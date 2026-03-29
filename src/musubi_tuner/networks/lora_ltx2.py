@@ -557,6 +557,48 @@ LTX2_INCLUDE_PATTERNS_V2V = [
     r".*\.audio_ff\.net\.2$",
 ]
 
+# video_attn: Video branch attention only
+# Targets only the video self-attention and text cross-attention projections.
+# Excludes audio, cross-modal, and feed-forward layers.
+LTX2_INCLUDE_PATTERNS_VIDEO_ATTN = [
+    r".*\.attn1\.to_k$",
+    r".*\.attn1\.to_q$",
+    r".*\.attn1\.to_v$",
+    r".*\.attn1\.to_out\.0$",
+    r".*\.attn2\.to_k$",
+    r".*\.attn2\.to_q$",
+    r".*\.attn2\.to_v$",
+    r".*\.attn2\.to_out\.0$",
+]
+
+# video_attn_ffn: Video branch attention + FFN
+# Same as video_attn, plus the video feed-forward layers. Excludes audio
+# and cross-modal branches for a narrower video-only adapter footprint.
+LTX2_INCLUDE_PATTERNS_VIDEO_ATTN_FFN = [
+    *LTX2_INCLUDE_PATTERNS_VIDEO_ATTN,
+    r".*\.ff\.net\.0\.proj$",
+    r".*\.ff\.net\.2$",
+]
+
+# video_cross_attn: Video text cross-attention only
+# Targets only the video branch text-conditioning attention (attn2).
+# Useful for image-heavy datasets where prompt adherence matters more than
+# latent self-attention dynamics.
+LTX2_INCLUDE_PATTERNS_VIDEO_CROSS_ATTN = [
+    r".*\.attn2\.to_k$",
+    r".*\.attn2\.to_q$",
+    r".*\.attn2\.to_v$",
+    r".*\.attn2\.to_out\.0$",
+]
+
+# video_cross_attn_ffn: Video text cross-attention + FFN
+# Same as video_cross_attn, plus the video feed-forward layers.
+LTX2_INCLUDE_PATTERNS_VIDEO_CROSS_ATTN_FFN = [
+    *LTX2_INCLUDE_PATTERNS_VIDEO_CROSS_ATTN,
+    r".*\.ff\.net\.0\.proj$",
+    r".*\.ff\.net\.2$",
+]
+
 # audio: Audio-only LoRA (audio attention/FFN + audio-side cross-modal)
 # Targets audio self/cross-attn, audio FFN, and video_to_audio_attn (audio queries video).
 # Excludes audio_to_video_attn to avoid altering the video branch.
@@ -612,6 +654,10 @@ LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers 
 LTX2_LORA_TARGET_PRESETS = {
     "t2v": LTX2_INCLUDE_PATTERNS_T2V,
     "v2v": LTX2_INCLUDE_PATTERNS_V2V,
+    "video_attn": LTX2_INCLUDE_PATTERNS_VIDEO_ATTN,
+    "video_attn_ffn": LTX2_INCLUDE_PATTERNS_VIDEO_ATTN_FFN,
+    "video_cross_attn": LTX2_INCLUDE_PATTERNS_VIDEO_CROSS_ATTN,
+    "video_cross_attn_ffn": LTX2_INCLUDE_PATTERNS_VIDEO_CROSS_ATTN_FFN,
     "audio": LTX2_INCLUDE_PATTERNS_AUDIO,
     "audio_ref_only_ic": LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC,
     "full": LTX2_INCLUDE_PATTERNS_FULL,

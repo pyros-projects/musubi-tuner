@@ -48,6 +48,12 @@ class _FakeTransformer(torch.nn.Module):
         self.training_switches += 1
 
 
+class _FakeCompileTransformer(_FakeTransformer):
+    def __init__(self):
+        super().__init__()
+        self._orig_mod = self
+
+
 class _RecordingTrainer(LTX2NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -79,6 +85,41 @@ class _RecordingTrainer(LTX2NetworkTrainer):
         self.sampled.append(sample_parameter["prompt"])
 
 
+class _SamplingHooksTrainer(LTX2NetworkTrainer):
+    def __init__(self):
+        super().__init__()
+        self.events = []
+
+    def _get_sampling_lora_specs(self, args):
+        return [("dummy.safetensors", 0.8)]
+
+    def _sampling_lora_requires_eager_fallback(self, transformer):
+        return False
+
+    def _apply_sampling_lora(self, args, transformer, device):
+        self.events.append(("apply", device.type))
+        return [("dummy.safetensors", {})]
+
+    def _restore_sampling_lora(self, args, transformer, device, applied):
+        self.events.append(("restore", len(applied), device.type))
+
+    def sample_image_inference(
+        self,
+        accelerator,
+        args,
+        transformer,
+        dit_dtype,
+        vae,
+        save_dir,
+        sample_parameter,
+        epoch,
+        steps,
+        audio_decoder=None,
+        vocoder=None,
+    ):
+        self.events.append(("sample", sample_parameter["prompt"]))
+
+
 class _FakeSamplingLora:
     def __init__(self, org_module: torch.nn.Module):
         self.lora_name = "lora_unet_model_linear"
@@ -99,6 +140,74 @@ class _FakeCaptionProjection:
 
 
 class LTX2SamplingLoraTests(unittest.TestCase):
+    def test_sample_images_applies_and_restores_sampling_lora(self):
+        trainer = _SamplingHooksTrainer()
+        accelerator = _FakeAccelerator()
+        transformer = _FakeTransformer()
+        args = Namespace(
+            sample_every_n_steps=1,
+            sample_every_n_epochs=None,
+            sample_at_first=False,
+            output_dir=tempfile.mkdtemp(),
+            sample_prompts="dummy.txt",
+            compile=False,
+            sampling_lora_weight=["dummy.safetensors"],
+            sampling_lora_multiplier=[0.8],
+        )
+
+        trainer.sample_images(
+            accelerator,
+            args,
+            epoch=None,
+            steps=1,
+            vae=None,
+            transformer=transformer,
+            sample_parameters=[{"prompt": "hello"}],
+            dit_dtype=torch.float32,
+        )
+
+        self.assertEqual(
+            trainer.events,
+            [("apply", "cpu"), ("sample", "hello"), ("restore", 1, "cpu")],
+        )
+
+    def test_sample_images_switches_compiled_fp8_transformer_to_eager_for_sampling_lora(self):
+        trainer = _SamplingHooksTrainer()
+        accelerator = _FakeAccelerator()
+        transformer = _FakeCompileTransformer()
+        args = Namespace(
+            sample_every_n_steps=1,
+            sample_every_n_epochs=None,
+            sample_at_first=False,
+            output_dir=tempfile.mkdtemp(),
+            sample_prompts="dummy.txt",
+            compile=True,
+            sampling_lora_weight=["dummy.safetensors"],
+            sampling_lora_multiplier=[0.8],
+        )
+
+        with mock.patch.object(trainer, "_sampling_lora_requires_eager_fallback", return_value=True), mock.patch(
+            "musubi_tuner.utils.model_utils.swap_compiled_modules_with_eager",
+            return_value=[("module", "forward", object())],
+        ) as swap_mock, mock.patch(
+            "musubi_tuner.utils.model_utils.restore_compiled_modules"
+        ) as restore_mock:
+            trainer.sample_images(
+                accelerator,
+                args,
+                epoch=None,
+                steps=1,
+                vae=None,
+                transformer=transformer,
+                sample_parameters=[{"prompt": "hello"}],
+                dit_dtype=torch.float32,
+            )
+
+        swap_mock.assert_called_once_with(transformer)
+        restore_mock.assert_called_once()
+        self.assertIn(("apply", "cpu"), trainer.events)
+        self.assertIn(("restore", 1, "cpu"), trainer.events)
+
     def test_parse_sample_sigmas_accepts_comma_string(self):
         trainer = LTX2NetworkTrainer()
         parsed = trainer._parse_sample_sigmas_value("1.0, 0.99375, 0.5, 0.0")
@@ -225,7 +334,7 @@ class LTX2SamplingLoraTests(unittest.TestCase):
         self.assertEqual(backups, {})
 
     @unittest.skipIf(not hasattr(torch, "float8_e4m3fn"), "float8 dtype unavailable")
-    def test_float8_runtime_overlay_preserves_lora_weight_dtype(self):
+    def test_float8_runtime_overlay_uses_float32_buffers(self):
         trainer = _Float8OverlayTrainer()
         module = torch.nn.Linear(4, 4, bias=False)
         module.weight = torch.nn.Parameter(module.weight.detach().to(torch.float8_e4m3fn), requires_grad=False)
@@ -245,8 +354,8 @@ class LTX2SamplingLoraTests(unittest.TestCase):
         self.assertEqual(runtime_attached, 1)
         self.assertEqual(backups, {})
         adapter = module._sampling_lora_runtime_adapters[0]
-        self.assertEqual(getattr(module, adapter["A"]).dtype, torch.bfloat16)
-        self.assertEqual(getattr(module, adapter["B"]).dtype, torch.bfloat16)
+        self.assertEqual(getattr(module, adapter["A"]).dtype, torch.float32)
+        self.assertEqual(getattr(module, adapter["B"]).dtype, torch.float32)
 
     def test_runtime_overlay_weights_follow_module_device_moves(self):
         trainer = LTX2NetworkTrainer()

@@ -152,7 +152,16 @@
 		const isAV = mode === 'av';
 		// Base LoRA size in GB per unit rank (t2v preset, video-only)
 		const loraBasePerRank = isAV ? 12.75 / 1024 : 6.0 / 1024;  // GB per rank
-		const presetMultiplier = { t2v: 1.0, v2v: 1.44, audio: 0.52, full: 2.1 }[t.lora_target_preset] || 1.0;
+		const presetMultiplier = {
+			t2v: 1.0,
+			v2v: 1.44,
+			video_attn: 0.34,
+			video_attn_ffn: 0.48,
+			video_cross_attn: 0.17,
+			video_cross_attn_ffn: 0.31,
+			audio: 0.52,
+			full: 2.1
+		}[t.lora_target_preset] || 1.0;
 		const loraParamsGB = rank * loraBasePerRank * presetMultiplier;
 
 		// ── Optimizer states ──

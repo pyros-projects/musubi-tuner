@@ -900,11 +900,15 @@ Use `--lora_target_preset` to control which layers LoRA targets:
 |--------|--------|----------|
 | `t2v` (default) | Attention only (`to_q`, `to_k`, `to_v`, `to_out.0`) | Text-to-video, matches official LTX-2 trainer |
 | `v2v` | Attention + FFN | Video-to-video / IC-LoRA style |
+| `video_attn` | Video `attn1` + `attn2` only | Narrow video-only adapter |
+| `video_attn_ffn` | Video `attn1` + `attn2` + `ff` only | Video-only adapter with FFN |
+| `video_cross_attn` | Video `attn2` only | Text-conditioning focused image/video adapter |
+| `video_cross_attn_ffn` | Video `attn2` + `ff` only | Text-conditioning focused adapter with FFN |
 | `audio` | Audio attention/FFN + audio-side cross-modal attention | Audio-only training (auto-selected when `--ltx2_mode audio`) |
 | `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio-reference IC-LoRA |
 | `full` | All linear layers | All layers targeted, larger file size |
 
-All presets apply to all relevant attention types: self-attention, cross-attention, and cross-modal attention (in AV mode). Connector layers are always excluded.
+`t2v` and `v2v` use broad patterns and therefore apply to all matching video/audio/cross-modal attention branches in AV mode. `video_attn`, `video_attn_ffn`, `video_cross_attn`, and `video_cross_attn_ffn` are narrower video-branch presets that only target `attn1`, `attn2`, and optionally `ff`. Connector layers are always excluded.
 
 To use custom layer patterns instead of a preset, use `--network_args`:
 ```bash
@@ -1829,4 +1833,3 @@ Note: `--gemma_root` is not needed for reference mode (text embeddings are loade
 **Cloud Platforms**
 - [fal.ai LTX-2 Trainer](https://fal.ai/models/fal-ai/ltx2-video-trainer) — Cloud-based LTX-2 LoRA training via API (~$0.005/step)
 - [WaveSpeedAI LTX-2](https://wavespeed.ai/landing/ltx2) — Hosted LTX-2 inference (T2V, I2V, video extend, lipsync)
-

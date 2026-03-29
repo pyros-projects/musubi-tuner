@@ -83,7 +83,12 @@
 							<FormSelect label="Target" value={t.lora_target_preset || 't2v'} options={[
 								{ value: 't2v', label: 't2v (attn)' },
 								{ value: 'v2v', label: 'v2v (attn+FFN)' },
+								{ value: 'video_attn', label: 'video_attn (video attn)' },
+								{ value: 'video_attn_ffn', label: 'video_attn_ffn (video attn+FFN)' },
+								{ value: 'video_cross_attn', label: 'video_cross_attn (attn2)' },
+								{ value: 'video_cross_attn_ffn', label: 'video_cross_attn_ffn (attn2+FFN)' },
 								{ value: 'audio', label: 'audio' },
+								{ value: 'audio_ref_only_ic', label: 'audio_ref_only_ic' },
 								{ value: 'full', label: 'full (all)' }
 							]} onchange={(e) => update('lora_target_preset', e.target.value)} tooltip="Target layers" />
 						</div>

@@ -3,6 +3,7 @@ import asyncio
 from datetime import timedelta
 import gc
 import importlib
+import inspect
 import argparse
 import math
 import os
@@ -70,6 +71,44 @@ logging.basicConfig(level=logging.INFO)
 # Global tracker for all-time peak VRAM since app launch
 _global_peak_alloc_mb: float = 0.0
 _global_peak_reserved_mb: float = 0.0
+
+
+def enable_gradient_checkpointing_compat(
+    module,
+    cpu_offload: bool = False,
+    *,
+    weight_cpu_offloading: bool = False,
+    blocks_to_checkpoint: int = -1,
+):
+    """Call module.enable_gradient_checkpointing with only supported kwargs.
+
+    Shared trainer paths now pass LTX-style checkpointing options, but not every
+    architecture exposes those keyword arguments. This helper preserves the
+    richer call shape when supported while staying compatible with simpler
+    implementations such as Z-Image.
+    """
+
+    fn = module.enable_gradient_checkpointing
+    try:
+        signature = inspect.signature(fn)
+        parameters = [p for p in signature.parameters.values() if p.name != "self"]
+    except (TypeError, ValueError):
+        parameters = None
+
+    kwargs = {}
+    pass_cpu_offload_positionally = True
+    if parameters is not None:
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters)
+        names = {p.name for p in parameters}
+        pass_cpu_offload_positionally = len(parameters) > 0
+        if accepts_kwargs or "weight_cpu_offloading" in names:
+            kwargs["weight_cpu_offloading"] = weight_cpu_offloading
+        if accepts_kwargs or "blocks_to_checkpoint" in names:
+            kwargs["blocks_to_checkpoint"] = blocks_to_checkpoint
+
+    if pass_cpu_offload_positionally:
+        return fn(cpu_offload, **kwargs)
+    return fn(**kwargs)
 
 
 def _update_global_peak() -> tuple[float, float]:
@@ -687,16 +726,17 @@ class NetworkTrainer:
                     and base_weight.ndim == 2
                 )
                 if supports_runtime_overlay:
-                    overlay_dtype = sd_for_lora["lora_down.weight"].dtype
-                    if not getattr(overlay_dtype, "is_floating_point", False) or overlay_dtype in float8_dtypes:
-                        overlay_dtype = torch.float32
                     self._attach_sampling_lora_runtime_overlay(
                         org_module,
                         sd_for_lora["lora_down.weight"],
                         sd_for_lora["lora_up.weight"],
                         lora.multiplier * float(lora.scale),
                         device=base_weight.device,
-                        compute_dtype=overlay_dtype,
+                        # Keep overlay math in float32 for quantized base modules.
+                        # The source Musubi behavior for FP8 sampling overlays is float32,
+                        # and lower-precision overlays can introduce NaNs during preview
+                        # sampling even when the underlying LoRA weights are fp16/bf16.
+                        compute_dtype=torch.float32,
                     )
                     runtime_attached += 1
                     continue
@@ -1703,6 +1743,8 @@ class NetworkTrainer:
         # Use the unwrapped model
         transformer = accelerator.unwrap_model(transformer)
         transformer.switch_block_swap_for_inference()
+        applied_sampling_lora = []
+        eager_sampling_swaps: list[tuple[torch.nn.Module, str, torch.nn.Module]] = []
 
         # Create a directory to save the samples
         save_dir = os.path.join(args.output_dir, "sample")
@@ -1716,35 +1758,48 @@ class NetworkTrainer:
         except Exception:
             pass
 
-        if distributed_state.num_processes <= 1:
-            # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
-            with torch.no_grad(), accelerator.autocast():
-                for sample_parameter in sample_parameters:
-                    self.sample_image_inference(
-                        accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
-                    )
-                    clean_memory_on_device(accelerator.device)
-        else:
-            # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
-            # prompt_dicts are assigned to lists based on order of processes, to attempt to time the image creation time to match enum order. Probably only works when steps and sampler are identical.
-            per_process_params = []  # list of lists
-            for i in range(distributed_state.num_processes):
-                per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
+        try:
+            if args.compile and self._get_sampling_lora_specs(args) and self._sampling_lora_requires_eager_fallback(transformer):
+                eager_sampling_swaps = model_utils.swap_compiled_modules_with_eager(transformer)
+                logger.info(
+                    f"Sampling LoRA requested on a compiled FP8 transformer; switched {len(eager_sampling_swaps)} compiled modules to eager for sampling only."
+                )
 
-            with torch.no_grad():
-                with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
-                    for sample_parameter in sample_parameter_lists[0]:
+            applied_sampling_lora = self._apply_sampling_lora(args, transformer, accelerator.device)
+
+            if distributed_state.num_processes <= 1:
+                # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
+                with torch.no_grad(), accelerator.autocast():
+                    for sample_parameter in sample_parameters:
                         self.sample_image_inference(
                             accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
                         )
                         clean_memory_on_device(accelerator.device)
+            else:
+                # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
+                # prompt_dicts are assigned to lists based on order of processes, to attempt to time the image creation time to match enum order. Probably only works when steps and sampler are identical.
+                per_process_params = []  # list of lists
+                for i in range(distributed_state.num_processes):
+                    per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
 
-        torch.set_rng_state(rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state(cuda_rng_state)
+                with torch.no_grad():
+                    with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
+                        for sample_parameter in sample_parameter_lists[0]:
+                            self.sample_image_inference(
+                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                            )
+                            clean_memory_on_device(accelerator.device)
+        finally:
+            self._restore_sampling_lora(args, transformer, accelerator.device, applied_sampling_lora)
+            if eager_sampling_swaps:
+                model_utils.restore_compiled_modules(eager_sampling_swaps)
 
-        transformer.switch_block_swap_for_training()
-        clean_memory_on_device(accelerator.device)
+            torch.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state)
+
+            transformer.switch_block_swap_for_training()
+            clean_memory_on_device(accelerator.device)
 
     def sample_image_inference(self, accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
         """architecture independent sample images"""
@@ -2695,10 +2750,11 @@ class NetworkTrainer:
         if args.gradient_checkpointing:
             blocks_to_ckpt = getattr(args, "blocks_to_checkpoint", -1)
             if getattr(args, "blockwise_checkpointing", False):
-                transformer.enable_gradient_checkpointing(
-                    args.gradient_checkpointing_cpu_offload, 
+                enable_gradient_checkpointing_compat(
+                    transformer,
+                    cpu_offload=args.gradient_checkpointing_cpu_offload,
                     weight_cpu_offloading=True,
-                    blocks_to_checkpoint=blocks_to_ckpt
+                    blocks_to_checkpoint=blocks_to_ckpt,
                 )
                 if hasattr(transformer, "transformer_blocks"):
                     total_blocks = len(transformer.transformer_blocks)
@@ -2719,9 +2775,10 @@ class NetworkTrainer:
                         if hasattr(block, "use_pinned_memory"):
                             block.use_pinned_memory = True
             else:
-                transformer.enable_gradient_checkpointing(
-                    args.gradient_checkpointing_cpu_offload,
-                    blocks_to_checkpoint=blocks_to_ckpt
+                enable_gradient_checkpointing_compat(
+                    transformer,
+                    cpu_offload=args.gradient_checkpointing_cpu_offload,
+                    blocks_to_checkpoint=blocks_to_ckpt,
                 )
             try:
                 network.enable_gradient_checkpointing(
