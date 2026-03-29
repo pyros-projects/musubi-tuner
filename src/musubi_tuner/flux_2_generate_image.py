@@ -981,13 +981,67 @@ def precompute_text_inputs_for_prompts(
 ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
     """Precompute text inputs for all prompts using a shared text encoder."""
     shared_models.setdefault("conds_cache", {})
-    all_precomputed_text_data = []
+    conds_cache = shared_models["conds_cache"]
+    text_embedder = shared_models.get("text_embedder")
+    if text_embedder is None:
+        raise ValueError("Text embedder is not loaded properly.")
 
+    model_version_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
+    required_texts: list[str] = []
+    for prompt_args_item in all_prompt_args_list:
+        required_texts.append(prompt_args_item.prompt)
+        if not model_version_info.guidance_distilled:
+            required_texts.append(prompt_args_item.negative_prompt if prompt_args_item.negative_prompt is not None else " ")
+
+    ordered_unique_texts = list(dict.fromkeys(required_texts))
+    missing_texts: list[str] = []
+    for text in ordered_unique_texts:
+        if text in conds_cache:
+            continue
+
+        ctx_vec = None
+        cache_key = None
+        if args.save_embeddings:
+            cache_key = build_prompt_embedding_cache_key(text, args)
+            ctx_vec = load_prompt_embedding_cache(args.save_embeddings, cache_key)
+        if ctx_vec is not None:
+            conds_cache[text] = ctx_vec
+        else:
+            missing_texts.append(text)
+
+    if missing_texts:
+        logger.info(
+            f"Batch-encoding {len(missing_texts)} uncached prompt text(s) for prompt-file inference."
+        )
+        text_embedder_original_device = text_embedder.device
+        text_embedder.to(device)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            encoded_batch = text_embedder(missing_texts)
+        encoded_batch = encoded_batch.cpu()
+
+        for text, ctx_vec in zip(missing_texts, encoded_batch):
+            ctx_vec = ctx_vec.unsqueeze(0)
+            conds_cache[text] = ctx_vec
+            if args.save_embeddings:
+                cache_key = build_prompt_embedding_cache_key(text, args)
+                save_prompt_embedding_cache(args.save_embeddings, cache_key, text, ctx_vec, args)
+
+        text_embedder.to(text_embedder_original_device)
+        gc.collect()
+        clean_memory_on_device(device)
+
+    all_precomputed_text_data = []
     logger.info("Preprocessing text and LLM/TextEncoder encoding for all prompts...")
     for i, prompt_args_item in enumerate(all_prompt_args_list):
         logger.info(f"Text preprocessing for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
-        ctx_nctx = prepare_text_inputs(prompt_args_item, device, shared_models)
-        all_precomputed_text_data.append(ctx_nctx)
+        ctx_vec = conds_cache[prompt_args_item.prompt]
+        arg_c = {"ctx_vec": ctx_vec, "prompt": prompt_args_item.prompt}
+        if model_version_info.guidance_distilled:
+            arg_null = None
+        else:
+            negative_prompt = prompt_args_item.negative_prompt if prompt_args_item.negative_prompt is not None else " "
+            arg_null = {"ctx_vec": conds_cache[negative_prompt], "prompt": negative_prompt}
+        all_precomputed_text_data.append((arg_c, arg_null))
 
     return all_precomputed_text_data
 

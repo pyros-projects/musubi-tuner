@@ -1,8 +1,11 @@
 import argparse
+import hashlib
 import gc
 from importlib.util import find_spec
 import random
+import json
 import os
+import shlex
 import time
 import copy
 from typing import Tuple, Optional, List, Any, Dict
@@ -37,6 +40,53 @@ class GenerationSettings:
     def __init__(self, device: torch.device, dit_weight_dtype: Optional[torch.dtype] = None):
         self.device = device
         self.dit_weight_dtype = dit_weight_dtype  # not used currently because model may be optimized
+
+
+def build_prompt_embedding_cache_key(text: str, args: argparse.Namespace) -> str:
+    payload = {
+        "text": text,
+        "text_encoder": os.path.abspath(args.text_encoder),
+        "fp8_llm": bool(args.fp8_llm),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+def get_prompt_embedding_cache_path(cache_dir: str, cache_key: str) -> str:
+    return os.path.join(cache_dir, f"{cache_key}.safetensors")
+
+
+def load_prompt_embedding_cache(cache_dir: str, cache_key: str) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    cache_path = get_prompt_embedding_cache_path(cache_dir, cache_key)
+    if not os.path.isfile(cache_path):
+        return None, None
+
+    logger.info(f"Loading cached prompt embedding from {cache_path}")
+    sd = load_file(cache_path)
+    embed = sd.get("embed")
+    mask = sd.get("mask")
+    if mask is not None:
+        mask = mask.to(torch.bool)
+    return embed, mask
+
+
+def save_prompt_embedding_cache(
+    cache_dir: str,
+    cache_key: str,
+    text: str,
+    embed: torch.Tensor,
+    mask: torch.Tensor,
+    args: argparse.Namespace,
+) -> str:
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = get_prompt_embedding_cache_path(cache_dir, cache_key)
+    metadata = {
+        "text": text,
+        "text_encoder": os.path.abspath(args.text_encoder),
+        "fp8_llm": str(bool(args.fp8_llm)),
+    }
+    save_file({"embed": embed.contiguous(), "mask": mask.to(torch.uint8).contiguous()}, cache_path, metadata=metadata)
+    logger.info(f"Saved prompt embedding cache to {cache_path}")
+    return cache_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,8 +180,21 @@ def parse_args() -> argparse.Namespace:
     setup_parser_compile(parser)
 
     # arguments for batch and interactive modes
-    parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
+    parser.add_argument("--from_file", "--sample_prompts", dest="from_file", type=str, default=None, help="Read prompts from a file")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
+    parser.add_argument(
+        "--save_strategy",
+        type=str,
+        default="immediate",
+        choices=["immediate", "deferred"],
+        help="When using prompt files, save each prompt immediately or defer image saving until all prompts have been generated.",
+    )
+    parser.add_argument(
+        "--save_embeddings",
+        type=str,
+        default=None,
+        help="Directory to load/store prompt text embeddings for reuse across inference runs.",
+    )
     parser.add_argument(
         "--bell",
         action="store_true",
@@ -166,13 +229,17 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
         Dict[str, Any]: Dictionary of argument overrides
     """
     # TODO common function with hv_train_network.line_to_prompt_dict
-    parts = line.split(" --")
-    prompt = parts[0].strip()
+    if line.strip().startswith("--"):  # No prompt
+        parts = (" " + line.strip()).split(" --")
+        prompt = None
+    else:
+        parts = line.split(" --")
+        prompt = parts[0].strip()
+        parts = parts[1:]
 
-    # Create dictionary of overrides
-    overrides = {"prompt": prompt}
+    overrides = {} if prompt is None else {"prompt": prompt}
 
-    for part in parts[1:]:
+    for part in parts:
         if not part.strip():
             continue
         option_parts = part.split(" ", 1)
@@ -194,6 +261,10 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
             overrides["flow_shift"] = float(value)
         elif option == "n":
             overrides["negative_prompt"] = value
+        elif option == "lora_weight":
+            overrides["lora_weight"] = shlex.split(value)
+        elif option == "lora_multiplier":
+            overrides["lora_multiplier"] = [float(v) for v in shlex.split(value)]
 
     return overrides
 
@@ -217,6 +288,11 @@ def apply_overrides(args: argparse.Namespace, overrides: Dict[str, Any]) -> argp
             args_copy.image_size[0] = value
         else:
             setattr(args_copy, key, value)
+
+    args_copy.lora_weight, args_copy.lora_multiplier = normalize_lora_weight_args(
+        getattr(args_copy, "lora_weight", None),
+        getattr(args_copy, "lora_multiplier", None),
+    )
 
     return args_copy
 
@@ -446,33 +522,48 @@ def prepare_text_inputs(
 
     prompt = args.prompt
 
-    # cache_key includes this because embed may be changed if resize_control_to_image_size is True
-    cache_key = prompt
-
-    if cache_key in conds_cache:
-        embed, mask = conds_cache[cache_key]
+    if prompt in conds_cache:
+        embed, mask = conds_cache[prompt]
     else:
-        move_models_to_device_if_needed()
+        embed = None
+        mask = None
+        cache_key = None
+        if args.save_embeddings:
+            cache_key = build_prompt_embedding_cache_key(prompt, args)
+            embed, mask = load_prompt_embedding_cache(args.save_embeddings, cache_key)
+        if embed is None or mask is None:
+            move_models_to_device_if_needed()
 
-        embed, mask = zimage_utils.get_text_embeds(tokenizer, text_encoder, prompt)
-        embed = embed.cpu()
-        mask = mask.cpu()
+            embed, mask = zimage_utils.get_text_embeds(tokenizer, text_encoder, prompt)
+            embed = embed.cpu()
+            mask = mask.cpu()
 
-        conds_cache[cache_key] = (embed, mask)
+            if args.save_embeddings and cache_key is not None:
+                save_prompt_embedding_cache(args.save_embeddings, cache_key, prompt, embed, mask, args)
+        conds_cache[prompt] = (embed, mask)
 
     negative_prompt = args.negative_prompt
     if negative_prompt is not None:
-        cache_key = negative_prompt
-        if cache_key in conds_cache:
-            negative_embed, negative_mask = conds_cache[cache_key]
+        if negative_prompt in conds_cache:
+            negative_embed, negative_mask = conds_cache[negative_prompt]
         else:
-            move_models_to_device_if_needed()
+            negative_embed = None
+            negative_mask = None
+            negative_cache_key = None
+            if args.save_embeddings:
+                negative_cache_key = build_prompt_embedding_cache_key(negative_prompt, args)
+                negative_embed, negative_mask = load_prompt_embedding_cache(args.save_embeddings, negative_cache_key)
+            if negative_embed is None or negative_mask is None:
+                move_models_to_device_if_needed()
 
-            negative_embed, negative_mask = zimage_utils.get_text_embeds(tokenizer, text_encoder, negative_prompt)
-            negative_embed = negative_embed.cpu()
-            negative_mask = negative_mask.cpu()
+                negative_embed, negative_mask = zimage_utils.get_text_embeds(tokenizer, text_encoder, negative_prompt)
+                negative_embed = negative_embed.cpu()
+                negative_mask = negative_mask.cpu()
 
-            conds_cache[cache_key] = (negative_embed, negative_mask)
+                if args.save_embeddings and negative_cache_key is not None:
+                    save_prompt_embedding_cache(args.save_embeddings, negative_cache_key, negative_prompt, negative_embed, negative_mask, args)
+
+            conds_cache[negative_prompt] = (negative_embed, negative_mask)
     else:
         negative_embed = None
         negative_mask = None
@@ -491,6 +582,26 @@ def prepare_text_inputs(
     arg_null = {"embed": negative_embed, "mask": negative_mask, "prompt": negative_prompt}
 
     return arg_c, arg_null
+
+
+def get_prompt_lora_spec(args: argparse.Namespace) -> Tuple[Tuple[str, float], ...]:
+    lora_weight = args.lora_weight or []
+    lora_multiplier = args.lora_multiplier or []
+    return tuple((weight, float(multiplier)) for weight, multiplier in zip(lora_weight, lora_multiplier))
+
+
+def ensure_batch_prompt_lora_consistency(all_prompt_args_list: List[argparse.Namespace]) -> Tuple[Tuple[str, float], ...]:
+    if not all_prompt_args_list:
+        return ()
+
+    first_spec = get_prompt_lora_spec(all_prompt_args_list[0])
+    for prompt_args in all_prompt_args_list[1:]:
+        if get_prompt_lora_spec(prompt_args) != first_spec:
+            raise ValueError(
+                "Prompt-file batch inference requires every prompt to use the same LoRA configuration. "
+                "Mixed prompt-level LoRA specs would force transformer reloads, so they are rejected."
+            )
+    return first_spec
 
 
 def generate(
@@ -802,6 +913,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     vae_for_batch.eval()
 
     all_prompt_args_list = [apply_overrides(args, pd) for pd in prompts_data]  # Create all arg instances first
+    ensure_batch_prompt_lora_consistency(all_prompt_args_list)
     for prompt_args in all_prompt_args_list:
         check_inputs(prompt_args)  # Validate each prompt's height/width
 
@@ -920,6 +1032,64 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
 
     del vae_for_batch
     clean_memory_on_device(device)
+
+
+def process_prompts_with_immediate_save(prompts_data: List[Dict], args: argparse.Namespace) -> None:
+    """Process multiple prompts and save each result immediately after generation."""
+    if not prompts_data:
+        logger.warning("No valid prompts found")
+        return
+
+    gen_settings = get_generation_settings(args)
+    dit_weight_dtype = gen_settings.dit_weight_dtype
+    device = gen_settings.device
+
+    logger.info("Loading shared models for immediate prompt processing...")
+    shared_models = load_shared_models(args)
+    shared_models["conds_cache"] = {}
+
+    all_prompt_args_list = [apply_overrides(args, pd) for pd in prompts_data]
+    ensure_batch_prompt_lora_consistency(all_prompt_args_list)
+
+    all_precomputed_text_data = []
+    logger.info("Preprocessing text and LLM/TextEncoder encoding for all prompts...")
+    for i, prompt_args_item in enumerate(all_prompt_args_list):
+        logger.info(f"Text preprocessing for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+        context, context_null = prepare_text_inputs(prompt_args_item, device, shared_models)
+        all_precomputed_text_data.append({"context": context, "context_null": context_null})
+
+    logger.info("Releasing Text Encoder after text precomputation...")
+    shared_models.pop("tokenizer", None)
+    shared_models.pop("text_encoder", None)
+    shared_models.pop("conds_cache", None)
+    gc.collect()
+    clean_memory_on_device(device)
+
+    vae_for_batch = zimage_autoencoder.load_autoencoder_kl(args.vae, device="cpu", disable_mmap=True)
+    vae_for_batch.eval()
+    dit_model = load_dit_model(all_prompt_args_list[0], device, dit_weight_dtype)
+    shared_models["model"] = dit_model
+
+    try:
+        with torch.no_grad():
+            for i, prompt_args_item in enumerate(all_prompt_args_list):
+                logger.info(f"Generating and saving prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+                latent = generate(prompt_args_item, gen_settings, shared_models, all_precomputed_text_data[i])
+                if latent is None:
+                    logger.warning(f"Skipping save for prompt {i + 1} because latent generation returned nothing.")
+                    continue
+                save_output(prompt_args_item, vae_for_batch, latent[0], device)
+    finally:
+        logger.info("Releasing immediate prompt processing models from memory...")
+        shared_models.pop("model", None)
+        if args.blocks_to_swap > 0:
+            logger.info("Waiting for 5 seconds to finish block swap")
+            time.sleep(5)
+        del dit_model
+        del vae_for_batch
+        gc.collect()
+        clean_memory_on_device(device)
+        synchronize_device(device)
 
 
 def process_interactive(args: argparse.Namespace) -> None:
@@ -1078,7 +1248,10 @@ def main():
 
         # Process prompts
         prompts_data = preprocess_prompts_for_batch(prompt_lines, args)
-        process_batch_prompts(prompts_data, args)
+        if args.save_strategy == "immediate":
+            process_prompts_with_immediate_save(prompts_data, args)
+        else:
+            process_batch_prompts(prompts_data, args)
 
         if args.bell:
             print("\a")  # Bell sound

@@ -403,6 +403,7 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
 
     else:
         # Dequantize the weight
+        input_dtype = x.dtype
         original_dtype = self.scale_weight.dtype
         if self.scale_weight.ndim < 3:
             # per-tensor or per-channel quantization, we can broadcast
@@ -414,13 +415,15 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
             dequantized_weight = dequantized_weight * self.scale_weight
             dequantized_weight = dequantized_weight.view(self.weight.shape)
 
-        # Perform linear transformation
-        if self.bias is not None:
-            output = F.linear(x, dequantized_weight, self.bias)
-        else:
-            output = F.linear(x, dequantized_weight)
+        # F.linear requires matching dtypes for input and weight. FP8-optimized models
+        # often keep dequantized weights/scales in float32 while activations are bf16/fp16.
+        # Run the matmul in the dequantized weight dtype, then cast back to the caller dtype.
+        if x.dtype != original_dtype:
+            x = x.to(original_dtype)
+        bias = self.bias.to(original_dtype) if self.bias is not None else None
+        output = F.linear(x, dequantized_weight, bias)
 
-        return output
+        return output.to(input_dtype)
 
 
 def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
