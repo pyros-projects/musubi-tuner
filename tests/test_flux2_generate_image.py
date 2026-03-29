@@ -185,6 +185,77 @@ class Flux2GenerateImageTest(unittest.TestCase):
 
         load_dit_model.assert_not_called()
 
+    def test_main_dispatches_chunked_save_for_prompt_files(self):
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "flux_2_generate_image.py",
+                    "--text_encoder",
+                    "/tmp/text_encoder",
+                    "--save_path",
+                    "/tmp/output",
+                    "--sample_prompts",
+                    "/tmp/prompts.txt",
+                    "--save_every_n_images",
+                    "4",
+                ],
+            ),
+            mock.patch("torch.cuda.is_available", return_value=False),
+            mock.patch("builtins.open", mock.mock_open(read_data="hello")),
+            mock.patch.object(flux2_generate_image, "preprocess_prompts_for_batch", return_value=[{"prompt": "hello"}]),
+            mock.patch.object(flux2_generate_image, "process_prompts_with_immediate_save") as process_immediate,
+            mock.patch.object(flux2_generate_image, "process_batch_prompts") as process_batch,
+            mock.patch.object(flux2_generate_image, "process_prompts_with_chunked_save") as process_chunked,
+        ):
+            flux2_generate_image.main()
+
+        process_chunked.assert_called_once()
+        process_batch.assert_not_called()
+        process_immediate.assert_not_called()
+
+    def test_process_prompts_with_chunked_save_loads_dit_once_per_chunk(self):
+        args = self._make_args(save_every_n_images=2, output_type="images")
+        prompts_data = [{"prompt": "first"}, {"prompt": "second"}, {"prompt": "third"}]
+
+        with (
+            mock.patch.object(
+                flux2_generate_image,
+                "get_generation_settings",
+                return_value=flux2_generate_image.GenerationSettings(torch.device("cpu"), torch.float32),
+            ),
+            mock.patch.object(flux2_generate_image, "load_shared_models", return_value={}),
+            mock.patch.object(
+                flux2_generate_image,
+                "apply_overrides",
+                side_effect=[
+                    self._make_args(prompt="first", save_every_n_images=2, output_type="images"),
+                    self._make_args(prompt="second", save_every_n_images=2, output_type="images"),
+                    self._make_args(prompt="third", save_every_n_images=2, output_type="images"),
+                ],
+            ),
+            mock.patch.object(
+                flux2_generate_image,
+                "precompute_text_inputs_for_prompts",
+                return_value=[
+                    ({"ctx_vec": torch.zeros(1), "prompt": "first"}, None),
+                    ({"ctx_vec": torch.zeros(1), "prompt": "second"}, None),
+                    ({"ctx_vec": torch.zeros(1), "prompt": "third"}, None),
+                ],
+            ),
+            mock.patch.object(flux2_generate_image.flux2_utils, "load_ae", return_value=_FakeMovable()),
+            mock.patch.object(flux2_generate_image, "prepare_image_inputs", return_value=(1024, 1024, None)),
+            mock.patch.object(flux2_generate_image, "load_dit_model", return_value=object()) as load_dit_model,
+            mock.patch.object(flux2_generate_image, "generate", return_value=(None, torch.zeros(1, 1, 1, 1, 1))),
+            mock.patch.object(flux2_generate_image, "save_output"),
+            mock.patch.object(flux2_generate_image, "clean_memory_on_device"),
+            mock.patch.object(flux2_generate_image, "synchronize_device"),
+        ):
+            flux2_generate_image.process_prompts_with_chunked_save(prompts_data, args)
+
+        self.assertEqual(load_dit_model.call_count, 2)
+
     def test_precompute_text_inputs_batches_unique_prompts(self):
         args = self._make_args(negative_prompt=None, save_embeddings=None)
         shared_models = {"text_embedder": _FakeTextEmbedder(), "conds_cache": {}}

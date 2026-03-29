@@ -196,6 +196,12 @@ def parse_args() -> argparse.Namespace:
         help="Directory to load/store prompt text embeddings for reuse across inference runs.",
     )
     parser.add_argument(
+        "--save_every_n_images",
+        type=int,
+        default=None,
+        help="When using prompt files, generate prompts in chunks and save/decode every N images.",
+    )
+    parser.add_argument(
         "--bell",
         action="store_true",
         help="Ring bell when done. For interactive mode, ring bell on each iteration. For other modes, ring bell at the end.",
@@ -210,6 +216,9 @@ def parse_args() -> argparse.Namespace:
     if args.latent_path is None or len(args.latent_path) == 0:
         if args.prompt is None and not args.from_file and not args.interactive:
             raise ValueError("Either --prompt, --from_file or --interactive must be specified")
+
+    if args.save_every_n_images is not None and args.save_every_n_images < 1:
+        raise ValueError("--save_every_n_images must be at least 1")
 
     if args.lycoris and not lycoris_available:
         raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
@@ -1092,6 +1101,87 @@ def process_prompts_with_immediate_save(prompts_data: List[Dict], args: argparse
         synchronize_device(device)
 
 
+def process_prompts_with_chunked_save(prompts_data: List[Dict], args: argparse.Namespace) -> None:
+    """Process prompt files in chunks, decoding and saving after each chunk."""
+    if not prompts_data:
+        logger.warning("No valid prompts found")
+        return
+
+    gen_settings = get_generation_settings(args)
+    dit_weight_dtype = gen_settings.dit_weight_dtype
+    device = gen_settings.device
+    chunk_size = max(1, int(args.save_every_n_images or 1))
+
+    logger.info("Loading shared models for chunked prompt processing...")
+    shared_models = load_shared_models(args)
+    shared_models["conds_cache"] = {}
+
+    all_prompt_args_list = [apply_overrides(args, pd) for pd in prompts_data]
+    ensure_batch_prompt_lora_consistency(all_prompt_args_list)
+
+    all_precomputed_text_data = []
+    logger.info("Preprocessing text and LLM/TextEncoder encoding for all prompts...")
+    for i, prompt_args_item in enumerate(all_prompt_args_list):
+        logger.info(f"Text preprocessing for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+        context, context_null = prepare_text_inputs(prompt_args_item, device, shared_models)
+        all_precomputed_text_data.append({"context": context, "context_null": context_null})
+
+    logger.info("Releasing Text Encoder after text precomputation...")
+    shared_models.pop("tokenizer", None)
+    shared_models.pop("text_encoder", None)
+    shared_models.pop("conds_cache", None)
+    gc.collect()
+    clean_memory_on_device(device)
+
+    vae_for_batch = zimage_autoencoder.load_autoencoder_kl(args.vae, device="cpu", disable_mmap=True)
+    vae_for_batch.eval()
+
+    try:
+        for chunk_start in range(0, len(all_prompt_args_list), chunk_size):
+            chunk_end = min(chunk_start + chunk_size, len(all_prompt_args_list))
+            chunk_prompt_args = all_prompt_args_list[chunk_start:chunk_end]
+            chunk_text_data = all_precomputed_text_data[chunk_start:chunk_end]
+
+            logger.info(
+                f"Processing prompt chunk {chunk_start // chunk_size + 1}: prompts {chunk_start + 1}-{chunk_end}/{len(all_prompt_args_list)}"
+            )
+
+            dit_model = load_dit_model(chunk_prompt_args[0], device, dit_weight_dtype)
+            shared_models["model"] = dit_model
+
+            chunk_latents = []
+            try:
+                with torch.no_grad():
+                    for i, prompt_args_item in enumerate(chunk_prompt_args):
+                        logger.info(
+                            f"Generating latent for prompt {chunk_start + i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}"
+                        )
+                        latent = generate(prompt_args_item, gen_settings, shared_models, chunk_text_data[i])
+                        chunk_latents.append((prompt_args_item, latent))
+            finally:
+                logger.info("Releasing DiT model after chunk generation...")
+                shared_models.pop("model", None)
+                if args.blocks_to_swap > 0:
+                    logger.info("Waiting for 5 seconds to finish block swap")
+                    time.sleep(5)
+                del dit_model
+                gc.collect()
+                clean_memory_on_device(device)
+                synchronize_device(device)
+
+            for prompt_args_item, latent in chunk_latents:
+                if latent is None:
+                    logger.warning(f"Skipping save for prompt due to empty latent: {prompt_args_item.prompt}")
+                    continue
+                save_output(prompt_args_item, vae_for_batch, latent[0], device)
+    finally:
+        logger.info("Releasing chunked prompt processing models from memory...")
+        del vae_for_batch
+        gc.collect()
+        clean_memory_on_device(device)
+        synchronize_device(device)
+
+
 def process_interactive(args: argparse.Namespace) -> None:
     """Process prompts in interactive mode
 
@@ -1248,7 +1338,9 @@ def main():
 
         # Process prompts
         prompts_data = preprocess_prompts_for_batch(prompt_lines, args)
-        if args.save_strategy == "immediate":
+        if args.save_every_n_images is not None:
+            process_prompts_with_chunked_save(prompts_data, args)
+        elif args.save_strategy == "immediate":
             process_prompts_with_immediate_save(prompts_data, args)
         else:
             process_batch_prompts(prompts_data, args)
