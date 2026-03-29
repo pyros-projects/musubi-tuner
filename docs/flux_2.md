@@ -177,6 +177,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 - Uses `flux_2_train_network.py`.
 - **Requires** specifying `--vae` (not `--ae`), `--text_encoder`
 - **Requires** specifying `--network_module networks.lora_flux_2`.
+- `networks.lora_flux_2` covers the full FLUX.2 linear surface, so all-layer Comfy / diffusion-pipe LoRAs that touch input projections, modulation linears, or the final projection head can still be matched.
 - `--mixed_precision bf16` is recommended for FLUX.2 training.
 - `--timestep_sampling flux2_shift` is recommended for FLUX.2.
 - Use the `--model_version` option for Flux.2 Klein training (if omitted, defaults to `dev`).
