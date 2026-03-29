@@ -2,6 +2,7 @@
 
 import argparse
 import gc
+import math
 import os
 import random
 import re
@@ -776,6 +777,65 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._self_flow = None
         self._self_flow_active: bool = False
         self._self_flow_step_context: Optional[Dict[str, Any]] = None
+
+    @staticmethod
+    def _looks_like_comfy_ltx_lora(weights_sd: Dict[str, torch.Tensor]) -> bool:
+        if not weights_sd:
+            return False
+        keys = list(weights_sd.keys())
+        return (
+            all(key.startswith("diffusion_model.") for key in keys)
+            and any(".lora_A.weight" in key for key in keys)
+            and any(".lora_B.weight" in key for key in keys)
+        )
+
+    @staticmethod
+    def _convert_ltx_comfy_sampling_lora_weights(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        converted: Dict[str, torch.Tensor] = {}
+        synthesized_alpha: Dict[str, torch.Tensor] = {}
+
+        for key, value in weights_sd.items():
+            if not key.startswith("diffusion_model."):
+                converted[key] = value
+                continue
+
+            if key.endswith(".lora_A.weight"):
+                module_path = key[len("diffusion_model.") : -len(".lora_A.weight")]
+                target_key = f"lora_unet_model_{module_path.replace('.', '_')}.lora_down.weight"
+                converted[target_key] = value
+                alpha_key = f"lora_unet_model_{module_path.replace('.', '_')}.alpha"
+                synthesized_alpha.setdefault(alpha_key, torch.tensor(float(value.shape[0]), dtype=torch.float32))
+                continue
+
+            if key.endswith(".lora_B.weight"):
+                module_path = key[len("diffusion_model.") : -len(".lora_B.weight")]
+                target_key = f"lora_unet_model_{module_path.replace('.', '_')}.lora_up.weight"
+                converted[target_key] = value
+                continue
+
+            if key.endswith(".alpha"):
+                module_path = key[len("diffusion_model.") : -len(".alpha")]
+                target_key = f"lora_unet_model_{module_path.replace('.', '_')}.alpha"
+                converted[target_key] = value
+                continue
+
+            converted[key] = value
+
+        for key, value in synthesized_alpha.items():
+            converted.setdefault(key, value)
+
+        return converted
+
+    def normalize_sampling_lora_weights(
+        self,
+        args: argparse.Namespace,
+        weights_sd: Dict[str, torch.Tensor],
+        weight_path: str,
+    ) -> Dict[str, torch.Tensor]:
+        if self._looks_like_comfy_ltx_lora(weights_sd):
+            logger.info("Converting LTX sampling LoRA from ComfyUI A/B format: %s", weight_path)
+            weights_sd = self._convert_ltx_comfy_sampling_lora_weights(weights_sd)
+        return super().normalize_sampling_lora_weights(args, weights_sd, weight_path)
 
     @staticmethod
     def _apply_caption_dropout(
@@ -3883,11 +3943,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
         default_frame_count = int(getattr(args, "sample_num_frames", 45))
         default_guidance_scale = float(getattr(args, "guidance_scale", self.default_guidance_scale))
         default_discrete_flow_shift = getattr(args, "discrete_flow_shift", None)
+        default_sample_sigmas = self._parse_sample_sigmas_value(getattr(args, "sample_sigmas", None))
+        default_sample_steps = len(default_sample_sigmas) - 1 if default_sample_sigmas is not None else 20
 
         sample_parameters = []
         for prompt_data in prompts:
             prompt_text = prompt_data.get("prompt", "")
             param = prompt_data.copy()
+            sample_sigmas = self._parse_sample_sigmas_value(prompt_data.get("sample_sigmas", default_sample_sigmas))
             param.setdefault("prompt", prompt_text)
             param.setdefault("negative_prompt", prompt_data.get("negative_prompt", ""))
             if "frame_count" not in param and "num_frames" in param:
@@ -3895,7 +3958,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
             param.setdefault("height", prompt_data.get("height", default_height))
             param.setdefault("width", prompt_data.get("width", default_width))
             param.setdefault("frame_count", prompt_data.get("frame_count", default_frame_count))
-            param.setdefault("sample_steps", prompt_data.get("sample_steps", 20))
+            if sample_sigmas is not None:
+                param["sample_sigmas"] = sample_sigmas
+                param["sample_steps"] = len(sample_sigmas) - 1
+            else:
+                param.setdefault("sample_steps", prompt_data.get("sample_steps", default_sample_steps))
             param.setdefault("guidance_scale", prompt_data.get("guidance_scale", default_guidance_scale))
             if default_discrete_flow_shift is not None:
                 param.setdefault("discrete_flow_shift", prompt_data.get("discrete_flow_shift", default_discrete_flow_shift))
@@ -3903,6 +3970,56 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sample_parameters.append(param)
 
         return sample_parameters
+
+    def _parse_sample_sigmas_value(self, value: Any) -> Optional[List[float]]:
+        if value is None:
+            return None
+
+        if isinstance(value, torch.Tensor):
+            raw_values = value.detach().cpu().flatten().tolist()
+        elif isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            raw_values = [part for part in re.split(r"[\s,]+", stripped) if part]
+        elif isinstance(value, (list, tuple)):
+            raw_values = list(value)
+        else:
+            raise TypeError(f"Unsupported sample_sigmas value type: {type(value)!r}")
+
+        if len(raw_values) < 2:
+            raise ValueError("sample_sigmas must contain at least two sigma values.")
+
+        sigmas = [float(item) for item in raw_values]
+        for idx, sigma in enumerate(sigmas):
+            if not math.isfinite(sigma):
+                raise ValueError(f"sample_sigmas contains non-finite value at index {idx}: {sigma}")
+            if sigma < 0.0 or sigma > 1.0:
+                raise ValueError(f"sample_sigmas values must be in [0, 1]. Got {sigma} at index {idx}.")
+
+        if any(curr < nxt for curr, nxt in zip(sigmas, sigmas[1:])):
+            raise ValueError("sample_sigmas must be monotonically non-increasing.")
+
+        return sigmas
+
+    def _resolve_sample_sigmas(
+        self,
+        sample_parameter: Dict,
+        sample_steps: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, int]:
+        parsed_sigmas = self._parse_sample_sigmas_value(sample_parameter.get("sample_sigmas"))
+        if parsed_sigmas is not None:
+            effective_steps = len(parsed_sigmas) - 1
+            sample_parameter["sample_sigmas"] = parsed_sigmas
+            sample_parameter["sample_steps"] = effective_steps
+            sigmas = torch.tensor(parsed_sigmas, device=device, dtype=torch.float32)
+            return sigmas, effective_steps
+
+        effective_steps = max(1, int(sample_steps))
+        ltx2_scheduler = LTX2Scheduler()
+        sigmas = ltx2_scheduler.execute(steps=effective_steps).to(device=device, dtype=torch.float32)
+        return sigmas, effective_steps
 
     def _load_precached_sample_prompts(self, args: argparse.Namespace) -> List[Dict]:
         cache_path = getattr(args, "sample_prompts_cache", None) or self._resolve_default_sample_prompts_cache(args)
@@ -4237,6 +4354,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         transformer = accelerator.unwrap_model(transformer)
         transformer.switch_block_swap_for_inference()
+        applied_sampling_lora = []
+        eager_sampling_swaps: list[tuple[torch.nn.Module, str, torch.nn.Module]] = []
         original_device = next(transformer.parameters()).device
         offload = bool(getattr(args, "sample_with_offloading", False))
         transformer_offloaded = offload and accelerator.device.type == "cuda"
@@ -4373,87 +4492,38 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 logger.warning("Sampling audio decoder load failed; continuing without audio preview: %s", exc)
                 audio_decoder, vocoder = None, None
 
-        if distributed_state.num_processes <= 1:
-            # Batch encode all prompts upfront when offloading is enabled
-            if transformer_offloaded:
-                offload_transformer_if_needed()
-                prepare_all_embeddings_batch(sample_parameters)
+        try:
+            if args.compile and self._get_sampling_lora_specs(args) and self._sampling_lora_requires_eager_fallback(transformer):
+                eager_sampling_swaps = model_utils.swap_compiled_modules_with_eager(transformer)
+                logger.info(
+                    "Sampling LoRA requested on a compiled FP8 transformer; switched %d compiled modules to eager for sampling only.",
+                    len(eager_sampling_swaps),
+                )
 
-            # Load VAE once before the prompt loop to avoid repeated disk reads from the
-            # (potentially huge) safetensors checkpoint.  Keep it on CPU between prompts.
-            vae_for_sampling = None
-            if transformer_offloaded:
-                vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
-                logger.info("Sampling offload: loading VAE for sampling (once)")
-                vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
+            applied_sampling_lora = self._apply_sampling_lora(args, transformer, accelerator.device)
 
-            with torch.no_grad(), accelerator.autocast():
-                for sample_parameter in sample_parameters:
-                    try:
-                        if transformer_offloaded:
-                            ensure_transformer_on_device()
-                            self.sample_image_inference(
-                                accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps,
-                                audio_decoder=audio_decoder, vocoder=vocoder,
-                            )
-                            offload_transformer_if_needed()
-                            vae_for_sampling.to_device("cpu")
-                            self._cleanup_cuda(accelerator.device)
-                        else:
-                            self.sample_image_inference(
-                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps,
-                                audio_decoder=audio_decoder, vocoder=vocoder,
-                            )
-                    except Exception as exc:
-                        logger.error("Sampling failed for prompt, skipping: %s", exc, exc_info=True)
-                    clean_memory_on_device(accelerator.device)
-                    self._cleanup_cuda(accelerator.device)
+            if distributed_state.num_processes <= 1:
+                # Batch encode all prompts upfront when offloading is enabled
+                if transformer_offloaded:
+                    offload_transformer_if_needed()
+                    prepare_all_embeddings_batch(sample_parameters)
 
-            if vae_for_sampling is not None:
-                del vae_for_sampling
-                self._cleanup_cuda(accelerator.device)
+                # Load VAE once before the prompt loop to avoid repeated disk reads from the
+                # (potentially huge) safetensors checkpoint.  Keep it on CPU between prompts.
+                vae_for_sampling = None
+                if transformer_offloaded:
+                    vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                    logger.info("Sampling offload: loading VAE for sampling (once)")
+                    vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
 
-            # Cleanup embeddings after all samples are done (but NOT if precached - they're reused)
-            if transformer_offloaded and not use_precached:
-                for sample_parameter in sample_parameters:
-                    cleanup_embeddings(sample_parameter)
-        else:
-            per_process_params = []
-            for i in range(distributed_state.num_processes):
-                per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
-
-            with torch.no_grad():
-                with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
-                    my_sample_params = sample_parameter_lists[0]
-
-                    # Batch encode all prompts for this process upfront
-                    if transformer_offloaded:
-                        offload_transformer_if_needed()
-                        prepare_all_embeddings_batch(my_sample_params)
-
-                    # Load VAE once before the prompt loop
-                    vae_for_sampling = None
-                    if transformer_offloaded:
-                        vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
-                        logger.info("Sampling offload: loading VAE for sampling (once)")
-                        vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
-
-                    for sample_parameter in my_sample_params:
+                with torch.no_grad(), accelerator.autocast():
+                    for sample_parameter in sample_parameters:
                         try:
                             if transformer_offloaded:
                                 ensure_transformer_on_device()
                                 self.sample_image_inference(
-                                    accelerator,
-                                    args,
-                                    transformer,
-                                    dit_dtype,
-                                    vae_for_sampling,
-                                    save_dir,
-                                    sample_parameter,
-                                    epoch,
-                                    steps,
-                                    audio_decoder=audio_decoder,
-                                    vocoder=vocoder,
+                                    accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps,
+                                    audio_decoder=audio_decoder, vocoder=vocoder,
                                 )
                                 offload_transformer_if_needed()
                                 vae_for_sampling.to_device("cpu")
@@ -4465,34 +4535,97 @@ class LTX2NetworkTrainer(NetworkTrainer):
                                 )
                         except Exception as exc:
                             logger.error("Sampling failed for prompt, skipping: %s", exc, exc_info=True)
+                        clean_memory_on_device(accelerator.device)
                         self._cleanup_cuda(accelerator.device)
 
-                    if vae_for_sampling is not None:
-                        del vae_for_sampling
-                        self._cleanup_cuda(accelerator.device)
+                if vae_for_sampling is not None:
+                    del vae_for_sampling
+                    self._cleanup_cuda(accelerator.device)
 
-                    # Cleanup embeddings after all samples for this process (but NOT if precached)
-                    if transformer_offloaded and not use_precached:
+                # Cleanup embeddings after all samples are done (but NOT if precached - they're reused)
+                if transformer_offloaded and not use_precached:
+                    for sample_parameter in sample_parameters:
+                        cleanup_embeddings(sample_parameter)
+            else:
+                per_process_params = []
+                for i in range(distributed_state.num_processes):
+                    per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
+
+                with torch.no_grad():
+                    with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
+                        my_sample_params = sample_parameter_lists[0]
+
+                        # Batch encode all prompts for this process upfront
+                        if transformer_offloaded:
+                            offload_transformer_if_needed()
+                            prepare_all_embeddings_batch(my_sample_params)
+
+                        # Load VAE once before the prompt loop
+                        vae_for_sampling = None
+                        if transformer_offloaded:
+                            vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                            logger.info("Sampling offload: loading VAE for sampling (once)")
+                            vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
+
                         for sample_parameter in my_sample_params:
-                            cleanup_embeddings(sample_parameter)
+                            try:
+                                if transformer_offloaded:
+                                    ensure_transformer_on_device()
+                                    self.sample_image_inference(
+                                        accelerator,
+                                        args,
+                                        transformer,
+                                        dit_dtype,
+                                        vae_for_sampling,
+                                        save_dir,
+                                        sample_parameter,
+                                        epoch,
+                                        steps,
+                                        audio_decoder=audio_decoder,
+                                        vocoder=vocoder,
+                                    )
+                                    offload_transformer_if_needed()
+                                    vae_for_sampling.to_device("cpu")
+                                    self._cleanup_cuda(accelerator.device)
+                                else:
+                                    self.sample_image_inference(
+                                        accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps,
+                                        audio_decoder=audio_decoder, vocoder=vocoder,
+                                    )
+                            except Exception as exc:
+                                logger.error("Sampling failed for prompt, skipping: %s", exc, exc_info=True)
+                            self._cleanup_cuda(accelerator.device)
 
-        torch.set_rng_state(rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state(cuda_rng_state)
+                        if vae_for_sampling is not None:
+                            del vae_for_sampling
+                            self._cleanup_cuda(accelerator.device)
 
-        if transformer_offloaded and next(transformer.parameters()).device != accelerator.device:
+                        # Cleanup embeddings after all samples for this process (but NOT if precached)
+                        if transformer_offloaded and not use_precached:
+                            for sample_parameter in my_sample_params:
+                                cleanup_embeddings(sample_parameter)
+        finally:
+            self._restore_sampling_lora(args, transformer, accelerator.device, applied_sampling_lora)
+            if eager_sampling_swaps:
+                model_utils.restore_compiled_modules(eager_sampling_swaps)
+
+            torch.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state)
+
+            if transformer_offloaded and next(transformer.parameters()).device != accelerator.device:
+                if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                    transformer.move_to_device_except_swap_blocks(accelerator.device)
+                else:
+                    transformer.to(accelerator.device)
+                logger.info("Sampling offload: restored transformer to training device")
+                clean_memory_on_device(accelerator.device)
+
+            transformer.switch_block_swap_for_training()
+            # Ensure block-swap layout is re-applied after sampling to avoid VRAM creep.
             if hasattr(transformer, "move_to_device_except_swap_blocks"):
                 transformer.move_to_device_except_swap_blocks(accelerator.device)
-            else:
-                transformer.to(accelerator.device)
-            logger.info("Sampling offload: restored transformer to training device")
-            clean_memory_on_device(accelerator.device)
-
-        transformer.switch_block_swap_for_training()
-        # Ensure block-swap layout is re-applied after sampling to avoid VRAM creep.
-        if hasattr(transformer, "move_to_device_except_swap_blocks"):
-            transformer.move_to_device_except_swap_blocks(accelerator.device)
-        self._cleanup_cuda(accelerator.device)
+            self._cleanup_cuda(accelerator.device)
 
     @staticmethod
     def _load_reference_for_output(
@@ -5021,6 +5154,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
             # else: subprocess mode or offloading mode - audio will be decoded later
 
         sample_steps = sample_parameter.get("sample_steps", 20)
+        sample_sigmas = self._parse_sample_sigmas_value(sample_parameter.get("sample_sigmas"))
+        if sample_sigmas is not None:
+            sample_parameter["sample_sigmas"] = sample_sigmas
+            sample_steps = len(sample_sigmas) - 1
+            sample_parameter["sample_steps"] = sample_steps
         width = sample_parameter.get("width", 768)
         height = sample_parameter.get("height", 512)
         frame_count = sample_parameter.get("frame_count", 45)
@@ -5098,6 +5236,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         logger.info(f"width: {width}")
         logger.info(f"frame count: {frame_count}")
         logger.info(f"sample steps: {sample_steps}")
+        if sample_sigmas is not None:
+            logger.info("sample sigmas: %s", ", ".join(f"{sigma:g}" for sigma in sample_sigmas))
         logger.info(f"guidance scale: {guidance_scale}")
         logger.info(f"discrete flow shift: {discrete_flow_shift}")
         if seed is not None:
@@ -5141,6 +5281,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 use_two_stage = False
 
         if use_two_stage:
+            if sample_sigmas is not None:
+                logger.warning(
+                    "Two-stage inference currently ignores custom sample sigmas; using the built-in stage schedulers."
+                )
             if v2v_ref_latent is not None:
                 logger.warning("V2V reference conditioning is not supported with two-stage inference; ignoring V2V reference")
                 v2v_ref_latent = None
@@ -5548,9 +5692,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     clean_latent = None
                     i2v_conditioning_mask_tokens = None
 
-        # Setup scheduler - official pipeline does NOT pass latent, uses default MAX_SHIFT_ANCHOR=4096
-        ltx2_scheduler = LTX2Scheduler()
-        sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
+        sigmas, sample_steps = self._resolve_sample_sigmas(
+            sample_parameter,
+            sample_steps=sample_steps,
+            device=transformer_device,
+        )
 
         audio_latents = None
         ref_audio_latents_device = None
@@ -6005,9 +6151,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
         elif getattr(args, "nf4_base", False):
             self._ensure_nf4_buffers_on_device(base_model)
 
-        # Scheduler
-        ltx2_scheduler = LTX2Scheduler()
-        sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
+        sigmas, sample_steps = self._resolve_sample_sigmas(
+            sample_parameter,
+            sample_steps=sample_steps,
+            device=transformer_device,
+        )
 
         # V2V denoising loop
         logger.info("V2V sampling: %d steps, ref_frames=%d, target_frames=%d", sample_steps, ref_frames, tgt_frames)
@@ -7202,4 +7350,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

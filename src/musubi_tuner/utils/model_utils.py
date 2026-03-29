@@ -226,6 +226,32 @@ def disable_linear_from_compile(module: torch.nn.Module):
             sub_module.forward = sub_module._eager_forward  # override forward to disable compile
 
 
+def swap_compiled_modules_with_eager(
+    module: torch.nn.Module,
+) -> list[tuple[torch.nn.Module, str, torch.nn.Module]]:
+    swapped: list[tuple[torch.nn.Module, str, torch.nn.Module]] = []
+
+    def walk(parent: torch.nn.Module):
+        for child_name, child_module in list(parent.named_children()):
+            eager_module = getattr(child_module, "_orig_mod", None)
+            if eager_module is not None and eager_module is not child_module and isinstance(eager_module, torch.nn.Module):
+                parent._modules[child_name] = eager_module
+                swapped.append((parent, child_name, child_module))
+                child_module = eager_module
+
+            walk(child_module)
+
+    walk(module)
+    return swapped
+
+
+def restore_compiled_modules(
+    swapped: list[tuple[torch.nn.Module, str, torch.nn.Module]],
+) -> None:
+    for parent, child_name, compiled_module in reversed(swapped):
+        parent._modules[child_name] = compiled_module
+
+
 def compile_transformer(
     args: argparse.Namespace,
     transformer: torch.nn.Module,

@@ -103,6 +103,12 @@ def parse_args() -> argparse.Namespace:
                         help="Number of frames (rounded to 8k+1)")
     parser.add_argument("--frame_rate", type=float, default=25.0, help="Output FPS")
     parser.add_argument("--sample_steps", type=int, default=20, help="Number of denoising steps")
+    parser.add_argument(
+        "--sample_sigmas",
+        type=str,
+        default=None,
+        help="Comma-separated sigma list to use instead of the default LTX scheduler, e.g. '1.0,0.99375,...,0.0'",
+    )
     parser.add_argument("--guidance_scale", type=float, default=1.0, help="Guidance scale (1.0 = no guidance)")
     parser.add_argument("--cfg_scale", type=float, default=None, help="CFG scale (overrides guidance_scale when set)")
     parser.add_argument("--discrete_flow_shift", type=float, default=5.0, help="Flow matching shift parameter")
@@ -275,6 +281,7 @@ def _build_prompt_list(
 
     # Single prompt from CLI
     prompt = args.prompt or ""
+    sample_sigmas = trainer._parse_sample_sigmas_value(getattr(args, "sample_sigmas", None))
     sample = {
         "prompt": prompt,
         "negative_prompt": args.negative_prompt or "",
@@ -282,13 +289,15 @@ def _build_prompt_list(
         "width": args.width,
         "frame_count": args.frame_count,
         "frame_rate": args.frame_rate,
-        "sample_steps": args.sample_steps,
+        "sample_steps": len(sample_sigmas) - 1 if sample_sigmas is not None else args.sample_steps,
         "guidance_scale": args.guidance_scale,
         "discrete_flow_shift": args.discrete_flow_shift,
         "seed": args.seed,
         "cfg_scale": args.cfg_scale,
         "enum": 0,
     }
+    if sample_sigmas is not None:
+        sample["sample_sigmas"] = sample_sigmas
     return [sample]
 
 

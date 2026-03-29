@@ -23,6 +23,7 @@ import huggingface_hub
 import toml
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from accelerate.utils import TorchDynamoPlugin, set_seed, DynamoBackend
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
@@ -338,6 +339,11 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["sample_steps"] = max(1, min(1000, int(m.group(1))))
                 continue
 
+            m = re.match(r"(?:sg|sample_sigmas) (.+)", parg, re.IGNORECASE)
+            if m:
+                prompt_dict["sample_sigmas"] = m.group(1).strip()
+                continue
+
             m = re.match(r"g ([\d\.]+)", parg, re.IGNORECASE)
             if m:  # scale
                 prompt_dict["guidance_scale"] = float(m.group(1))
@@ -524,8 +530,190 @@ class NetworkTrainer:
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
+        self._network_module = None
+        self._network_module_name: Optional[str] = None
+        self._sampling_lora_cache: dict[str, dict[str, torch.Tensor]] = {}
         self._current_batch_latents_info: Optional[dict[str, Any]] = None
         self.training = False
+
+    def _sampling_lora_float8_dtypes(self) -> tuple[torch.dtype, ...]:
+        return tuple(
+            dt
+            for dt in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+                getattr(torch, "float8_e5m2", None),
+                getattr(torch, "float8_e5m2fnuz", None),
+            )
+            if dt is not None
+        )
+
+    def _clear_sampling_lora_runtime_overlays(self, transformer: torch.nn.Module) -> int:
+        cleared = 0
+        for module in transformer.modules():
+            if hasattr(module, "_sampling_lora_runtime_forward"):
+                module.forward = module._sampling_lora_runtime_forward
+                delattr(module, "_sampling_lora_runtime_forward")
+            if hasattr(module, "_sampling_lora_runtime_adapters"):
+                for adapter in module._sampling_lora_runtime_adapters:
+                    for key in ("A", "B"):
+                        buffer_name = adapter.get(key)
+                        if isinstance(buffer_name, str):
+                            module._buffers.pop(buffer_name, None)
+                delattr(module, "_sampling_lora_runtime_adapters")
+                if hasattr(module, "_sampling_lora_runtime_adapter_index"):
+                    delattr(module, "_sampling_lora_runtime_adapter_index")
+                cleared += 1
+        return cleared
+
+    def _attach_sampling_lora_runtime_overlay(
+        self,
+        module: torch.nn.Module,
+        down: torch.Tensor,
+        up: torch.Tensor,
+        scale: float,
+        *,
+        device: torch.device,
+        compute_dtype: torch.dtype,
+    ) -> None:
+        if not hasattr(module, "_sampling_lora_runtime_adapters"):
+            module._sampling_lora_runtime_adapters = []
+        if not hasattr(module, "_sampling_lora_runtime_adapter_index"):
+            module._sampling_lora_runtime_adapter_index = 0
+        if not hasattr(module, "_sampling_lora_runtime_forward"):
+            module._sampling_lora_runtime_forward = module.forward
+
+            def _sampling_lora_runtime_forward(self, x):
+                out = self._sampling_lora_runtime_forward(x)
+                if getattr(self, "_sampling_lora_runtime_adapters", None):
+                    for adapter in self._sampling_lora_runtime_adapters:
+                        adapter_a = getattr(self, adapter["A"]) if isinstance(adapter["A"], str) else adapter["A"]
+                        adapter_b = getattr(self, adapter["B"]) if isinstance(adapter["B"], str) else adapter["B"]
+                        lora_input = x.to(device=adapter_a.device, dtype=adapter_a.dtype)
+                        lora_out = F.linear(F.linear(lora_input, adapter_a), adapter_b).to(device=out.device, dtype=out.dtype)
+                        out = out + adapter["scale"] * lora_out
+                return out
+
+            module.forward = _sampling_lora_runtime_forward.__get__(module, module.__class__)
+
+        adapter_idx = int(module._sampling_lora_runtime_adapter_index)
+        down_name = f"_sampling_lora_runtime_A_{adapter_idx}"
+        up_name = f"_sampling_lora_runtime_B_{adapter_idx}"
+        module.register_buffer(down_name, down.to(device=device, dtype=compute_dtype), persistent=False)
+        module.register_buffer(up_name, up.to(device=device, dtype=compute_dtype), persistent=False)
+        module._sampling_lora_runtime_adapter_index = adapter_idx + 1
+        module._sampling_lora_runtime_adapters.append(
+            {
+                "A": down_name,
+                "B": up_name,
+                "scale": float(scale),
+            }
+        )
+
+    def _iter_sampling_lora_module_weights(
+        self,
+        network,
+        weights_sd: dict[str, torch.Tensor],
+    ):
+        for lora in list(getattr(network, "text_encoder_loras", [])) + list(getattr(network, "unet_loras", [])):
+            sd_for_lora = {}
+            prefix = f"{lora.lora_name}."
+            for key, value in weights_sd.items():
+                if key.startswith(prefix):
+                    sd_for_lora[key[len(prefix):]] = value
+            if sd_for_lora:
+                yield lora, sd_for_lora
+
+    def _sampling_lora_requires_eager_fallback(
+        self,
+        transformer: torch.nn.Module,
+    ) -> bool:
+        float8_dtypes = self._sampling_lora_float8_dtypes()
+        if not float8_dtypes:
+            return False
+
+        has_compiled_modules = False
+        has_float8_modules = False
+        for module in transformer.modules():
+            eager_module = getattr(module, "_orig_mod", None)
+            if eager_module is not None and eager_module is not module and isinstance(eager_module, torch.nn.Module):
+                has_compiled_modules = True
+
+            weight = getattr(module, "weight", None)
+            if isinstance(weight, torch.Tensor) and weight.dtype in float8_dtypes:
+                has_float8_modules = True
+
+            if has_compiled_modules and has_float8_modules:
+                return True
+
+        return False
+
+    def _apply_sampling_lora_network(
+        self,
+        network,
+        weights_sd: dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> tuple[int, int, dict[int, tuple[torch.nn.Module, torch.Tensor]]]:
+        float8_dtypes = self._sampling_lora_float8_dtypes()
+        runtime_attached = 0
+        merged = 0
+        backups: dict[int, tuple[torch.nn.Module, torch.Tensor]] = {}
+
+        for lora, sd_for_lora in self._iter_sampling_lora_module_weights(network, weights_sd):
+            org_module = lora.org_module_ref[0]
+            if not hasattr(org_module, "weight"):
+                continue
+
+            base_weight = org_module.weight.data
+            is_nf4_quantized = bool(getattr(org_module, "_nf4_quantized", False))
+            if is_nf4_quantized or (float8_dtypes and base_weight.dtype in float8_dtypes):
+                supports_runtime_overlay = (
+                    lora.split_dims is None
+                    and org_module.__class__.__name__.endswith("Linear")
+                    and "lora_down.weight" in sd_for_lora
+                    and "lora_up.weight" in sd_for_lora
+                    and base_weight.ndim == 2
+                )
+                if supports_runtime_overlay:
+                    overlay_dtype = sd_for_lora["lora_down.weight"].dtype
+                    if not getattr(overlay_dtype, "is_floating_point", False) or overlay_dtype in float8_dtypes:
+                        overlay_dtype = torch.float32
+                    self._attach_sampling_lora_runtime_overlay(
+                        org_module,
+                        sd_for_lora["lora_down.weight"],
+                        sd_for_lora["lora_up.weight"],
+                        lora.multiplier * float(lora.scale),
+                        device=base_weight.device,
+                        compute_dtype=overlay_dtype,
+                    )
+                    runtime_attached += 1
+                    continue
+
+                quantized_kind = "NF4" if is_nf4_quantized else "float8"
+                logger.warning(
+                    f"Sampling LoRA fallback-merging {quantized_kind} module {lora.lora_name}; "
+                    "runtime overlay is only supported for standard Linear LoRA modules."
+                )
+
+            backup_key = id(org_module)
+            if backup_key not in backups:
+                backups[backup_key] = (org_module, org_module.weight.detach().to("cpu").clone())
+
+            lora.merge_to(sd_for_lora, dtype=None, device=device)
+            merged += 1
+
+        return merged, runtime_attached, backups
+
+    def _restore_sampling_lora_network(
+        self,
+        backups: dict[int, tuple[torch.nn.Module, torch.Tensor]],
+    ) -> int:
+        restored = 0
+        with torch.no_grad():
+            for org_module, original_weight in backups.values():
+                org_module.weight.copy_(original_weight.to(device=org_module.weight.device, dtype=org_module.weight.dtype))
+                restored += 1
+        return restored
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -1628,6 +1816,95 @@ class NetworkTrainer:
             return convert_lora.convert_from_diffusers("lora_unet_", weights_sd)
         return weights_sd  # unknown format, return as is
 
+    def normalize_sampling_lora_weights(
+        self,
+        args: argparse.Namespace,
+        weights_sd: dict[str, torch.Tensor],
+        weight_path: str,
+    ) -> dict[str, torch.Tensor]:
+        network_module_name = self._network_module_name or args.network_module
+        return self.convert_weight_keys(weights_sd, network_module_name)
+
+    def _get_sampling_lora_specs(self, args: argparse.Namespace) -> list[tuple[str, float]]:
+        if not getattr(args, "sampling_lora_weight", None):
+            return []
+
+        specs: list[tuple[str, float]] = []
+        multipliers = getattr(args, "sampling_lora_multiplier", None) or []
+        for i, weight_path in enumerate(args.sampling_lora_weight):
+            multiplier = float(multipliers[i]) if i < len(multipliers) else 1.0
+            specs.append((weight_path, multiplier))
+        return specs
+
+    def _load_sampling_lora_weights(
+        self,
+        args: argparse.Namespace,
+        weight_path: str,
+    ) -> dict[str, torch.Tensor]:
+        cached = self._sampling_lora_cache.get(weight_path)
+        if cached is not None:
+            return cached
+
+        weights_sd = load_file(weight_path)
+        weights_sd = self.normalize_sampling_lora_weights(args, weights_sd, weight_path)
+        self._sampling_lora_cache[weight_path] = weights_sd
+        return weights_sd
+
+    def _apply_sampling_lora(
+        self,
+        args: argparse.Namespace,
+        transformer: torch.nn.Module,
+        device: torch.device,
+    ) -> list[tuple[str, dict[int, tuple[torch.nn.Module, torch.Tensor]]]]:
+        specs = self._get_sampling_lora_specs(args)
+        if not specs:
+            return []
+
+        network_module = self._network_module or importlib.import_module(args.network_module)
+        applied: list[tuple[str, dict[int, tuple[torch.nn.Module, torch.Tensor]]]] = []
+        stale_overlays = self._clear_sampling_lora_runtime_overlays(transformer)
+        if stale_overlays:
+            logger.warning(
+                f"Cleared {stale_overlays} stale sampling LoRA runtime overlays before applying new sampling weights."
+            )
+
+        for weight_path, multiplier in specs:
+            logger.info(f"Loading sampling LoRA weights from {weight_path} with multiplier {multiplier}")
+            weights_sd = self._load_sampling_lora_weights(args, weight_path)
+            module = network_module.create_arch_network_from_weights(
+                multiplier,
+                weights_sd,
+                unet=transformer,
+                for_inference=True,
+            )
+            merged, runtime_attached, backups = self._apply_sampling_lora_network(module, weights_sd, device)
+            logger.info(
+                f"Applied sampling LoRA {weight_path}: merged={merged} runtime_overlays={runtime_attached}"
+            )
+            if merged == 0 and runtime_attached == 0:
+                logger.warning(f"Sampling LoRA {weight_path} did not match any modules on the current transformer.")
+            applied.append((weight_path, backups))
+
+        return applied
+
+    def _restore_sampling_lora(
+        self,
+        args: argparse.Namespace,
+        transformer: torch.nn.Module,
+        device: torch.device,
+        applied: list[tuple[str, dict[int, tuple[torch.nn.Module, torch.Tensor]]]],
+    ) -> None:
+        if not applied:
+            return
+
+        runtime_cleared = self._clear_sampling_lora_runtime_overlays(transformer)
+        for weight_path, backups in reversed(applied):
+            logger.info(f"Restoring sampling LoRA weights from {weight_path}")
+            restored = self._restore_sampling_lora_network(backups)
+            logger.info(f"Restored sampling LoRA {weight_path}: restored_modules={restored}")
+        if runtime_cleared:
+            logger.info(f"Cleared {runtime_cleared} sampling LoRA runtime overlays.")
+
     def process_sample_prompts(
         self,
         args: argparse.Namespace,
@@ -2209,6 +2486,8 @@ class NetworkTrainer:
         sys.path.append(os.path.dirname(__file__))
         accelerator.print("import network module:", args.network_module)
         network_module: lora_module = importlib.import_module(args.network_module)  # actual module may be different
+        self._network_module = network_module
+        self._network_module_name = args.network_module
 
         if args.base_weights is not None:
             # if base_weights is specified, merge the weights to DiT model
@@ -3822,6 +4101,26 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="file for prompts to generate sample images / 学習中モデルのサンプル出力用プロンプトのファイル",
+    )
+    parser.add_argument(
+        "--sample_sigmas",
+        type=str,
+        default=None,
+        help="Comma-separated sigma list for LTX sampling previews, e.g. '1.0,0.9,0.5,0.0'. When set, overrides scheduler-generated sigmas.",
+    )
+    parser.add_argument(
+        "--sampling_lora_weight",
+        type=str,
+        default=None,
+        nargs="*",
+        help="LoRA weights to merge only during sample image generation / サンプル画像生成時のみ一時的にマージするLoRA重み",
+    )
+    parser.add_argument(
+        "--sampling_lora_multiplier",
+        type=float,
+        default=None,
+        nargs="*",
+        help="Multiplier for LoRA weights merged only during sample image generation / サンプル画像生成時のみ一時的にマージするLoRA重みの倍率",
     )
     parser.add_argument(
         "--validate_every_n_steps",
