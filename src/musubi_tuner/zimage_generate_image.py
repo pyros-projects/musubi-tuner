@@ -12,6 +12,7 @@ from safetensors.torch import load_file, save_file
 from safetensors import safe_open
 from tqdm import tqdm
 
+from musubi_tuner.utils.inference_lora_utils import normalize_lora_weight_args, normalize_zimage_inference_lora_weights
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.lora_utils import filter_lora_state_dict
 from musubi_tuner.zimage import zimage_config, zimage_model, zimage_utils
@@ -150,6 +151,8 @@ def parse_args() -> argparse.Namespace:
     if args.lycoris and not lycoris_available:
         raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
 
+    args.lora_weight, args.lora_multiplier = normalize_lora_weight_args(args.lora_weight, args.lora_multiplier)
+
     return args
 
 
@@ -264,6 +267,7 @@ def load_dit_model(
         for lora_weight in args.lora_weight:
             logger.info(f"Loading LoRA weight from: {lora_weight}")
             lora_sd = load_file(lora_weight)  # load on CPU, dtype is as is
+            lora_sd = normalize_zimage_inference_lora_weights(lora_sd)
             lora_sd = filter_lora_state_dict(lora_sd, args.include_patterns, args.exclude_patterns)
             lora_weights_list.append(lora_sd)
     else:
@@ -302,6 +306,7 @@ def load_dit_model(
                 device,
                 lycoris=True,
                 save_merged_model=args.save_merged_model,
+                converter=normalize_zimage_inference_lora_weights,
             )
 
         if args.fp8_scaled:
