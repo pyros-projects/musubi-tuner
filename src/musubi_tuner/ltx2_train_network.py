@@ -3904,6 +3904,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
         default_discrete_flow_shift = getattr(args, "discrete_flow_shift", None)
         default_sample_sigmas = self._parse_sample_sigmas_value(getattr(args, "sample_sigmas", None))
         default_sample_steps = len(default_sample_sigmas) - 1 if default_sample_sigmas is not None else 20
+        default_stage1_distilled_lora_multiplier = float(
+            getattr(args, "sample_stage1_distilled_lora_multiplier", 1.0)
+        )
+        default_stage2_distilled_lora_multiplier = float(
+            getattr(args, "sample_stage2_distilled_lora_multiplier", 1.0)
+        )
 
         sample_parameters = []
         for prompt_data in prompts:
@@ -3923,6 +3929,26 @@ class LTX2NetworkTrainer(NetworkTrainer):
             else:
                 param.setdefault("sample_steps", prompt_data.get("sample_steps", default_sample_steps))
             param.setdefault("guidance_scale", prompt_data.get("guidance_scale", default_guidance_scale))
+            param.setdefault(
+                "stage1_distilled_lora_multiplier",
+                prompt_data.get(
+                    "stage1_distilled_lora_multiplier",
+                    prompt_data.get(
+                        "sample_stage1_distilled_lora_multiplier",
+                        default_stage1_distilled_lora_multiplier,
+                    ),
+                ),
+            )
+            param.setdefault(
+                "stage2_distilled_lora_multiplier",
+                prompt_data.get(
+                    "stage2_distilled_lora_multiplier",
+                    prompt_data.get(
+                        "sample_stage2_distilled_lora_multiplier",
+                        default_stage2_distilled_lora_multiplier,
+                    ),
+                ),
+            )
             if default_discrete_flow_shift is not None:
                 param.setdefault("discrete_flow_shift", prompt_data.get("discrete_flow_shift", default_discrete_flow_shift))
             param.setdefault("seed", prompt_data.get("seed", 0))
@@ -6396,6 +6422,24 @@ class LTX2NetworkTrainer(NetworkTrainer):
             spatial_upsampler_path=spatial_upsampler_path,
             distilled_lora_path=distilled_lora_path,
             stage1_use_distilled_lora=bool(getattr(args, "sample_stage1_use_distilled_lora", False)),
+            stage1_distilled_lora_multiplier=float(
+                sample_parameter.get(
+                    "stage1_distilled_lora_multiplier",
+                    sample_parameter.get(
+                        "sample_stage1_distilled_lora_multiplier",
+                        getattr(args, "sample_stage1_distilled_lora_multiplier", 1.0),
+                    ),
+                )
+            ),
+            stage2_distilled_lora_multiplier=float(
+                sample_parameter.get(
+                    "stage2_distilled_lora_multiplier",
+                    sample_parameter.get(
+                        "sample_stage2_distilled_lora_multiplier",
+                        getattr(args, "sample_stage2_distilled_lora_multiplier", 1.0),
+                    ),
+                )
+            ),
             stage1_sigmas=list(stage1_sigmas) if stage1_sigmas is not None else None,
             stage2_sigmas=list(STAGE_2_DISTILLED_SIGMA_VALUES[:stage2_steps + 1]),
             stage2_steps=stage2_steps,
@@ -7058,6 +7102,18 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_stage1_use_distilled_lora",
         action="store_true",
         help="Experimental: apply the distilled LoRA during stage 1 as well, and keep it active through stage 2.",
+    )
+    parser.add_argument(
+        "--sample_stage1_distilled_lora_multiplier",
+        type=float,
+        default=1.0,
+        help="Distilled LoRA multiplier to use during stage 1 when stage-1 distilled sampling is enabled.",
+    )
+    parser.add_argument(
+        "--sample_stage2_distilled_lora_multiplier",
+        type=float,
+        default=1.0,
+        help="Distilled LoRA multiplier to use during stage 2 refinement.",
     )
     parser.add_argument(
         "--sample_official_distilled_pipeline",

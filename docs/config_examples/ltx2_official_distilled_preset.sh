@@ -7,6 +7,8 @@ CHECKPOINT="/abs/path/to/ltx-2.3-22b-dev-nf4.safetensors"
 GEMMA_ROOT="/abs/path/to/gemma-3-12b-it-qat-q4_0-unquantized"
 SPATIAL_UPSAMPLER="/abs/path/to/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 DISTILLED_LORA="/abs/path/to/ltx-2.3-22b-distilled-lora.safetensors"
+STAGE1_DISTILLED_LORA_MULTIPLIER="1.0"
+STAGE2_DISTILLED_LORA_MULTIPLIER="1.0"
 
 PROMPT="cinematic close-up of a woman walking through neon rain at night, shallow depth of field, realistic lighting"
 NEGATIVE_PROMPT=""
@@ -47,6 +49,8 @@ PYTHONPATH=src python -m musubi_tuner.ltx2_generate_video \
   --frame_rate "$FRAME_RATE" \
   --spatial_upsampler_path "$SPATIAL_UPSAMPLER" \
   --distilled_lora_path "$DISTILLED_LORA" \
+  --sample_stage1_distilled_lora_multiplier "$STAGE1_DISTILLED_LORA_MULTIPLIER" \
+  --sample_stage2_distilled_lora_multiplier "$STAGE2_DISTILLED_LORA_MULTIPLIER" \
   --sample_official_distilled_pipeline \
   --sample_with_offloading \
   --sample_tiled_vae \

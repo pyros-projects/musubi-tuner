@@ -1,0 +1,58 @@
+# Example prompt file for `--sample_prompts` with LTX-2 two-stage sampling.
+# Uses TOML so per-sample overrides like stage-specific distilled LoRA multipliers
+# can be expressed directly.
+#
+# Example usage:
+#   source .venv/bin/activate
+#   PYTHONPATH=src python -m musubi_tuner.ltx2_generate_video \
+#     --device cuda \
+#     --mixed_precision bf16 \
+#     --ltx2_checkpoint /abs/path/to/ltx-2.3-22b-dev-nf4.safetensors \
+#     --vae /abs/path/to/ltx-2.3-22b-dev-nf4.safetensors \
+#     --ltx_version 2.3 \
+#     --ltx_version_check_mode error \
+#     --nf4_base \
+#     --gemma_root /abs/path/to/gemma-3-12b-it-qat-q4_0-unquantized \
+#     --gemma_load_in_4bit \
+#     --sample_prompts /abs/path/to/ltx2_sample_prompts_two_stage.toml \
+#     --spatial_upsampler_path /abs/path/to/ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+#     --distilled_lora_path /abs/path/to/ltx-2.3-22b-distilled-lora.safetensors \
+#     --sample_official_distilled_pipeline \
+#     --sample_with_offloading \
+#     --sample_tiled_vae \
+#     --sample_vae_tile_size 512 \
+#     --sample_vae_tile_overlap 64 \
+#     --output_dir /abs/path/to/output/ltx23_promptfile \
+#     --output_name ltx23_promptfile
+#
+# Omit `seed` in a subset to use a random seed for that sample.
+
+[prompt]
+width = 1280
+height = 832
+frame_count = 49
+frame_rate = 24
+sample_steps = 8
+sample_sigmas = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+guidance_scale = 1.0
+cfg_scale = 1.0
+negative_prompt = ""
+stage1_distilled_lora_multiplier = 1.0
+stage2_distilled_lora_multiplier = 1.0
+
+[[prompt.subset]]
+prompt = "cinematic close-up of a woman walking through neon rain at night, shallow depth of field, realistic lighting"
+seed = 1234
+
+[[prompt.subset]]
+prompt = "two tennis players rallying on an outdoor clay court, long lens sports footage, natural motion, realistic sunlight"
+seed = 2345
+stage1_distilled_lora_multiplier = 0.75
+stage2_distilled_lora_multiplier = 1.0
+
+[[prompt.subset]]
+prompt = "slow drone shot over a pine forest valley at sunrise, mist between trees, realistic aerial cinematography"
+seed = 3456
+frame_count = 81
+stage1_distilled_lora_multiplier = 0.6
+stage2_distilled_lora_multiplier = 0.9

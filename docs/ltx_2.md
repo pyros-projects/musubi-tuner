@@ -1279,6 +1279,8 @@ For IC-LoRA / V2V training, you can also precache the conditioning image latents
 | `--spatial_upsampler_path` | — | Path to spatial upsampler model. Required when `--sample_two_stage` is set |
 | `--distilled_lora_path` | — | Path to distilled LoRA for stage 2 refinement. Optional |
 | `--sample_stage1_use_distilled_lora` | off | Experimental: keep the distilled LoRA active during stage 1 as well as stage 2 |
+| `--sample_stage1_distilled_lora_multiplier` | 1.0 | Distilled LoRA multiplier to use during stage 1 when stage-1 distilled sampling is enabled |
+| `--sample_stage2_distilled_lora_multiplier` | 1.0 | Distilled LoRA multiplier to use during stage 2 refinement |
 | `--sample_official_distilled_pipeline` | off | Use the official distilled two-stage preset: 8 distilled stage-1 steps, 4 distilled stage-2 steps, and no CFG. Requires both `--spatial_upsampler_path` and `--distilled_lora_path` |
 | `--sample_stage2_steps` | 3 | Number of denoising steps for stage 2 |
 
@@ -1289,6 +1291,8 @@ The official distilled preset applies the same stage-1 sigma schedule used by th
 ```
 
 It also forces `guidance_scale=1.0` and `cfg_scale=1.0`, enables stage-1 distilled LoRA application, and uses the built-in 4-value distilled stage-2 refine schedule.
+
+When using prompt files, the same stage-specific multipliers can be overridden per sample with `stage1_distilled_lora_multiplier` and `stage2_distilled_lora_multiplier`.
 
 #### Checkpoint Output Format
 

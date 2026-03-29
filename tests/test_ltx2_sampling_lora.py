@@ -1,3 +1,4 @@
+import argparse
 import sys
 import tempfile
 import unittest
@@ -27,7 +28,7 @@ from musubi_tuner.ltx2_inference import (
     build_vae_tiling_config,
 )
 from musubi_tuner.ltx2_lora_utils import normalize_ltx_comfy_lora_weights
-from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
+from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser
 from musubi_tuner.ltx_2.model.video_vae.video_vae import VideoDecoder, resolve_slice_bounds
 from musubi_tuner.ltx_2.model.video_vae.tiling import Tile
 
@@ -254,6 +255,89 @@ class LTX2SamplingLoraTests(unittest.TestCase):
             events,
             ["apply", "denoise:Stage 1", "upsample", "denoise:Stage 2 refine", "remove"],
         )
+
+    def test_two_stage_generate_uses_distilled_lora_stage_specific_multipliers(self):
+        inferencer = LTX2Inferencer(
+            transformer=_FakeTransformer(),
+            vae=object(),
+            device=torch.device("cpu"),
+            dit_dtype=torch.float32,
+            audio_video_mode=False,
+        )
+        inferencer._spatial_upsampler = _FakeUpsampler()
+        inferencer._distilled_lora_state = {"dummy": torch.randn(1)}
+
+        events = []
+
+        def _record_apply(multiplier=1.0):
+            events.append(("apply", float(multiplier)))
+
+        def _record_remove(multiplier=1.0):
+            events.append(("remove", float(multiplier)))
+
+        with mock.patch.object(inferencer, "_prepare_prompt_embeds", return_value=(torch.zeros(1, 1, 4), None)), \
+             mock.patch.object(inferencer, "_get_vae_factors", return_value=(8, 32)), \
+             mock.patch.object(inferencer, "_get_expected_embed_dim", return_value=None), \
+             mock.patch.object(inferencer, "_init_latents", return_value=torch.zeros((1, 1, 7, 2, 2))), \
+             mock.patch.object(inferencer, "_upsample_latents", side_effect=lambda latents, upsampler: latents), \
+             mock.patch.object(inferencer, "_apply_distilled_lora", side_effect=_record_apply), \
+             mock.patch.object(inferencer, "_remove_distilled_lora", side_effect=_record_remove), \
+             mock.patch.object(inferencer, "_denoise_loop", side_effect=lambda latents, sigmas, *args, **kwargs: (latents, None)):
+            inferencer.generate(
+                InferenceConfig(
+                    two_stage=True,
+                    spatial_upsampler_path="/tmp/upsampler.safetensors",
+                    distilled_lora_path="/tmp/distilled.safetensors",
+                    stage1_use_distilled_lora=True,
+                    stage1_distilled_lora_multiplier=0.65,
+                    stage2_distilled_lora_multiplier=0.35,
+                    width=768,
+                    height=512,
+                    frame_count=49,
+                    sample_steps=2,
+                    stage2_steps=1,
+                    cfg_scale=1.0,
+                    guidance_scale=1.0,
+                    prompt_embeds=torch.zeros(1, 1, 4),
+                ),
+                decode_video=False,
+            )
+
+        self.assertEqual(
+            events,
+            [("apply", 0.65), ("remove", 0.65), ("apply", 0.35), ("remove", 0.35)],
+        )
+
+        events.clear()
+        with mock.patch.object(inferencer, "_prepare_prompt_embeds", return_value=(torch.zeros(1, 1, 4), None)), \
+             mock.patch.object(inferencer, "_get_vae_factors", return_value=(8, 32)), \
+             mock.patch.object(inferencer, "_get_expected_embed_dim", return_value=None), \
+             mock.patch.object(inferencer, "_init_latents", return_value=torch.zeros((1, 1, 7, 2, 2))), \
+             mock.patch.object(inferencer, "_upsample_latents", side_effect=lambda latents, upsampler: latents), \
+             mock.patch.object(inferencer, "_apply_distilled_lora", side_effect=_record_apply), \
+             mock.patch.object(inferencer, "_remove_distilled_lora", side_effect=_record_remove), \
+             mock.patch.object(inferencer, "_denoise_loop", side_effect=lambda latents, sigmas, *args, **kwargs: (latents, None)):
+            inferencer.generate(
+                InferenceConfig(
+                    two_stage=True,
+                    spatial_upsampler_path="/tmp/upsampler.safetensors",
+                    distilled_lora_path="/tmp/distilled.safetensors",
+                    stage1_use_distilled_lora=False,
+                    stage1_distilled_lora_multiplier=0.65,
+                    stage2_distilled_lora_multiplier=0.35,
+                    width=768,
+                    height=512,
+                    frame_count=49,
+                    sample_steps=2,
+                    stage2_steps=1,
+                    cfg_scale=1.0,
+                    guidance_scale=1.0,
+                    prompt_embeds=torch.zeros(1, 1, 4),
+                ),
+                decode_video=False,
+            )
+
+        self.assertEqual(events, [("apply", 0.35), ("remove", 0.35)])
 
     def test_two_stage_generate_uses_explicit_stage_sigmas(self):
         inferencer = LTX2Inferencer(
@@ -483,6 +567,46 @@ class LTX2SamplingLoraTests(unittest.TestCase):
 
         self.assertTrue(args.sample_official_distilled_pipeline)
 
+    def test_generator_parse_args_accepts_stage_specific_distilled_multipliers(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "ltx2_generate_video.py",
+                "--ltx2_checkpoint",
+                "/tmp/ltx.safetensors",
+                "--gemma_root",
+                "/tmp/gemma",
+                "--prompt",
+                "hello",
+                "--sample_stage1_distilled_lora_multiplier",
+                "0.75",
+                "--sample_stage2_distilled_lora_multiplier",
+                "0.25",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.sample_stage1_distilled_lora_multiplier, 0.75)
+        self.assertEqual(args.sample_stage2_distilled_lora_multiplier, 0.25)
+
+    def test_training_parser_accepts_stage_specific_distilled_multipliers(self):
+        parser = ltx2_setup_parser(argparse.ArgumentParser())
+
+        args = parser.parse_args(
+            [
+                "--ltx2_checkpoint",
+                "/tmp/ltx.safetensors",
+                "--sample_stage1_distilled_lora_multiplier",
+                "0.75",
+                "--sample_stage2_distilled_lora_multiplier",
+                "0.25",
+            ]
+        )
+
+        self.assertEqual(args.sample_stage1_distilled_lora_multiplier, 0.75)
+        self.assertEqual(args.sample_stage2_distilled_lora_multiplier, 0.25)
+
     def test_apply_official_distilled_pipeline_args_sets_expected_overrides(self):
         args = Namespace(
             sample_official_distilled_pipeline=True,
@@ -621,6 +745,36 @@ class LTX2SamplingLoraTests(unittest.TestCase):
         self.assertEqual(params[0]["sample_sigmas"], [1.0, 0.9, 0.5, 0.0])
         self.assertEqual(params[0]["sample_steps"], 3)
 
+    def test_apply_sample_defaults_propagates_stage_specific_distilled_lora_multipliers(self):
+        trainer = LTX2NetworkTrainer()
+        args = Namespace(
+            height=512,
+            width=768,
+            sample_num_frames=45,
+            guidance_scale=1.0,
+            discrete_flow_shift=5.0,
+            sample_sigmas=None,
+            sample_stage1_distilled_lora_multiplier=0.8,
+            sample_stage2_distilled_lora_multiplier=0.6,
+        )
+
+        params = trainer._apply_sample_defaults(
+            args,
+            [
+                {"prompt": "default"},
+                {
+                    "prompt": "override",
+                    "stage1_distilled_lora_multiplier": 0.4,
+                    "stage2_distilled_lora_multiplier": 0.2,
+                },
+            ],
+        )
+
+        self.assertEqual(params[0]["stage1_distilled_lora_multiplier"], 0.8)
+        self.assertEqual(params[0]["stage2_distilled_lora_multiplier"], 0.6)
+        self.assertEqual(params[1]["stage1_distilled_lora_multiplier"], 0.4)
+        self.assertEqual(params[1]["stage2_distilled_lora_multiplier"], 0.2)
+
     def test_resolve_sample_sigmas_uses_explicit_values(self):
         trainer = LTX2NetworkTrainer()
 
@@ -664,6 +818,8 @@ class LTX2SamplingLoraTests(unittest.TestCase):
             discrete_flow_shift=5.0,
             seed=123,
             cfg_scale=None,
+            sample_stage1_distilled_lora_multiplier=1.0,
+            sample_stage2_distilled_lora_multiplier=1.0,
         )
 
         prompts = _build_prompt_list(trainer, args, _FakeAccelerator())

@@ -82,6 +82,8 @@ class InferenceConfig:
     spatial_upsampler_path: Optional[str] = None
     distilled_lora_path: Optional[str] = None
     stage1_use_distilled_lora: bool = False
+    stage1_distilled_lora_multiplier: float = 1.0
+    stage2_distilled_lora_multiplier: float = 1.0
     stage1_sigmas: Optional[list[float]] = None
     stage2_sigmas: Optional[list[float]] = None
     stage2_steps: int = 3  # Stage 2 uses 3 steps (4 sigma values including 0.0)
@@ -797,12 +799,17 @@ class LTX2Inferencer:
                 )
 
         distilled_lora_active = False
+        active_distilled_multiplier: Optional[float] = None
         if config.two_stage and config.distilled_lora_path and config.stage1_use_distilled_lora:
             if self._distilled_lora_state is None:
                 self.load_distilled_lora(config.distilled_lora_path)
-            logger.info("Stage 1: Applying distilled LoRA before initial generation")
-            self._apply_distilled_lora()
+            logger.info(
+                "Stage 1: Applying distilled LoRA before initial generation (multiplier=%.3f)",
+                float(config.stage1_distilled_lora_multiplier),
+            )
+            self._apply_distilled_lora(float(config.stage1_distilled_lora_multiplier))
             distilled_lora_active = True
+            active_distilled_multiplier = float(config.stage1_distilled_lora_multiplier)
 
         # Stage 1: Main generation
         # Official pipeline does NOT pass latent to scheduler - uses default MAX_SHIFT_ANCHOR=4096
@@ -871,11 +878,27 @@ class LTX2Inferencer:
                         self.transformer.to(self.device)
 
                 # Apply distilled LoRA for stage 2 when not already active from stage 1
-                if config.distilled_lora_path and not distilled_lora_active:
+                if config.distilled_lora_path:
                     if self._distilled_lora_state is None:
                         self.load_distilled_lora(config.distilled_lora_path)
-                    self._apply_distilled_lora()
-                    distilled_lora_active = True
+                    stage2_multiplier = float(config.stage2_distilled_lora_multiplier)
+                    if distilled_lora_active and active_distilled_multiplier != stage2_multiplier:
+                        logger.info(
+                            "Stage 2: Switching distilled LoRA multiplier from %.3f to %.3f",
+                            float(active_distilled_multiplier),
+                            stage2_multiplier,
+                        )
+                        self._remove_distilled_lora(float(active_distilled_multiplier))
+                        distilled_lora_active = False
+                        active_distilled_multiplier = None
+                    if not distilled_lora_active:
+                        logger.info(
+                            "Stage 2: Applying distilled LoRA for refinement (multiplier=%.3f)",
+                            stage2_multiplier,
+                        )
+                        self._apply_distilled_lora(stage2_multiplier)
+                        distilled_lora_active = True
+                        active_distilled_multiplier = stage2_multiplier
 
                 # Stage 2 denoising with distilled sigmas
                 stage2_sigma_values = config.stage2_sigmas or STAGE_2_DISTILLED_SIGMA_VALUES[:config.stage2_steps + 1]
@@ -940,8 +963,9 @@ class LTX2Inferencer:
                     )
             finally:
                 if distilled_lora_active and self._distilled_lora_state is not None:
-                    self._remove_distilled_lora()
+                    self._remove_distilled_lora(float(active_distilled_multiplier or 1.0))
                     distilled_lora_active = False
+                    active_distilled_multiplier = None
 
         # Decode video
         video = None

@@ -195,6 +195,18 @@ def parse_args() -> argparse.Namespace:
                         help="Path to distilled LoRA for two-stage refinement.")
     parser.add_argument("--sample_stage1_use_distilled_lora", action="store_true",
                         help="Experimental: apply the distilled LoRA during stage 1 as well, and keep it active through stage 2.")
+    parser.add_argument(
+        "--sample_stage1_distilled_lora_multiplier",
+        type=float,
+        default=1.0,
+        help="Distilled LoRA multiplier to use during stage 1 when stage-1 distilled sampling is enabled.",
+    )
+    parser.add_argument(
+        "--sample_stage2_distilled_lora_multiplier",
+        type=float,
+        default=1.0,
+        help="Distilled LoRA multiplier to use during stage 2 refinement.",
+    )
     parser.add_argument("--sample_official_distilled_pipeline", action="store_true",
                         help="Use the official distilled two-stage preset: 8 stage-1 distilled steps, 4 stage-2 distilled steps, and no CFG.")
     parser.add_argument("--sample_stage2_steps", type=int, default=3,
@@ -362,6 +374,8 @@ def _build_prompt_list(
         "discrete_flow_shift": args.discrete_flow_shift,
         "seed": args.seed,
         "cfg_scale": args.cfg_scale,
+        "stage1_distilled_lora_multiplier": args.sample_stage1_distilled_lora_multiplier,
+        "stage2_distilled_lora_multiplier": args.sample_stage2_distilled_lora_multiplier,
         "enum": 0,
     }
     if sample_sigmas is not None:
