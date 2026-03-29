@@ -5412,6 +5412,40 @@ class LTX2NetworkTrainer(NetworkTrainer):
             vocoder.to("cpu")
             clean_memory_on_device(device)
 
+    def _resolve_sampling_prompt_embeds(
+        self,
+        *,
+        transformer,
+        prompt_embeds: torch.Tensor,
+        enable_audio_preview: bool,
+        audio_ref_only_ic_sampling: bool,
+    ) -> torch.Tensor:
+        """Resolve preview prompt embeddings for the active sampling modality."""
+        if enable_audio_preview or audio_ref_only_ic_sampling:
+            return prompt_embeds
+
+        base_model = transformer.model if hasattr(transformer, "model") else transformer
+        expected_video_dim = int(getattr(base_model, "cross_attention_dim", 0) or 0)
+        expected_audio_dim = int(getattr(base_model, "audio_cross_attention_dim", 0) or 0)
+        current_dim = int(prompt_embeds.shape[-1])
+
+        if expected_video_dim <= 0:
+            return prompt_embeds
+
+        resolved_prompt_embeds = select_video_text_embeds_for_video_mode(
+            prompt_embeds,
+            expected_video_dim=expected_video_dim,
+            expected_audio_dim=expected_audio_dim,
+        )
+        resolved_dim = int(resolved_prompt_embeds.shape[-1])
+        if resolved_dim != current_dim:
+            logger.warning(
+                "Sampling: audio preview disabled; using video-only prompt embeddings (%s -> %s).",
+                current_dim,
+                resolved_dim,
+            )
+        return resolved_prompt_embeds
+
     def do_inference(
         self,
         accelerator: Accelerator,
@@ -5574,22 +5608,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 prompt_mask = None
 
         enable_audio_preview = bool(enable_audio_preview)
-        if not enable_audio_preview and not audio_ref_only_ic_sampling:
-            expected_embed_dim = None
-            try:
-                caption_proj = getattr(transformer, "caption_projection", None)
-                if caption_proj is not None and hasattr(caption_proj, "linear_1"):
-                    expected_embed_dim = int(caption_proj.linear_1.in_features)
-            except Exception:
-                expected_embed_dim = None
-
-            current_dim = int(prompt_embeds.shape[-1])
-            if expected_embed_dim is not None and current_dim == expected_embed_dim * 2:
-                logger.warning(
-                    "Sampling: audio preview disabled; using video-only prompt embeddings (half of dim=%s).",
-                    current_dim,
-                )
-                prompt_embeds = prompt_embeds[..., : expected_embed_dim]
+        prompt_embeds = self._resolve_sampling_prompt_embeds(
+            transformer=transformer,
+            prompt_embeds=prompt_embeds,
+            enable_audio_preview=enable_audio_preview,
+            audio_ref_only_ic_sampling=audio_ref_only_ic_sampling,
+        )
 
         # Setup LTX-2 specific stepper
         from musubi_tuner.ltx_2.model.ltx2_scheduler import EulerDiffusionStep, X0PredictionWrapper

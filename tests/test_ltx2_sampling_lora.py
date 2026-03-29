@@ -93,6 +93,11 @@ class _Float8OverlayTrainer(LTX2NetworkTrainer):
         return (torch.float8_e4m3fn,)
 
 
+class _FakeCaptionProjection:
+    def __init__(self, in_features: int):
+        self.linear_1 = type("Linear1", (), {"in_features": in_features})()
+
+
 class LTX2SamplingLoraTests(unittest.TestCase):
     def test_parse_sample_sigmas_accepts_comma_string(self):
         trainer = LTX2NetworkTrainer()
@@ -150,6 +155,51 @@ class LTX2SamplingLoraTests(unittest.TestCase):
 
         self.assertEqual(prompts[0]["sample_sigmas"], [1.0, 0.9, 0.5, 0.0])
         self.assertEqual(prompts[0]["sample_steps"], 3)
+
+    def test_sampling_prompt_embeds_trim_to_video_dims_when_audio_preview_disabled(self):
+        trainer = LTX2NetworkTrainer()
+        transformer = type(
+            "FakeTransformer",
+            (),
+            {
+                "cross_attention_dim": 4096,
+                "audio_cross_attention_dim": 2048,
+                "caption_projection": None,
+            },
+        )()
+        prompt_embeds = torch.randn(2, 8, 6144)
+
+        resolved = trainer._resolve_sampling_prompt_embeds(
+            transformer=transformer,
+            prompt_embeds=prompt_embeds,
+            enable_audio_preview=False,
+            audio_ref_only_ic_sampling=False,
+        )
+
+        self.assertEqual(resolved.shape, (2, 8, 4096))
+        self.assertTrue(torch.equal(resolved, prompt_embeds[..., :4096]))
+
+    def test_sampling_prompt_embeds_keep_full_dims_when_audio_preview_enabled(self):
+        trainer = LTX2NetworkTrainer()
+        transformer = type(
+            "FakeTransformer",
+            (),
+            {
+                "cross_attention_dim": 4096,
+                "audio_cross_attention_dim": 2048,
+                "caption_projection": _FakeCaptionProjection(4096),
+            },
+        )()
+        prompt_embeds = torch.randn(2, 8, 6144)
+
+        resolved = trainer._resolve_sampling_prompt_embeds(
+            transformer=transformer,
+            prompt_embeds=prompt_embeds,
+            enable_audio_preview=True,
+            audio_ref_only_ic_sampling=False,
+        )
+
+        self.assertIs(resolved, prompt_embeds)
 
     def test_nf4_runtime_overlay_avoids_merge_against_packed_weight_shape(self):
         trainer = LTX2NetworkTrainer()
