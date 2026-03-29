@@ -1,0 +1,76 @@
+[run]
+name = "zimage-smoke"
+architecture = "zimage"
+seed = 123
+
+[accelerate]
+num_cpu_threads_per_process = 1
+mixed_precision = "bf16"
+
+[model]
+version = "zimage-base"
+dit = "/models/zimage.safetensors"
+vae = "/models/ae.safetensors"
+text_encoder = "/models/text-encoder.safetensors"
+sdpa = true
+
+[training]
+timestep_sampling = "sigmoid"
+weighting_scheme = "none"
+gradient_checkpointing = true
+learning_rate = 0.0001
+max_grad_norm = 1
+max_train_epochs = 1
+save_every_n_epochs = 1
+max_data_loader_n_workers = 2
+persistent_data_loader_workers = true
+
+[optimizer]
+type = "adafactor"
+lr_scheduler = "constant"
+
+[optimizer.args]
+scale_parameter = false
+relative_step = false
+warmup_init = false
+
+[network]
+module = "networks.lora_zimage"
+dim = 16
+alpha = 16
+
+[performance]
+compile_dynamic = false
+compile_prewarm = false
+cuda_allow_tf32 = true
+
+[output]
+dir = "/tmp/northstar/zimage-smoke"
+name = "zimage-smoke"
+logging_dir = "/tmp/northstar/zimage-smoke"
+
+[sampling]
+enabled = true
+sample_at_first = true
+sample_every_n_steps = 25
+
+[[sampling.prompts]]
+prompt = "a fashion editorial photo"
+width = 1024
+height = 1024
+steps = 8
+seed = 777
+guidance = 5
+negative_prompt = " "
+
+[[dataset.groups]]
+resolution = [512, 512]
+batch_size = 2
+enable_bucket = true
+bucket_no_upscale = false
+cache_directory = "cache/zimage-smoke"
+caption_extension = ".txt"
+
+[[dataset.groups.sources]]
+image_directory = "/datasets/zimage-smoke"
+num_repeats = 1
