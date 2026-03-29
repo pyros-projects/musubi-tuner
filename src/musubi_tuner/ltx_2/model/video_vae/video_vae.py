@@ -30,6 +30,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def resolve_slice_bounds(axis_slice: slice, length: int) -> tuple[int, int]:
+    """Resolve optional slice bounds against a concrete axis length."""
+    start = 0 if axis_slice.start is None else axis_slice.start
+    stop = length if axis_slice.stop is None else axis_slice.stop
+    return start, stop
+
+
 def _make_encoder_block(
     block_name: str,
     block_config: dict[str, Any],
@@ -841,6 +848,7 @@ class VideoDecoder(nn.Module):
 
         for temporal_group_tiles in temporal_groups:
             curr_temporal_slice = temporal_group_tiles[0].out_coords[2]
+            curr_temporal_start, curr_temporal_stop = resolve_slice_bounds(curr_temporal_slice, full_video_shape.frames)
 
             # Calculate the shape of the temporal buffer for this group of tiles.
             # The temporal length depends on whether this is the first tile (starts at 0) or not.
@@ -848,7 +856,7 @@ class VideoDecoder(nn.Module):
             # - Subsequent tiles: frames * scale
             # This logic is handled by TemporalAxisMapping and reflected in out_coords.
             temporal_tile_buffer_shape = full_video_shape._replace(
-                frames=curr_temporal_slice.stop - curr_temporal_slice.start,
+                frames=curr_temporal_stop - curr_temporal_start,
             )
 
             buffer = torch.zeros(
@@ -867,10 +875,11 @@ class VideoDecoder(nn.Module):
 
             # Blend with previous temporal chunk if it exists
             if previous_chunk is not None:
+                prev_temporal_start, prev_temporal_stop = resolve_slice_bounds(previous_temporal_slice, full_video_shape.frames)
                 # Check if current temporal slice overlaps with previous temporal slice
-                if previous_temporal_slice.stop > curr_temporal_slice.start:
-                    overlap_len = previous_temporal_slice.stop - curr_temporal_slice.start
-                    temporal_overlap_slice = slice(curr_temporal_slice.start - previous_temporal_slice.start, None)
+                if prev_temporal_stop > curr_temporal_start:
+                    overlap_len = prev_temporal_stop - curr_temporal_start
+                    temporal_overlap_slice = slice(curr_temporal_start - prev_temporal_start, None)
 
                     # The overlap is already masked before it reaches this step. Each tile is accumulated into buffer
                     # with its trapezoidal mask, and curr_weights accumulates the same mask. In the overlap blend we add
@@ -888,7 +897,7 @@ class VideoDecoder(nn.Module):
 
                 # Yield the non-overlapping part of the previous chunk
                 previous_weights = previous_weights.clamp(min=1e-8)
-                yield_len = curr_temporal_slice.start - previous_temporal_slice.start
+                yield_len = curr_temporal_start - prev_temporal_start
                 yield (previous_chunk / previous_weights)[:, :, :yield_len, :, :]
 
             # Update state for next iteration
@@ -945,10 +954,16 @@ class VideoDecoder(nn.Module):
         for tile in group_tiles:
             decoded_tile = self.forward(latent[tile.in_coords], timestep, generator)
             mask = tile.blend_mask.to(device=buffer.device, dtype=buffer.dtype)
-            temporal_offset = tile.out_coords[2].start - temporal_slice.start
+            group_temporal_start = 0 if temporal_slice.start is None else temporal_slice.start
+            tile_temporal_start = group_temporal_start if tile.out_coords[2].start is None else tile.out_coords[2].start
+            temporal_offset = tile_temporal_start - group_temporal_start
             # Use the tile's output coordinate length, not the decoded tile's length,
             # as the decoder may produce a different number of frames than expected
-            expected_temporal_len = tile.out_coords[2].stop - tile.out_coords[2].start
+            _, tile_temporal_stop = resolve_slice_bounds(
+                tile.out_coords[2],
+                group_temporal_start + buffer.shape[2],
+            )
+            expected_temporal_len = tile_temporal_stop - tile_temporal_start
             decoded_temporal_len = decoded_tile.shape[2]
 
             # Ensure we don't exceed the buffer or decoded tile bounds

@@ -21,6 +21,8 @@ from accelerate import Accelerator
 from safetensors.torch import load_file
 
 from musubi_tuner.hv_generate_video import setup_parser_compile
+from musubi_tuner.ltx2_inference import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
+from musubi_tuner.ltx2_lora_utils import looks_like_comfy_ltx_lora, normalize_ltx_comfy_lora_weights
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
 from musubi_tuner.networks import lora_ltx2
 from musubi_tuner.utils.device_utils import clean_memory_on_device
@@ -65,6 +67,26 @@ def parse_args() -> argparse.Namespace:
         default="video",
         choices=["video", "av", "audio", "v", "a", "va"],
         help="Generation modality: 'video' (default), 'av' for audio+video, 'audio' for audio-only.",
+    )
+    parser.add_argument(
+        "--ltx_version",
+        type=str,
+        default="2.0",
+        choices=["2.0", "2.3"],
+        help=(
+            "Target LTX major behavior for standalone inference. "
+            "2.0 keeps legacy defaults; 2.3 enables 2.3-oriented defaults when mode is not explicitly overridden."
+        ),
+    )
+    parser.add_argument(
+        "--ltx_version_check_mode",
+        type=str,
+        default="warn",
+        choices=["off", "warn", "error"],
+        help=(
+            "How strictly to enforce --ltx_version vs checkpoint metadata consistency. "
+            "'warn' logs mismatches, 'error' stops startup, 'off' disables checks."
+        ),
     )
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--device", type=str, default=None, help="Force device to cpu or cuda")
@@ -171,6 +193,10 @@ def parse_args() -> argparse.Namespace:
                         help="Path to spatial upsampler model for two-stage inference.")
     parser.add_argument("--distilled_lora_path", type=str, default=None,
                         help="Path to distilled LoRA for two-stage refinement.")
+    parser.add_argument("--sample_stage1_use_distilled_lora", action="store_true",
+                        help="Experimental: apply the distilled LoRA during stage 1 as well, and keep it active through stage 2.")
+    parser.add_argument("--sample_official_distilled_pipeline", action="store_true",
+                        help="Use the official distilled two-stage preset: 8 stage-1 distilled steps, 4 stage-2 distilled steps, and no CFG.")
     parser.add_argument("--sample_stage2_steps", type=int, default=3,
                         help="Number of stage-2 refinement steps (default: 3)")
 
@@ -237,11 +263,37 @@ def _configure_attention_flags(args: argparse.Namespace) -> None:
     args.xformers = attn_mode == "xformers"
 
 
+def _apply_official_distilled_pipeline_args(args: argparse.Namespace) -> None:
+    if not getattr(args, "sample_official_distilled_pipeline", False):
+        return
+
+    if not getattr(args, "spatial_upsampler_path", None):
+        raise ValueError("--sample_official_distilled_pipeline requires --spatial_upsampler_path")
+    if not getattr(args, "distilled_lora_path", None):
+        raise ValueError("--sample_official_distilled_pipeline requires --distilled_lora_path")
+
+    args.sample_two_stage = True
+    args.sample_stage1_use_distilled_lora = True
+    args.sample_stage2_steps = len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1
+    args.sample_sigmas = ",".join(str(v) for v in DISTILLED_SIGMA_VALUES)
+    args.sample_steps = len(DISTILLED_SIGMA_VALUES) - 1
+    args.guidance_scale = 1.0
+    args.cfg_scale = 1.0
+
+    logger.info(
+        "Using official distilled pipeline preset: two-stage, stage1 distilled LoRA, "
+        "%d stage-1 sigmas, %d stage-2 sigmas, CFG disabled",
+        len(DISTILLED_SIGMA_VALUES),
+        len(STAGE_2_DISTILLED_SIGMA_VALUES),
+    )
+
+
 # ---------------------------------------------------------------------------
 # LoRA merging
 # ---------------------------------------------------------------------------
 
 def _merge_lora_weights(
+    trainer: LTX2NetworkTrainer,
     transformer: torch.nn.Module,
     weights: list[str],
     multipliers: Optional[list[float]],
@@ -252,6 +304,9 @@ def _merge_lora_weights(
         multiplier = multipliers[idx] if multipliers and len(multipliers) > idx else 1.0
         logger.info("Merging LoRA: %s (multiplier=%.3f)", path, multiplier)
         lora_sd = load_file(path)
+        if looks_like_comfy_ltx_lora(lora_sd):
+            logger.info("Converting LTX inference LoRA from ComfyUI A/B format: %s", path)
+            lora_sd = normalize_ltx_comfy_lora_weights(lora_sd)
         net = lora_ltx2.create_arch_network_from_weights(
             multiplier,
             lora_sd,
@@ -260,7 +315,20 @@ def _merge_lora_weights(
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
         )
-        net.merge_to(None, transformer, lora_sd, device=next(transformer.parameters()).device, non_blocking=True)
+        device = next(transformer.parameters()).device
+        merged, runtime_attached, _ = trainer._apply_sampling_lora_network(
+            net,
+            lora_sd,
+            device=device,
+        )
+        logger.info(
+            "Applied inference LoRA %s: merged=%d runtime_overlays=%d",
+            path,
+            merged,
+            runtime_attached,
+        )
+        if merged == 0 and runtime_attached == 0:
+            logger.warning("Inference LoRA %s did not match any modules on the current transformer.", path)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +375,7 @@ def _build_prompt_list(
 
 def main() -> None:
     args = parse_args()
+    _apply_official_distilled_pipeline_args(args)
 
     # Wire up aliases that the training code expects
     args.dit = args.ltx2_checkpoint
@@ -342,6 +411,7 @@ def main() -> None:
     # -- Merge LoRAs --
     if args.lora_weight:
         _merge_lora_weights(
+            trainer,
             transformer,
             args.lora_weight,
             args.lora_multiplier,

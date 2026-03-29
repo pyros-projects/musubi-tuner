@@ -19,12 +19,45 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from musubi_tuner.utils.device_utils import clean_memory_on_device
+from musubi_tuner.ltx2_lora_utils import (
+    looks_like_comfy_ltx_lora,
+    normalize_ltx_comfy_lora_weights,
+)
+from musubi_tuner.ltx2_text_conditioning import select_video_text_embeds_for_video_mode
 
 logger = logging.getLogger(__name__)
+
+# Stage 1 distilled sigma values (from the official LTX-2 distilled pipeline)
+DISTILLED_SIGMA_VALUES = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
 
 # Stage 2 distilled sigma values (from LTX-2 official pipeline)
 # These are a subset of the full distilled schedule, optimized for refinement
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+
+
+def build_vae_tiling_config(
+    tile_size: int = 512,
+    tile_overlap: int = 64,
+    temporal_tile_size: int = 0,
+    temporal_tile_overlap: int = 8,
+):
+    """Build a VAE tiling config, omitting temporal tiling when disabled."""
+    from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
+
+    temporal_config = None
+    if temporal_tile_size > 0:
+        temporal_config = TemporalTilingConfig(
+            tile_size_in_frames=temporal_tile_size,
+            tile_overlap_in_frames=temporal_tile_overlap,
+        )
+
+    return TilingConfig(
+        spatial_config=SpatialTilingConfig(
+            tile_size_in_pixels=tile_size,
+            tile_overlap_in_pixels=tile_overlap,
+        ),
+        temporal_config=temporal_config,
+    )
 
 
 @dataclass
@@ -48,6 +81,9 @@ class InferenceConfig:
     two_stage: bool = False
     spatial_upsampler_path: Optional[str] = None
     distilled_lora_path: Optional[str] = None
+    stage1_use_distilled_lora: bool = False
+    stage1_sigmas: Optional[list[float]] = None
+    stage2_sigmas: Optional[list[float]] = None
     stage2_steps: int = 3  # Stage 2 uses 3 steps (4 sigma values including 0.0)
 
     # Offloading
@@ -81,17 +117,19 @@ class LTX2Inferencer:
         device: torch.device,
         dit_dtype: torch.dtype,
         audio_video_mode: bool = False,
+        sampling_lora_runtime_helper: Optional[Any] = None,
     ):
         self.transformer = transformer
         self.vae = vae
         self.device = device
         self.dit_dtype = dit_dtype
         self._audio_video = audio_video_mode
+        self._sampling_lora_runtime_helper = sampling_lora_runtime_helper
 
         # Cached components
         self._spatial_upsampler: Optional[torch.nn.Module] = None
         self._distilled_lora_state: Optional[Dict[str, torch.Tensor]] = None
-        self._original_lora_state: Optional[Dict[str, torch.Tensor]] = None
+        self._distilled_lora_runtime_state: Optional[Dict[str, Any]] = None
         self._audio_preview_config: Optional[Dict[str, Any]] = None
 
     def load_spatial_upsampler(
@@ -132,13 +170,43 @@ class LTX2Inferencer:
         logger.info("Loading distilled LoRA from %s", lora_path)
 
         from safetensors.torch import load_file
-        self._distilled_lora_state = load_file(lora_path)
+        distilled_lora_state = load_file(lora_path)
+        if looks_like_comfy_ltx_lora(distilled_lora_state):
+            logger.info("Converting distilled LTX LoRA from ComfyUI A/B format: %s", lora_path)
+            distilled_lora_state = normalize_ltx_comfy_lora_weights(distilled_lora_state)
+        self._distilled_lora_state = distilled_lora_state
         return self._distilled_lora_state
 
     def _apply_distilled_lora(self, multiplier: float = 1.0) -> None:
         """Apply distilled LoRA weights to transformer (for stage 2)."""
         if self._distilled_lora_state is None:
             logger.warning("No distilled LoRA loaded; skipping application")
+            return
+
+        if self._sampling_lora_runtime_helper is not None:
+            from musubi_tuner.networks import lora_ltx2
+
+            overlay_snapshot = self._snapshot_sampling_lora_runtime_state()
+            net = lora_ltx2.create_arch_network_from_weights(
+                multiplier,
+                self._distilled_lora_state,
+                unet=self.transformer,
+                for_inference=True,
+            )
+            merged, runtime_attached, backups = self._sampling_lora_runtime_helper._apply_sampling_lora_network(
+                net,
+                self._distilled_lora_state,
+                self.device,
+            )
+            self._distilled_lora_runtime_state = {
+                "overlay_snapshot": overlay_snapshot,
+                "backups": backups,
+            }
+            logger.info(
+                "Applied distilled LoRA with training runtime path (merged=%d, runtime=%d)",
+                merged,
+                runtime_attached,
+            )
             return
 
         from musubi_tuner.networks import lora_ltx2
@@ -164,6 +232,22 @@ class LTX2Inferencer:
         if self._distilled_lora_state is None:
             return
 
+        if self._sampling_lora_runtime_helper is not None:
+            runtime_state = self._distilled_lora_runtime_state or {}
+            runtime_removed = self._restore_sampling_lora_runtime_state(
+                runtime_state.get("overlay_snapshot", {})
+            )
+            restored = self._sampling_lora_runtime_helper._restore_sampling_lora_network(
+                runtime_state.get("backups", {})
+            )
+            self._distilled_lora_runtime_state = None
+            logger.info(
+                "Removed distilled LoRA with training runtime path (restored=%d, runtime=%d)",
+                restored,
+                runtime_removed,
+            )
+            return
+
         from musubi_tuner.networks import lora_ltx2
 
         # Merge with negative multiplier to remove
@@ -181,6 +265,56 @@ class LTX2Inferencer:
             non_blocking=True,
         )
         logger.info("Removed distilled LoRA")
+
+    def _snapshot_sampling_lora_runtime_state(self) -> Dict[int, Dict[str, Any]]:
+        snapshot: Dict[int, Dict[str, Any]] = {}
+        for module in self.transformer.modules():
+            adapters = getattr(module, "_sampling_lora_runtime_adapters", None)
+            if adapters is None and not hasattr(module, "_sampling_lora_runtime_forward"):
+                continue
+            snapshot[id(module)] = {
+                "adapter_count": len(adapters or []),
+                "adapter_index": getattr(module, "_sampling_lora_runtime_adapter_index", None),
+                "had_runtime_forward": hasattr(module, "_sampling_lora_runtime_forward"),
+            }
+        return snapshot
+
+    def _restore_sampling_lora_runtime_state(self, snapshot: Dict[int, Dict[str, Any]]) -> int:
+        restored_modules = 0
+        for module in self.transformer.modules():
+            adapters = getattr(module, "_sampling_lora_runtime_adapters", None)
+            if adapters is None:
+                continue
+
+            baseline = snapshot.get(id(module), {})
+            baseline_count = int(baseline.get("adapter_count", 0) or 0)
+            baseline_index = baseline.get("adapter_index", None)
+            had_runtime_forward = bool(baseline.get("had_runtime_forward", False))
+
+            if len(adapters) > baseline_count:
+                for adapter in adapters[baseline_count:]:
+                    for key in ("A", "B"):
+                        buffer_name = adapter.get(key)
+                        if isinstance(buffer_name, str):
+                            module._buffers.pop(buffer_name, None)
+                del adapters[baseline_count:]
+                restored_modules += 1
+
+            if len(adapters) == 0 and not had_runtime_forward:
+                if hasattr(module, "_sampling_lora_runtime_forward"):
+                    module.forward = module._sampling_lora_runtime_forward
+                    delattr(module, "_sampling_lora_runtime_forward")
+                delattr(module, "_sampling_lora_runtime_adapters")
+                if hasattr(module, "_sampling_lora_runtime_adapter_index"):
+                    delattr(module, "_sampling_lora_runtime_adapter_index")
+                continue
+
+            if baseline_index is not None:
+                module._sampling_lora_runtime_adapter_index = baseline_index
+            elif len(adapters) == 0 and hasattr(module, "_sampling_lora_runtime_adapter_index"):
+                delattr(module, "_sampling_lora_runtime_adapter_index")
+
+        return restored_modules
 
     def _get_vae_factors(self) -> Tuple[int, int]:
         """Get VAE temporal and spatial downsample factors."""
@@ -208,10 +342,19 @@ class LTX2Inferencer:
 
     def _get_expected_embed_dim(self) -> int:
         """Get expected embedding dimension based on mode."""
-        # Known dimensions for LTX-2
-        VIDEO_ONLY_DIM = 1920
-        AV_DIM = 3840
-        return AV_DIM if self._audio_video else VIDEO_ONLY_DIM
+        base_model = self.transformer.model if hasattr(self.transformer, "model") else self.transformer
+        video_dim = int(getattr(base_model, "cross_attention_dim", 0) or 0)
+        audio_dim = int(getattr(base_model, "audio_cross_attention_dim", 0) or 0)
+
+        if self._audio_video and video_dim > 0 and audio_dim > 0:
+            return video_dim + audio_dim
+        if video_dim > 0:
+            return video_dim
+        if self._audio_video and audio_dim > 0:
+            return audio_dim
+
+        # Legacy fallback for older checkpoints/configs that don't expose dims.
+        return 3840 if self._audio_video else 1920
 
     def _prepare_prompt_embeds(
         self,
@@ -251,7 +394,12 @@ class LTX2Inferencer:
                     "Using video portion only.",
                     current_dim, expected_dim
                 )
-                prompt_embeds = prompt_embeds[..., :expected_dim]
+                base_model = self.transformer.model if hasattr(self.transformer, "model") else self.transformer
+                prompt_embeds = select_video_text_embeds_for_video_mode(
+                    prompt_embeds,
+                    expected_video_dim=int(getattr(base_model, "cross_attention_dim", 0) or 0),
+                    expected_audio_dim=int(getattr(base_model, "audio_cross_attention_dim", 0) or 0),
+                )
             else:
                 logger.warning(
                     "Prompt embedding dimension mismatch: got %d, expected %d. "
@@ -648,11 +796,22 @@ class LTX2Inferencer:
                     generator=generator,
                 )
 
+        distilled_lora_active = False
+        if config.two_stage and config.distilled_lora_path and config.stage1_use_distilled_lora:
+            if self._distilled_lora_state is None:
+                self.load_distilled_lora(config.distilled_lora_path)
+            logger.info("Stage 1: Applying distilled LoRA before initial generation")
+            self._apply_distilled_lora()
+            distilled_lora_active = True
+
         # Stage 1: Main generation
         # Official pipeline does NOT pass latent to scheduler - uses default MAX_SHIFT_ANCHOR=4096
-        from musubi_tuner.ltx_2.components.schedulers import LTX2Scheduler
-        scheduler = LTX2Scheduler()
-        sigmas = scheduler.execute(steps=config.sample_steps).to(device=self.device, dtype=torch.float32)
+        if config.stage1_sigmas is not None:
+            sigmas = torch.tensor(config.stage1_sigmas, device=self.device, dtype=torch.float32)
+        else:
+            from musubi_tuner.ltx_2.components.schedulers import LTX2Scheduler
+            scheduler = LTX2Scheduler()
+            sigmas = scheduler.execute(steps=config.sample_steps).to(device=self.device, dtype=torch.float32)
 
         logger.info("Stage 1: Generating at %dx%d (%d frames, %d steps)",
                    gen_width, gen_height, frame_count, config.sample_steps)
@@ -670,114 +829,119 @@ class LTX2Inferencer:
 
         # Stage 2: Upsample and refine (if two-stage)
         if config.two_stage:
-            logger.info("Stage 2: Upsampling and refining to %dx%d", config.width, config.height)
+            try:
+                logger.info("Stage 2: Upsampling and refining to %dx%d", config.width, config.height)
 
-            # Load upsampler if needed
-            if self._spatial_upsampler is None and config.spatial_upsampler_path:
-                self.load_spatial_upsampler(config.spatial_upsampler_path)
+                # Load upsampler if needed
+                if self._spatial_upsampler is None and config.spatial_upsampler_path:
+                    self.load_spatial_upsampler(config.spatial_upsampler_path)
 
-            if self._spatial_upsampler is None:
-                raise ValueError("Spatial upsampler required for two-stage inference")
+                if self._spatial_upsampler is None:
+                    raise ValueError("Spatial upsampler required for two-stage inference")
 
-            # Optionally offload transformer to CPU while upsampling (saves VRAM)
-            transformer_was_offloaded = False
-            if config.offload_between_stages:
-                if hasattr(self.transformer, "move_to_device_except_swap_blocks"):
-                    logger.info("Offloading transformer for upsampling")
-                    self.transformer.move_to_device_except_swap_blocks(torch.device("cpu"))
-                    transformer_was_offloaded = True
-                elif hasattr(self.transformer, "to"):
-                    logger.info("Offloading transformer for upsampling")
-                    self.transformer.to("cpu")
-                    transformer_was_offloaded = True
+                # Optionally offload transformer to CPU while upsampling (saves VRAM)
+                transformer_was_offloaded = False
+                if config.offload_between_stages:
+                    if hasattr(self.transformer, "move_to_device_except_swap_blocks"):
+                        logger.info("Offloading transformer for upsampling")
+                        self.transformer.move_to_device_except_swap_blocks(torch.device("cpu"))
+                        transformer_was_offloaded = True
+                    elif hasattr(self.transformer, "to"):
+                        logger.info("Offloading transformer for upsampling")
+                        self.transformer.to("cpu")
+                        transformer_was_offloaded = True
+                    if transformer_was_offloaded:
+                        clean_memory_on_device(self.device)
+
+                # Upsample latents
+                logger.info("Stage 2: latent shape before upsampler %s", tuple(latents.shape))
+                self._spatial_upsampler.to(self.device)
+                with torch.no_grad():
+                    latents = self._upsample_latents(latents, self._spatial_upsampler)
+                self._spatial_upsampler.to("cpu")
+                clean_memory_on_device(self.device)
+                logger.info("Stage 2: latent shape after upsampler %s", tuple(latents.shape))
+
+                # Restore transformer for stage 2
                 if transformer_was_offloaded:
-                    clean_memory_on_device(self.device)
+                    logger.info("Restoring transformer for stage 2")
+                    if hasattr(self.transformer, "move_to_device_except_swap_blocks"):
+                        self.transformer.move_to_device_except_swap_blocks(self.device)
+                    else:
+                        self.transformer.to(self.device)
 
-            # Upsample latents
-            self._spatial_upsampler.to(self.device)
-            with torch.no_grad():
-                latents = self._upsample_latents(latents, self._spatial_upsampler)
-            self._spatial_upsampler.to("cpu")
-            clean_memory_on_device(self.device)
+                # Apply distilled LoRA for stage 2 when not already active from stage 1
+                if config.distilled_lora_path and not distilled_lora_active:
+                    if self._distilled_lora_state is None:
+                        self.load_distilled_lora(config.distilled_lora_path)
+                    self._apply_distilled_lora()
+                    distilled_lora_active = True
 
-            # Restore transformer for stage 2
-            if transformer_was_offloaded:
-                logger.info("Restoring transformer for stage 2")
-                if hasattr(self.transformer, "move_to_device_except_swap_blocks"):
-                    self.transformer.move_to_device_except_swap_blocks(self.device)
-                else:
-                    self.transformer.to(self.device)
+                # Stage 2 denoising with distilled sigmas
+                stage2_sigma_values = config.stage2_sigmas or STAGE_2_DISTILLED_SIGMA_VALUES[:config.stage2_steps + 1]
+                stage2_sigmas = torch.tensor(
+                    stage2_sigma_values,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
 
-            # Apply distilled LoRA for stage 2
-            if config.distilled_lora_path:
-                if self._distilled_lora_state is None:
-                    self.load_distilled_lora(config.distilled_lora_path)
-                self._apply_distilled_lora()
+                # Prepare stage 2 prompt (no CFG needed for distilled)
+                stage2_embeds = config.prompt_embeds
+                if stage2_embeds.dim() == 2:
+                    stage2_embeds = stage2_embeds.unsqueeze(0)
 
-            # Stage 2 denoising with distilled sigmas
-            stage2_sigmas = torch.tensor(
-                STAGE_2_DISTILLED_SIGMA_VALUES[:config.stage2_steps + 1],
-                device=self.device,
-                dtype=torch.float32,
-            )
+                # Fix embedding dimensions if needed (same as stage 1)
+                expected_dim = self._get_expected_embed_dim()
+                current_dim = stage2_embeds.shape[-1]
+                if expected_dim is not None and current_dim != expected_dim:
+                    if current_dim * 2 == expected_dim:
+                        # Pad video-only to AV
+                        padding = torch.zeros(
+                            *stage2_embeds.shape[:-1], current_dim,
+                            dtype=stage2_embeds.dtype, device=stage2_embeds.device
+                        )
+                        stage2_embeds = torch.cat([stage2_embeds, padding], dim=-1)
+                    elif current_dim == expected_dim * 2:
+                        # Slice AV to video-only
+                        stage2_embeds = stage2_embeds[..., :expected_dim]
 
-            # Prepare stage 2 prompt (no CFG needed for distilled)
-            stage2_embeds = config.prompt_embeds
-            if stage2_embeds.dim() == 2:
-                stage2_embeds = stage2_embeds.unsqueeze(0)
+                stage2_embeds = stage2_embeds.to(device=self.device, dtype=self.dit_dtype)
 
-            # Fix embedding dimensions if needed (same as stage 1)
-            expected_dim = self._get_expected_embed_dim()
-            current_dim = stage2_embeds.shape[-1]
-            if expected_dim is not None and current_dim != expected_dim:
-                if current_dim * 2 == expected_dim:
-                    # Pad video-only to AV
-                    padding = torch.zeros(
-                        *stage2_embeds.shape[:-1], current_dim,
-                        dtype=stage2_embeds.dtype, device=stage2_embeds.device
+                stage2_mask = config.prompt_attention_mask
+                if stage2_mask is not None:
+                    if stage2_mask.dim() == 1:
+                        stage2_mask = stage2_mask.unsqueeze(0)
+                    stage2_mask = stage2_mask.to(device=self.device, dtype=torch.int64)
+
+                # Add noise at stage 2 starting sigma using flow matching formula:
+                # noisy = (1 - sigma) * x0 + sigma * noise
+                sigma = stage2_sigmas[0].item()
+                video_noise = torch.randn(
+                    latents.shape, dtype=latents.dtype, device=latents.device, generator=generator
+                )
+                latents = (1.0 - sigma) * latents + sigma * video_noise
+
+                # Also add noise to audio latents if present (official pipeline does this)
+                if audio_latents is not None:
+                    audio_noise = torch.randn(
+                        audio_latents.shape, dtype=audio_latents.dtype, device=audio_latents.device, generator=generator
                     )
-                    stage2_embeds = torch.cat([stage2_embeds, padding], dim=-1)
-                elif current_dim == expected_dim * 2:
-                    # Slice AV to video-only
-                    stage2_embeds = stage2_embeds[..., :expected_dim]
+                    audio_latents = (1.0 - sigma) * audio_latents + sigma * audio_noise
 
-            stage2_embeds = stage2_embeds.to(device=self.device, dtype=self.dit_dtype)
-
-            stage2_mask = config.prompt_attention_mask
-            if stage2_mask is not None:
-                if stage2_mask.dim() == 1:
-                    stage2_mask = stage2_mask.unsqueeze(0)
-                stage2_mask = stage2_mask.to(device=self.device, dtype=torch.int64)
-
-            # Add noise at stage 2 starting sigma using flow matching formula:
-            # noisy = (1 - sigma) * x0 + sigma * noise
-            sigma = stage2_sigmas[0].item()
-            video_noise = torch.randn(
-                latents.shape, dtype=latents.dtype, device=latents.device, generator=generator
-            )
-            latents = (1.0 - sigma) * latents + sigma * video_noise
-
-            # Also add noise to audio latents if present (official pipeline does this)
-            if audio_latents is not None:
-                audio_noise = torch.randn(
-                    audio_latents.shape, dtype=audio_latents.dtype, device=audio_latents.device, generator=generator
-                )
-                audio_latents = (1.0 - sigma) * audio_latents + sigma * audio_noise
-
-            with torch.no_grad():
-                latents, audio_latents = self._denoise_loop(
-                    latents, stage2_sigmas, stage2_embeds, stage2_mask,
-                    do_cfg=False, cfg_scale=1.0, frame_rate=config.frame_rate,
-                    audio_latents=audio_latents,
-                    audio_only=config.audio_only,
-                    progress_desc="Stage 2 refine",
-                    conditioning_latent=config.conditioning_latent,
-                    use_i2v_token_timestep_mask=bool(config.use_i2v_token_timestep_mask),
-                )
-
-            # Remove distilled LoRA
-            if config.distilled_lora_path and self._distilled_lora_state is not None:
-                self._remove_distilled_lora()
+                with torch.no_grad():
+                    latents, audio_latents = self._denoise_loop(
+                        latents, stage2_sigmas, stage2_embeds, stage2_mask,
+                        do_cfg=False, cfg_scale=1.0, frame_rate=config.frame_rate,
+                        audio_latents=audio_latents,
+                        audio_only=config.audio_only,
+                        progress_desc="Stage 2 refine",
+                        conditioning_latent=config.conditioning_latent,
+                        use_i2v_token_timestep_mask=bool(config.use_i2v_token_timestep_mask),
+                    )
+            finally:
+                if distilled_lora_active and self._distilled_lora_state is not None:
+                    self._remove_distilled_lora()
+                    distilled_lora_active = False
 
         # Decode video
         video = None
@@ -785,17 +949,11 @@ class LTX2Inferencer:
             self.vae.to_device(self.device)
             with torch.no_grad():
                 if use_tiled_vae and tiled_vae_config:
-                    from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
-
-                    tile_cfg = TilingConfig(
-                        spatial_config=SpatialTilingConfig(
-                            tile_size_in_pixels=tiled_vae_config.get("tile_size", 512),
-                            tile_overlap_in_pixels=tiled_vae_config.get("tile_overlap", 64),
-                        ),
-                        temporal_config=TemporalTilingConfig(
-                            tile_size_in_frames=tiled_vae_config.get("temporal_tile_size", 9999),
-                            tile_overlap_in_frames=tiled_vae_config.get("temporal_tile_overlap", 0),
-                        ),
+                    tile_cfg = build_vae_tiling_config(
+                        tile_size=tiled_vae_config.get("tile_size", 512),
+                        tile_overlap=tiled_vae_config.get("tile_overlap", 64),
+                        temporal_tile_size=tiled_vae_config.get("temporal_tile_size", 0),
+                        temporal_tile_overlap=tiled_vae_config.get("temporal_tile_overlap", 8),
                     )
                     video = self.vae.tiled_decode(latents.squeeze(0), tile_cfg)
                 else:
@@ -807,6 +965,7 @@ class LTX2Inferencer:
                     if video.dim() == 4:
                         video = video.unsqueeze(0)
                     video = (video / 2 + 0.5).clamp(0, 1).to(torch.float32).cpu()
+                    logger.info("Decoded video shape %s", tuple(video.shape))
 
         # Decode audio
         audio_waveform = None

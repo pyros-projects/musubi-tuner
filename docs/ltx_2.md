@@ -1278,7 +1278,17 @@ For IC-LoRA / V2V training, you can also precache the conditioning image latents
 | `--sample_two_stage` | off | Enable two-stage inference during sampling |
 | `--spatial_upsampler_path` | — | Path to spatial upsampler model. Required when `--sample_two_stage` is set |
 | `--distilled_lora_path` | — | Path to distilled LoRA for stage 2 refinement. Optional |
+| `--sample_stage1_use_distilled_lora` | off | Experimental: keep the distilled LoRA active during stage 1 as well as stage 2 |
+| `--sample_official_distilled_pipeline` | off | Use the official distilled two-stage preset: 8 distilled stage-1 steps, 4 distilled stage-2 steps, and no CFG. Requires both `--spatial_upsampler_path` and `--distilled_lora_path` |
 | `--sample_stage2_steps` | 3 | Number of denoising steps for stage 2 |
+
+The official distilled preset applies the same stage-1 sigma schedule used by the upstream `DistilledPipeline`:
+
+```text
+1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0
+```
+
+It also forces `guidance_scale=1.0` and `cfg_scale=1.0`, enables stage-1 distilled LoRA application, and uses the built-in 4-value distilled stage-2 refine schedule.
 
 #### Checkpoint Output Format
 

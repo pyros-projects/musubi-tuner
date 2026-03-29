@@ -1,0 +1,32 @@
+[general]
+# Good starter resolution for mixed random videos.
+resolution = [768, 512]
+caption_extension = ".txt"
+batch_size = 1
+num_repeats = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+[[datasets]]
+# One video per scene, one same-stem caption .txt per video.
+# Example:
+#   videos/
+#     clip_001.mp4
+#     clip_001.txt
+video_directory = "/abs/path/to/videos"
+cache_directory = "/abs/path/to/cache/videos_ltx23"
+
+# For mixed-length raw clips, chunking makes better use of the folder than "full".
+frame_extraction = "chunk"
+
+# Balanced starter set:
+# - 17 / 33 / 49 keep lots of shorter clips usable
+# - 81 gives the model some real longer-horizon supervision
+target_frames = [17, 33, 49, 81]
+
+# Let the cache step normalize all videos to one temporal rate.
+target_fps = 25
+
+# If variable-FPS phone clips get misdetected, set source_fps explicitly
+# in a separate dataset block for those files.
+# source_fps = 30

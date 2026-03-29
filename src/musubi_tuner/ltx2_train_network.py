@@ -57,8 +57,11 @@ from musubi_tuner.ltx2_text_conditioning import (
     select_video_text_embeds_for_av_no_audio,
 )
 from musubi_tuner.ltx2_inference import (
+    DISTILLED_SIGMA_VALUES,
     LTX2Inferencer,
     InferenceConfig,
+    STAGE_2_DISTILLED_SIGMA_VALUES,
+    build_vae_tiling_config,
 )
 from musubi_tuner.ltx2_lycoris_runtime import (
     apply_lycoris_preset_before_network_creation,
@@ -69,6 +72,10 @@ from musubi_tuner.ltx2_lycoris_runtime import (
     summarize_active_adapters,
     validate_lycoris_quantized_base_compatibility,
     validate_lycoris_runtime,
+)
+from musubi_tuner.ltx2_lora_utils import (
+    looks_like_comfy_ltx_lora,
+    normalize_ltx_comfy_lora_weights,
 )
 
 # LTX-2 latent normalization defaults.
@@ -778,63 +785,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._self_flow_active: bool = False
         self._self_flow_step_context: Optional[Dict[str, Any]] = None
 
-    @staticmethod
-    def _looks_like_comfy_ltx_lora(weights_sd: Dict[str, torch.Tensor]) -> bool:
-        if not weights_sd:
-            return False
-        keys = list(weights_sd.keys())
-        return (
-            all(key.startswith("diffusion_model.") for key in keys)
-            and any(".lora_A.weight" in key for key in keys)
-            and any(".lora_B.weight" in key for key in keys)
-        )
-
-    @staticmethod
-    def _convert_ltx_comfy_sampling_lora_weights(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        converted: Dict[str, torch.Tensor] = {}
-        synthesized_alpha: Dict[str, torch.Tensor] = {}
-
-        for key, value in weights_sd.items():
-            if not key.startswith("diffusion_model."):
-                converted[key] = value
-                continue
-
-            if key.endswith(".lora_A.weight"):
-                module_path = key[len("diffusion_model.") : -len(".lora_A.weight")]
-                target_key = f"lora_unet_model_{module_path.replace('.', '_')}.lora_down.weight"
-                converted[target_key] = value
-                alpha_key = f"lora_unet_model_{module_path.replace('.', '_')}.alpha"
-                synthesized_alpha.setdefault(alpha_key, torch.tensor(float(value.shape[0]), dtype=torch.float32))
-                continue
-
-            if key.endswith(".lora_B.weight"):
-                module_path = key[len("diffusion_model.") : -len(".lora_B.weight")]
-                target_key = f"lora_unet_model_{module_path.replace('.', '_')}.lora_up.weight"
-                converted[target_key] = value
-                continue
-
-            if key.endswith(".alpha"):
-                module_path = key[len("diffusion_model.") : -len(".alpha")]
-                target_key = f"lora_unet_model_{module_path.replace('.', '_')}.alpha"
-                converted[target_key] = value
-                continue
-
-            converted[key] = value
-
-        for key, value in synthesized_alpha.items():
-            converted.setdefault(key, value)
-
-        return converted
-
     def normalize_sampling_lora_weights(
         self,
         args: argparse.Namespace,
         weights_sd: Dict[str, torch.Tensor],
         weight_path: str,
     ) -> Dict[str, torch.Tensor]:
-        if self._looks_like_comfy_ltx_lora(weights_sd):
+        if looks_like_comfy_ltx_lora(weights_sd):
             logger.info("Converting LTX sampling LoRA from ComfyUI A/B format: %s", weight_path)
-            weights_sd = self._convert_ltx_comfy_sampling_lora_weights(weights_sd)
+            weights_sd = normalize_ltx_comfy_lora_weights(weights_sd)
         return super().normalize_sampling_lora_weights(args, weights_sd, weight_path)
 
     @staticmethod
@@ -4002,6 +3961,32 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         return sigmas
 
+    def _apply_official_distilled_pipeline_overrides(
+        self,
+        args: argparse.Namespace,
+        sample_parameter: Dict[str, Any],
+    ) -> None:
+        if not bool(getattr(args, "sample_official_distilled_pipeline", False)):
+            return
+
+        if not getattr(args, "spatial_upsampler_path", None):
+            raise ValueError("--sample_official_distilled_pipeline requires --spatial_upsampler_path")
+        if not getattr(args, "distilled_lora_path", None):
+            raise ValueError("--sample_official_distilled_pipeline requires --distilled_lora_path")
+
+        args.sample_two_stage = True
+        args.sample_stage1_use_distilled_lora = True
+        args.sample_stage2_steps = len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1
+        sample_parameter["sample_sigmas"] = list(DISTILLED_SIGMA_VALUES)
+        sample_parameter["sample_steps"] = len(DISTILLED_SIGMA_VALUES) - 1
+        sample_parameter["guidance_scale"] = 1.0
+        sample_parameter["cfg_scale"] = 1.0
+
+        logger.info(
+            "Applying official distilled pipeline preset for sample %s",
+            sample_parameter.get("enum", 0),
+        )
+
     def _resolve_sample_sigmas(
         self,
         sample_parameter: Dict,
@@ -4015,6 +4000,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sample_parameter["sample_steps"] = effective_steps
             sigmas = torch.tensor(parsed_sigmas, device=device, dtype=torch.float32)
             return sigmas, effective_steps
+
+        from musubi_tuner.ltx_2.components.schedulers import LTX2Scheduler
 
         effective_steps = max(1, int(sample_steps))
         ltx2_scheduler = LTX2Scheduler()
@@ -4939,6 +4926,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         vocoder=None,
     ):
         """LTX-2-specific sampling with proper frame/size rounding."""
+        self._apply_official_distilled_pipeline_overrides(args, sample_parameter)
 
         # ===== PHASE 1: I2V Image Encoding (if needed) =====
         # Do this FIRST, before loading any other models, to respect --sample_with_offloading
@@ -5282,9 +5270,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         if use_two_stage:
             if sample_sigmas is not None:
-                logger.warning(
-                    "Two-stage inference currently ignores custom sample sigmas; using the built-in stage schedulers."
-                )
+                logger.info("Two-stage inference: using custom stage-1 sigmas.")
             if v2v_ref_latent is not None:
                 logger.warning("V2V reference conditioning is not supported with two-stage inference; ignoring V2V reference")
                 v2v_ref_latent = None
@@ -5305,6 +5291,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 generator=generator,
                 spatial_upsampler_path=spatial_upsampler_path,
                 conditioning_latent=conditioning_latent,
+                stage1_sigmas=sample_sigmas,
                 distilled_lora_path=distilled_lora_path,
                 stage2_steps=int(getattr(args, "sample_stage2_steps", 3)),
                 audio_decoder=audio_decoder,
@@ -5953,25 +5940,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
             with torch.no_grad():
                 use_tiled_vae = getattr(args, "sample_tiled_vae", False)
                 if use_tiled_vae:
-                    from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
                     tile_size = getattr(args, "sample_vae_tile_size", 512)
                     tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
                     temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
                     temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
-                    
-                    # Use configured temporal tiling, or 9999 frames (all at once) if disabled
-                    effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 9999
-                    effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
-                    
-                    tiling_config = TilingConfig(
-                        spatial_config=SpatialTilingConfig(
-                            tile_size_in_pixels=tile_size,
-                            tile_overlap_in_pixels=tile_overlap,
-                        ),
-                        temporal_config=TemporalTilingConfig(
-                            tile_size_in_frames=effective_temporal_size,
-                            tile_overlap_in_frames=effective_temporal_overlap,
-                        ),
+
+                    tiling_config = build_vae_tiling_config(
+                        tile_size=tile_size,
+                        tile_overlap=tile_overlap,
+                        temporal_tile_size=temporal_tile_size,
+                        temporal_tile_overlap=temporal_tile_overlap,
                     )
                     if temporal_tile_size > 0:
                         logger.info("Using tiled VAE decode (spatial=%dx%d, temporal=%d/%d)", 
@@ -6296,16 +6274,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
             with torch.no_grad():
                 use_tiled_vae = getattr(args, "sample_tiled_vae", False)
                 if use_tiled_vae:
-                    from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
                     tile_size = getattr(args, "sample_vae_tile_size", 512)
                     tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
                     temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
                     temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
-                    effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 9999
-                    effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
-                    tiling_config = TilingConfig(
-                        spatial_config=SpatialTilingConfig(tile_size_in_pixels=tile_size, tile_overlap_in_pixels=tile_overlap),
-                        temporal_config=TemporalTilingConfig(tile_size_in_frames=effective_temporal_size, tile_overlap_in_frames=effective_temporal_overlap),
+                    tiling_config = build_vae_tiling_config(
+                        tile_size=tile_size,
+                        tile_overlap=tile_overlap,
+                        temporal_tile_size=temporal_tile_size,
+                        temporal_tile_overlap=temporal_tile_overlap,
                     )
                     video = vae.tiled_decode(latents.squeeze(0), tiling_config)
                     if video.dim() == 4:
@@ -6352,6 +6329,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         seed: Optional[int],
         generator: torch.Generator,
         spatial_upsampler_path: str,
+        stage1_sigmas: Optional[List[float]] = None,
         distilled_lora_path: Optional[str] = None,
         stage2_steps: int = 4,
         audio_decoder: Optional[torch.nn.Module] = None,
@@ -6371,6 +6349,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             device=device,
             dit_dtype=dit_dtype,
             audio_video_mode=self._audio_video,
+            sampling_lora_runtime_helper=self,
         )
 
         # Load upsampler
@@ -6397,7 +6376,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             tiled_vae_config = {
                 "tile_size": getattr(args, "sample_vae_tile_size", 512),
                 "tile_overlap": getattr(args, "sample_vae_tile_overlap", 64),
-                "temporal_tile_size": getattr(args, "sample_vae_temporal_tile_size", 0) or 9999,
+                "temporal_tile_size": getattr(args, "sample_vae_temporal_tile_size", 0),
                 "temporal_tile_overlap": getattr(args, "sample_vae_temporal_tile_overlap", 8),
             }
 
@@ -6416,6 +6395,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
             two_stage=True,
             spatial_upsampler_path=spatial_upsampler_path,
             distilled_lora_path=distilled_lora_path,
+            stage1_use_distilled_lora=bool(getattr(args, "sample_stage1_use_distilled_lora", False)),
+            stage1_sigmas=list(stage1_sigmas) if stage1_sigmas is not None else None,
+            stage2_sigmas=list(STAGE_2_DISTILLED_SIGMA_VALUES[:stage2_steps + 1]),
             stage2_steps=stage2_steps,
             enable_audio=enable_audio_preview,
             audio_only=audio_only,
@@ -7071,6 +7053,16 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=None,
         help="Path to distilled LoRA (ltx-2-19b-distilled-lora-384.safetensors) for two-stage refinement.",
+    )
+    parser.add_argument(
+        "--sample_stage1_use_distilled_lora",
+        action="store_true",
+        help="Experimental: apply the distilled LoRA during stage 1 as well, and keep it active through stage 2.",
+    )
+    parser.add_argument(
+        "--sample_official_distilled_pipeline",
+        action="store_true",
+        help="Use the official distilled two-stage preset: 8 stage-1 distilled steps, 4 stage-2 distilled steps, and no CFG.",
     )
     parser.add_argument(
         "--sample_stage2_steps",
