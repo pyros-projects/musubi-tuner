@@ -47,6 +47,62 @@ class ZImageNetworkTrainer(NetworkTrainer):
         self.default_guidance_scale = 0.0  # embedded guidance scale. not used for Z-Image model
         self.default_discrete_flow_shift = 3.0  # Z-Image uses flux-shift, so it's better to use it
 
+    def normalize_sampling_lora_weights(
+        self, args: argparse.Namespace, weights_sd: dict[str, torch.Tensor], weight_path: str
+    ) -> dict[str, torch.Tensor]:
+        weights_sd = super().normalize_sampling_lora_weights(args, weights_sd, weight_path)
+
+        packed_qkv_prefixes = sorted(
+            {
+                key[: -len(".lora_down.weight")]
+                for key in weights_sd
+                if key.endswith(".lora_down.weight") and "attention_qkv" in key
+            }
+        )
+        if packed_qkv_prefixes:
+            logger.info(f"Sampling LoRA {weight_path} uses packed attention_qkv weights; splitting to to_q/to_k/to_v.")
+            converted: dict[str, torch.Tensor] = {}
+            skip_prefixes = set(packed_qkv_prefixes)
+            for key, value in weights_sd.items():
+                prefix = key.split(".", 1)[0]
+                if prefix in skip_prefixes:
+                    continue
+                converted[key] = value
+
+            for prefix in packed_qkv_prefixes:
+                down_key = f"{prefix}.lora_down.weight"
+                up_key = f"{prefix}.lora_up.weight"
+                alpha_key = f"{prefix}.alpha"
+                down_weight = weights_sd[down_key]
+                up_weight = weights_sd[up_key]
+                alpha = weights_sd.get(alpha_key)
+                up_chunks = torch.tensor_split(up_weight, 3, dim=0)
+                for suffix, up_chunk in zip(("to_q", "to_k", "to_v"), up_chunks):
+                    new_prefix = prefix.replace("attention_qkv", f"attention_{suffix}")
+                    converted[f"{new_prefix}.lora_down.weight"] = down_weight.clone()
+                    converted[f"{new_prefix}.lora_up.weight"] = up_chunk.contiguous()
+                    if alpha is not None:
+                        converted[f"{new_prefix}.alpha"] = alpha.clone() if torch.is_tensor(alpha) else alpha
+            weights_sd = converted
+
+        missing_alpha = 0
+        for key, value in list(weights_sd.items()):
+            if not key.endswith(".lora_down.weight"):
+                continue
+            prefix = key[: -len(".lora_down.weight")]
+            alpha_key = f"{prefix}.alpha"
+            if alpha_key in weights_sd:
+                continue
+            weights_sd[alpha_key] = torch.tensor(float(value.shape[0]), dtype=torch.float32)
+            missing_alpha += 1
+
+        if missing_alpha:
+            logger.info(
+                f"Sampling LoRA {weight_path} is missing alpha for {missing_alpha} modules; defaulting alpha to rank."
+            )
+
+        return weights_sd
+
     def process_sample_prompts(
         self,
         args: argparse.Namespace,

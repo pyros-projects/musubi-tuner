@@ -13,7 +13,14 @@ logging.basicConfig(level=logging.INFO)
 import musubi_tuner.networks.lora as lora
 
 
-FLUX_2_TARGET_REPLACE_MODULES = ["DoubleStreamBlock", "SingleStreamBlock"]
+# Scan the full Flux2 transformer surface instead of only the block classes.
+#
+# This keeps Flux2 training/inference compatible with "all layer" LoRAs that also
+# touch img/txt input projections, timestep embedding, modulation linears, and the
+# final projection head. The generic LoRA helper will still only attach to Linear /
+# Conv2d modules, so this remains a boring "all linear layers except excluded ones"
+# policy.
+FLUX_2_TARGET_REPLACE_MODULES = None
 
 
 def create_arch_network(
@@ -29,11 +36,12 @@ def create_arch_network(
     # add default exclude patterns
     exclude_patterns = kwargs.get("exclude_patterns", None)
     if exclude_patterns is None:
-        exclude_patterns = [r".*(img_mod\.lin|txt_mod\.lin|modulation\.lin).*"]
+        exclude_patterns = []
     else:
         exclude_patterns = ast.literal_eval(exclude_patterns)
 
-    # exclude if 'norm' in the name of the module
+    # LoRA on norm layers tends to be noisy and is not used by the extracted
+    # Comfy / diffusion-pipe Flux2 LoRAs we want to stay compatible with.
     exclude_patterns.append(r".*(norm).*")
 
     kwargs["exclude_patterns"] = exclude_patterns

@@ -356,7 +356,7 @@ class FineTuningTrainer:
         return sample_parameters
 
     def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
-        # adamw, adamw8bit, adafactor
+        # adamw, adamw8bit, adafactor, prodigyplusschedulefree
 
         optimizer_type = args.optimizer_type.lower()
 
@@ -421,6 +421,20 @@ class FineTuningTrainer:
         elif optimizer_type == "AdamW".lower():
             logger.info(f"use AdamW optimizer | {optimizer_kwargs}")
             optimizer_class = torch.optim.AdamW
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type == "ProdigyPlusScheduleFree".lower():
+            try:
+                from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
+            except ImportError as exc:
+                raise ImportError(
+                    "ProdigyPlusScheduleFree requires the optional package "
+                    "'prodigy-plus-schedule-free'. Install it with "
+                    "`pip install prodigy-plus-schedule-free`."
+                ) from exc
+
+            logger.info(f"use ProdigyPlusScheduleFree optimizer | {optimizer_kwargs}")
+            optimizer_class = ProdigyPlusScheduleFree
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         if optimizer is None:
@@ -1372,7 +1386,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor. "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor, ProdigyPlusScheduleFree. "
         "Also, you can use any optimizer by specifying the full path to the class, like 'torch.optim.AdamW', 'bitsandbytes.optim.AdEMAMix8bit' or 'bitsandbytes.optim.PagedAdEMAMix8bit' etc. / ",
     )
     parser.add_argument(
