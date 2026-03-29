@@ -1,8 +1,11 @@
 import argparse
+import hashlib
 import gc
 from importlib.util import find_spec
+import json
 import random
 import os
+import shlex
 import time
 import copy
 from typing import Tuple, Optional, List, Any, Dict
@@ -14,6 +17,7 @@ from safetensors import safe_open
 from musubi_tuner.flux_2 import flux2_utils
 from musubi_tuner.flux_2 import flux2_models
 from musubi_tuner.utils import model_utils
+from musubi_tuner.utils.inference_lora_utils import normalize_flux_inference_lora_weights, normalize_lora_weight_args
 from musubi_tuner.utils.lora_utils import filter_lora_state_dict
 
 lycoris_available = find_spec("lycoris") is not None
@@ -35,6 +39,50 @@ class GenerationSettings:
         self.dit_weight_dtype = dit_weight_dtype  # not used currently because model may be optimized
 
 
+def build_prompt_embedding_cache_key(text: str, args: argparse.Namespace) -> str:
+    payload = {
+        "text": text,
+        "model_version": args.model_version,
+        "text_encoder": os.path.abspath(args.text_encoder),
+        "fp8_text_encoder": bool(args.fp8_text_encoder),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+def get_prompt_embedding_cache_path(cache_dir: str, cache_key: str) -> str:
+    return os.path.join(cache_dir, f"{cache_key}.safetensors")
+
+
+def load_prompt_embedding_cache(cache_dir: str, cache_key: str) -> Optional[torch.Tensor]:
+    cache_path = get_prompt_embedding_cache_path(cache_dir, cache_key)
+    if not os.path.isfile(cache_path):
+        return None
+
+    logger.info(f"Loading cached prompt embedding from {cache_path}")
+    sd = load_file(cache_path)
+    return sd.get("ctx_vec")
+
+
+def save_prompt_embedding_cache(
+    cache_dir: str,
+    cache_key: str,
+    text: str,
+    ctx_vec: torch.Tensor,
+    args: argparse.Namespace,
+) -> str:
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = get_prompt_embedding_cache_path(cache_dir, cache_key)
+    metadata = {
+        "text": text,
+        "model_version": args.model_version,
+        "text_encoder": os.path.abspath(args.text_encoder),
+        "fp8_text_encoder": str(bool(args.fp8_text_encoder)),
+    }
+    save_file({"ctx_vec": ctx_vec.contiguous()}, cache_path, metadata=metadata)
+    logger.info(f"Saved prompt embedding cache to {cache_path}")
+    return cache_path
+
+
 def parse_args() -> argparse.Namespace:
     """parse command line arguments"""
     parser = argparse.ArgumentParser(description="FLUX.2 inference script")
@@ -54,7 +102,7 @@ def parse_args() -> argparse.Namespace:
 
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
-    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=1.0, help="LoRA multiplier")
+    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=None, help="LoRA multiplier")
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
     parser.add_argument(
@@ -150,8 +198,21 @@ def parse_args() -> argparse.Namespace:
     setup_parser_compile(parser)
 
     # New arguments for batch and interactive modes
-    parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
+    parser.add_argument("--from_file", "--sample_prompts", dest="from_file", type=str, default=None, help="Read prompts from a file")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
+    parser.add_argument(
+        "--save_strategy",
+        type=str,
+        default="immediate",
+        choices=["immediate", "deferred"],
+        help="When using prompt files, save each prompt immediately or defer image saving until all prompts have been generated.",
+    )
+    parser.add_argument(
+        "--save_embeddings",
+        type=str,
+        default=None,
+        help="Directory to load/store prompt text embeddings for reuse across inference runs.",
+    )
 
     flux2_utils.add_model_version_args(parser)
 
@@ -167,6 +228,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.lycoris and not lycoris_available:
         raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
+
+    args.lora_weight, args.lora_multiplier = normalize_lora_weight_args(args.lora_weight, args.lora_multiplier)
 
     return args
 
@@ -223,6 +286,10 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
             overrides["negative_prompt"] = value
         elif option == "ci":  # control_image_path
             overrides["control_image_path"].append(value)
+        elif option == "lora_weight":
+            overrides["lora_weight"] = shlex.split(value)
+        elif option == "lora_multiplier":
+            overrides["lora_multiplier"] = [float(v) for v in shlex.split(value)]
 
     # If no control_image_path was provided, remove the empty list
     if not overrides["control_image_path"]:
@@ -250,6 +317,11 @@ def apply_overrides(args: argparse.Namespace, overrides: Dict[str, Any]) -> argp
             args_copy.image_size[0] = value
         else:
             setattr(args_copy, key, value)
+
+    args_copy.lora_weight, args_copy.lora_multiplier = normalize_lora_weight_args(
+        getattr(args_copy, "lora_weight", None),
+        getattr(args_copy, "lora_multiplier", None),
+    )
 
     return args_copy
 
@@ -301,6 +373,7 @@ def load_dit_model(
         for lora_weight in args.lora_weight:
             logger.info(f"Loading LoRA weight from: {lora_weight}")
             lora_sd = load_file(lora_weight)  # load on CPU, dtype is as is
+            lora_sd = normalize_flux_inference_lora_weights(lora_sd)
             lora_sd = filter_lora_state_dict(lora_sd, args.include_patterns, args.exclude_patterns)
             lora_weights_list.append(lora_sd)
     else:
@@ -340,6 +413,7 @@ def load_dit_model(
                 device,
                 lycoris=True,
                 save_merged_model=args.save_merged_model,
+                converter=normalize_flux_inference_lora_weights,
             )
 
         if args.fp8_scaled:
@@ -512,11 +586,19 @@ def prepare_text_inputs(
     if prompt in conds_cache:
         ctx_vec = conds_cache[prompt]
     else:
-        move_models_to_device_if_needed()
+        ctx_vec = None
+        cache_key = None
+        if args.save_embeddings:
+            cache_key = build_prompt_embedding_cache_key(prompt, args)
+            ctx_vec = load_prompt_embedding_cache(args.save_embeddings, cache_key)
+        if ctx_vec is None:
+            move_models_to_device_if_needed()
 
-        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            ctx_vec = text_embedder([prompt])  # [1, 512, 15360]
-        ctx_vec = ctx_vec.cpu()
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                ctx_vec = text_embedder([prompt])  # [1, 512, 15360]
+            ctx_vec = ctx_vec.cpu()
+            if args.save_embeddings and cache_key is not None:
+                save_prompt_embedding_cache(args.save_embeddings, cache_key, prompt, ctx_vec, args)
         conds_cache[prompt] = ctx_vec
 
     negative_prompt = args.negative_prompt
@@ -527,11 +609,19 @@ def prepare_text_inputs(
         if negative_prompt in conds_cache:
             negative_ctx_vec = conds_cache[negative_prompt]
         else:
-            move_models_to_device_if_needed()
+            negative_ctx_vec = None
+            negative_cache_key = None
+            if args.save_embeddings:
+                negative_cache_key = build_prompt_embedding_cache_key(negative_prompt, args)
+                negative_ctx_vec = load_prompt_embedding_cache(args.save_embeddings, negative_cache_key)
+            if negative_ctx_vec is None:
+                move_models_to_device_if_needed()
 
-            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                negative_ctx_vec = text_embedder([negative_prompt])  # [1, 512, 15360]
-            negative_ctx_vec = negative_ctx_vec.cpu()
+                with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    negative_ctx_vec = text_embedder([negative_prompt])  # [1, 512, 15360]
+                negative_ctx_vec = negative_ctx_vec.cpu()
+                if args.save_embeddings and negative_cache_key is not None:
+                    save_prompt_embedding_cache(args.save_embeddings, negative_cache_key, negative_prompt, negative_ctx_vec, args)
             conds_cache[negative_prompt] = negative_ctx_vec
 
     if not (shared_models and "text_embedder" in shared_models):  # if loaded locally
@@ -550,6 +640,26 @@ def prepare_text_inputs(
         arg_null = {"ctx_vec": negative_ctx_vec, "prompt": negative_prompt}
 
     return arg_c, arg_null
+
+
+def get_prompt_lora_spec(args: argparse.Namespace) -> Tuple[Tuple[str, float], ...]:
+    lora_weight = args.lora_weight or []
+    lora_multiplier = args.lora_multiplier or []
+    return tuple((weight, float(multiplier)) for weight, multiplier in zip(lora_weight, lora_multiplier))
+
+
+def ensure_batch_prompt_lora_consistency(all_prompt_args_list: List[argparse.Namespace]) -> Tuple[Tuple[str, float], ...]:
+    if not all_prompt_args_list:
+        return ()
+
+    first_spec = get_prompt_lora_spec(all_prompt_args_list[0])
+    for prompt_args in all_prompt_args_list[1:]:
+        if get_prompt_lora_spec(prompt_args) != first_spec:
+            raise ValueError(
+                "Prompt-file batch inference requires every prompt to use the same LoRA configuration. "
+                "Mixed prompt-level LoRA specs would force transformer reloads, so they are rejected."
+            )
+    return first_spec
 
 
 def prepare_i2v_inputs(
@@ -863,6 +973,25 @@ def load_shared_models(args: argparse.Namespace) -> Dict:
     return shared_models
 
 
+def precompute_text_inputs_for_prompts(
+    all_prompt_args_list: List[argparse.Namespace],
+    args: argparse.Namespace,
+    device: torch.device,
+    shared_models: Dict[str, Any],
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """Precompute text inputs for all prompts using a shared text encoder."""
+    shared_models.setdefault("conds_cache", {})
+    all_precomputed_text_data = []
+
+    logger.info("Preprocessing text and LLM/TextEncoder encoding for all prompts...")
+    for i, prompt_args_item in enumerate(all_prompt_args_list):
+        logger.info(f"Text preprocessing for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+        ctx_nctx = prepare_text_inputs(prompt_args_item, device, shared_models)
+        all_precomputed_text_data.append(ctx_nctx)
+
+    return all_precomputed_text_data
+
+
 def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) -> None:
     """Process multiple prompts with model reuse and batched precomputation
 
@@ -885,6 +1014,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
 
     all_precomputed_image_data = []
     all_prompt_args_list = [apply_overrides(args, pd) for pd in prompts_data]  # Create all arg instances first
+    ensure_batch_prompt_lora_consistency(all_prompt_args_list)
 
     logger.info("Preprocessing images and AE encoding for all prompts...")
 
@@ -913,20 +1043,12 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     # Text Encoders to device for this phase
     text_embedder_batch.to(device)  # Moved into prepare_text_inputs logic
 
-    all_precomputed_text_data = []
     conds_cache_batch = {}
-
-    logger.info("Preprocessing text and LLM/TextEncoder encoding for all prompts...")
     temp_shared_models_txt = {
         "text_embedder": text_embedder_batch,  # on GPU
         "conds_cache": conds_cache_batch,
     }
-
-    for i, prompt_args_item in enumerate(all_prompt_args_list):
-        logger.info(f"Text preprocessing for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
-        # prepare_text_inputs will move text_encoders to device temporarily
-        ctx_nctx = prepare_text_inputs(prompt_args_item, device, temp_shared_models_txt)
-        all_precomputed_text_data.append(ctx_nctx)
+    all_precomputed_text_data = precompute_text_inputs_for_prompts(all_prompt_args_list, args, device, temp_shared_models_txt)
 
     # Models should be removed from device after prepare_text_inputs
     del text_embedder_batch, temp_shared_models_txt, conds_cache_batch
@@ -1031,6 +1153,61 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
 
     del ae_for_batch
     clean_memory_on_device(device)
+
+
+def process_prompts_with_immediate_save(prompts_data: List[Dict], args: argparse.Namespace) -> None:
+    """Process multiple prompts and save each result immediately after generation."""
+    if not prompts_data:
+        logger.warning("No valid prompts found")
+        return
+
+    gen_settings = get_generation_settings(args)
+    dit_weight_dtype = gen_settings.dit_weight_dtype
+    device = gen_settings.device
+
+    logger.info("Loading shared models for immediate prompt processing...")
+    shared_models = load_shared_models(args)
+    shared_models["conds_cache"] = {}
+
+    all_prompt_args_list = [apply_overrides(args, pd) for pd in prompts_data]
+    ensure_batch_prompt_lora_consistency(all_prompt_args_list)
+    all_precomputed_text_data = precompute_text_inputs_for_prompts(all_prompt_args_list, args, device, shared_models)
+    logger.info("Releasing Text Encoder after text precomputation...")
+    shared_models.pop("text_embedder", None)
+    shared_models.pop("conds_cache", None)
+    gc.collect()
+    clean_memory_on_device(device)
+
+    ae_for_batch = flux2_utils.load_ae(args.vae, dtype=torch.float32, device=device, disable_mmap=True)
+    dit_model = load_dit_model(all_prompt_args_list[0], device, dit_weight_dtype)
+    shared_models["model"] = dit_model
+
+    try:
+        with torch.no_grad():
+            for i, prompt_args_item in enumerate(all_prompt_args_list):
+                logger.info(f"Preparing prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+                image_data = prepare_image_inputs(prompt_args_item, device, ae_for_batch)
+                text_data = all_precomputed_text_data[i]
+
+                logger.info(f"Generating and saving prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+                _, latent = generate(prompt_args_item, gen_settings, shared_models, image_data, text_data)
+
+                if latent is None:
+                    logger.warning(f"Skipping save for prompt {i + 1} because latent generation returned nothing.")
+                    continue
+
+                save_output(prompt_args_item, ae_for_batch, latent[0], device)
+    finally:
+        logger.info("Releasing immediate prompt processing models from memory...")
+        shared_models.pop("model", None)
+        if args.blocks_to_swap > 0:
+            logger.info("Waiting for 5 seconds to finish block swap")
+            time.sleep(5)
+        del dit_model
+        del ae_for_batch
+        gc.collect()
+        clean_memory_on_device(device)
+        synchronize_device(device)
 
 
 def process_interactive(args: argparse.Namespace) -> None:
@@ -1182,7 +1359,10 @@ def main():
 
         # Process prompts
         prompts_data = preprocess_prompts_for_batch(prompt_lines, args)
-        process_batch_prompts(prompts_data, args)
+        if args.save_strategy == "immediate":
+            process_prompts_with_immediate_save(prompts_data, args)
+        else:
+            process_batch_prompts(prompts_data, args)
 
     elif args.interactive:
         # Interactive mode
