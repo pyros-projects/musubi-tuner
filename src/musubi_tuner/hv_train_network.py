@@ -203,6 +203,18 @@ def clean_memory_on_device(device: torch.device):
         torch.mps.empty_cache()
 
 
+def move_batch_tensors_to_device(batch: Any, device: torch.device):
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device=device)
+    if isinstance(batch, dict):
+        return {key: move_batch_tensors_to_device(value, device) for key, value in batch.items()}
+    if isinstance(batch, list):
+        return [move_batch_tensors_to_device(value, device) for value in batch]
+    if isinstance(batch, tuple):
+        return tuple(move_batch_tensors_to_device(value, device) for value in batch)
+    return batch
+
+
 # for collate_fn: epoch and step is multiprocessing.Value
 class collator_class:
     def __init__(self, epoch, dataset):
@@ -714,6 +726,111 @@ class NetworkTrainer:
                 org_module.weight.copy_(original_weight.to(device=org_module.weight.device, dtype=org_module.weight.dtype))
                 restored += 1
         return restored
+
+    def build_compile_prewarm_dataloader(
+        self,
+        train_dataset_group,
+        collator,
+        max_buckets: Optional[int],
+    ) -> tuple[Optional[torch.utils.data.DataLoader], list[int]]:
+        if not hasattr(train_dataset_group, "get_representative_batch_indices"):
+            return None, []
+
+        representative_indices = train_dataset_group.get_representative_batch_indices(max_buckets=max_buckets)
+        if len(representative_indices) == 0:
+            return None, []
+
+        subset = torch.utils.data.Subset(train_dataset_group, representative_indices)
+        prewarm_collator = collator_class(collator.current_epoch, train_dataset_group)
+        prewarm_dataloader = torch.utils.data.DataLoader(
+            subset,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=prewarm_collator,
+            num_workers=0,
+            persistent_workers=False,
+        )
+        return prewarm_dataloader, representative_indices
+
+    def _run_compile_prewarm(
+        self,
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        training_model,
+        transformer,
+        network,
+        optimizer,
+        prewarm_batches,
+        noise_scheduler,
+        dit_dtype: torch.dtype,
+        network_dtype: torch.dtype,
+        include_backward: bool,
+        total_available_buckets: Optional[int] = None,
+    ) -> int:
+        rng_state = torch.get_rng_state()
+        cuda_rng_state = None
+        try:
+            cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        except Exception:
+            pass
+
+        prewarmed_batches = 0
+        total_target_batches = len(prewarm_batches) if hasattr(prewarm_batches, "__len__") else None
+        progress_enabled = getattr(accelerator, "is_local_main_process", True)
+        try:
+            optimizer.zero_grad(set_to_none=True)
+            with tqdm(
+                prewarm_batches,
+                total=total_target_batches,
+                desc="Compile prewarm",
+                unit="bucket",
+                disable=not progress_enabled,
+            ) as progress_bar:
+                for batch in progress_bar:
+                    batch = move_batch_tensors_to_device(batch, accelerator.device)
+                    latents = batch["latents"]
+
+                    with accelerator.accumulate(training_model):
+                        network.on_step_start()
+
+                        latents = self.scale_shift_latents(latents)
+                        noise = torch.randn_like(latents)
+                        noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
+                            args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
+                        )
+
+                        weighting = compute_loss_weighting_for_sd3(
+                            args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
+                        )
+
+                        model_pred, target = self.call_dit(
+                            args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
+                        )
+                        loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
+                        if weighting is not None:
+                            loss = loss * weighting
+                        loss = loss.mean()
+
+                        if include_backward:
+                            accelerator.backward(loss)
+
+                        optimizer.zero_grad(set_to_none=True)
+
+                    clean_memory_on_device(accelerator.device)
+                    prewarmed_batches += 1
+                    compiled_status = f"{prewarmed_batches}/{total_target_batches}" if total_target_batches is not None else str(prewarmed_batches)
+                    available_status = total_available_buckets if total_available_buckets is not None else "?"
+                    progress_bar.set_postfix_str(
+                        f"compiled={compiled_status} available={available_status} backward={'on' if include_backward else 'off'}"
+                    )
+        finally:
+            optimizer.zero_grad(set_to_none=True)
+            torch.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state)
+            clean_memory_on_device(accelerator.device)
+
+        return prewarmed_batches
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -2699,6 +2816,14 @@ class NetworkTrainer:
                 num_workers=n_workers,
                 persistent_workers=args.persistent_data_loader_workers,
             )
+        compile_prewarm_dataloader = None
+        compile_prewarm_indices: list[int] = []
+        total_representative_buckets = 0
+        if args.compile_prewarm:
+            total_representative_buckets = len(train_dataset_group.get_representative_batch_indices())
+            compile_prewarm_dataloader, compile_prewarm_indices = self.build_compile_prewarm_dataloader(
+                train_dataset_group, collator, args.compile_prewarm_max_buckets
+            )
 
         # calculate max_train_steps
         if args.max_train_epochs is not None:
@@ -3111,6 +3236,47 @@ class NetworkTrainer:
                     accelerator.print(f"removing old Comfy checkpoint: {comfy_old_ckpt_file}")
                     os.remove(comfy_old_ckpt_file)
             train_utils.remove_checkpoint_metadata(old_ckpt_file)
+
+        if args.compile_prewarm:
+            if not args.compile:
+                logger.warning("--compile_prewarm is enabled but --compile is not enabled. Skipping compile prewarm.")
+            elif compile_prewarm_dataloader is None:
+                logger.warning("Compile prewarm requested but no representative bucket batches were found.")
+            else:
+                set_trainer_train_mode()
+                prewarm_started_at = time.time()
+                logger.info(
+                    f"Starting compile prewarm for {len(compile_prewarm_indices)} representative bucket batches "
+                    f"(total available buckets: {total_representative_buckets})."
+                )
+                if (
+                    args.compile_prewarm_max_buckets is not None
+                    and args.compile_prewarm_max_buckets > 0
+                    and len(compile_prewarm_indices) < total_representative_buckets
+                ):
+                    logger.info(
+                        f"Compile prewarm limited to {len(compile_prewarm_indices)} buckets by "
+                        f"--compile_prewarm_max_buckets={args.compile_prewarm_max_buckets}."
+                    )
+
+                prewarmed_batches = self._run_compile_prewarm(
+                    accelerator=accelerator,
+                    args=args,
+                    training_model=training_model,
+                    transformer=transformer,
+                    network=accelerator.unwrap_model(network),
+                    optimizer=optimizer,
+                    prewarm_batches=compile_prewarm_dataloader,
+                    noise_scheduler=noise_scheduler,
+                    dit_dtype=dit_dtype,
+                    network_dtype=network_dtype,
+                    include_backward=args.compile_prewarm_include_backward,
+                    total_available_buckets=total_representative_buckets,
+                )
+                logger.info(
+                    f"Compile prewarm finished: prewarmed_batches={prewarmed_batches}, "
+                    f"elapsed={time.time() - prewarm_started_at:.2f}s"
+                )
 
         def run_validation(step: int, epoch_no: int | None = None) -> None:
             if validation_dataloader is None:
@@ -3958,6 +4124,23 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="Set torch._dynamo.config.cache_size_limit (default: PyTorch default, typically 8-32) / torch._dynamo.config.cache_size_limitを設定（デフォルト: PyTorchのデフォルト、通常8-32）",
     )
     parser.add_argument(
+        "--compile_prewarm",
+        action="store_true",
+        help="Run representative bucket batches before training to frontload torch.compile work / torch.compileの事前ウォームアップとして学習前に代表バケットを実行する",
+    )
+    parser.add_argument(
+        "--compile_prewarm_max_buckets",
+        type=int,
+        default=None,
+        help="Maximum number of representative buckets to prewarm (default: all) / 事前コンパイルする代表バケット数の上限（デフォルト: すべて）",
+    )
+    parser.add_argument(
+        "--compile_prewarm_include_backward",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include backward pass during compile prewarm (default: true) / コンパイル事前ウォームアップにbackwardを含める（デフォルト: true）",
+    )
+    parser.add_argument(
         "--cuda_allow_tf32",
         action="store_true",
         help="Allow TF32 on Ampere or higher GPUs / Ampere以降のGPUでTF32を許可する",
@@ -4603,9 +4786,17 @@ def setup_parser_common() -> argparse.ArgumentParser:
     return parser
 
 
+def normalize_compile_args(args: argparse.Namespace) -> argparse.Namespace:
+    if getattr(args, "compile_prewarm", False) and not getattr(args, "compile", False):
+        logger.info("--compile_prewarm implies --compile; enabling torch.compile automatically.")
+        args.compile = True
+
+    return args
+
+
 def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentParser):
     if not args.config_file:
-        return args
+        return normalize_compile_args(args)
 
     config_path = args.config_file + ".toml" if not args.config_file.endswith(".toml") else args.config_file
 
@@ -4634,7 +4825,7 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
     args.config_file = os.path.splitext(args.config_file)[0]
     logger.info(args.config_file)
 
-    return args
+    return normalize_compile_args(args)
 
 
 def hv_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:

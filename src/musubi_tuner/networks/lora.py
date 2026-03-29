@@ -494,6 +494,11 @@ class LoRANetwork(torch.nn.Module):
                 include_re_patterns.append(re_pattern)
 
         # create module instances
+        def normalize_module_name(name: str) -> str:
+            if not name:
+                return name
+            return ".".join(part for part in name.split(".") if part != "_orig_mod")
+
         def create_modules(
             is_unet: bool,
             pfx: str,
@@ -505,6 +510,7 @@ class LoRANetwork(torch.nn.Module):
             loras = []
             skipped = []
             for name, module in root_module.named_modules():
+                normalized_name = normalize_module_name(name)
                 if target_replace_mods is None or module.__class__.__name__ in target_replace_mods:
                     if target_replace_mods is None:  # dirty hack for all modules
                         module = root_module  # search all modules
@@ -515,7 +521,8 @@ class LoRANetwork(torch.nn.Module):
                         is_conv2d_1x1 = is_conv2d and child_module.kernel_size == (1, 1)
 
                         if is_linear or is_conv2d:
-                            original_name = (name + "." if name else "") + child_name
+                            normalized_child_name = normalize_module_name(child_name)
+                            original_name = ".".join(part for part in (normalized_name, normalized_child_name) if part)
                             lora_name = f"{pfx}.{original_name}".replace(".", "_")
 
                             # exclude/include filter

@@ -98,11 +98,16 @@ The performance gains vary depending on hardware and settings. Here are some exa
   - Choices: `true`, `false`, `auto`
 - `--compile_fullgraph`: Enable fullgraph mode
 - `--compile_cache_size_limit`: Set cache size limit (default: PyTorch default, typically 8-32, recommended: 32)
+- `--compile_prewarm`: Run representative training buckets before epoch 1 to frontload compile cost. This also enables `--compile` automatically.
+- `--compile_prewarm_max_buckets`: Limit how many representative buckets are prewarmed (default: all)
+- `--compile_prewarm_include_backward`: Include backward pass during prewarm (default: `true`)
 
 So far, it has been observed that setting `compile_mode` to `max-autotune` may not work in some cases.
 Also, `compile_fullgraph` may not work depending on the architecture.
 
 If `compile_dynamic` is not set to `true`, recompilation will occur each time the shape of the model input changes. This may result in longer training times for the first epoch, but subsequent epochs will be faster.
+
+If `compile_prewarm` is enabled, Musubi Tuner will automatically enable `compile` and run one representative batch per bucket (or per the configured limit) before real training begins. This can reduce compile pauses during the first epoch, but may increase startup time and still cannot guarantee that all future recompiles are eliminated.
 
 ### Additional Performance Arguments / 追加のパフォーマンス引数
 
@@ -122,11 +127,16 @@ If `compile_dynamic` is not set to `true`, recompilation will occur each time th
   - 選択肢: `true`, `false`, `auto`
 - `--compile_fullgraph`: フルグラフモードを有効にする
 - `--compile_cache_size_limit`: キャッシュサイズ制限を設定（デフォルト: PyTorchのデフォルト、通常8-32、推奨: 32）
+- `--compile_prewarm`: エポック1の前に代表的な学習バケットを実行してコンパイルコストを前倒しする。指定すると `--compile` も自動で有効になります。
+- `--compile_prewarm_max_buckets`: 事前コンパイルする代表バケット数の上限（デフォルト: すべて）
+- `--compile_prewarm_include_backward`: 事前ウォームアップにbackwardを含める（デフォルト: `true`）
 
 これまでに確認したところ、`compile_mode`は`max-autotune`に設定すると動作しないケースがあるようです。
 また、`compile_fullgraph`はアーキテクチャにより動作しない場合があります。
 
 `compile_dynamic`で `true` を指定しない場合、モデルの入力の形状が変わるごとに再コンパイルが発生します。最初のエポックの学習時間が長くなる可能性がありますが、その後のエポックでは高速化されます。
+
+`compile_prewarm`を有効にすると、`compile`も自動的に有効になり、実際の学習の前に代表的な各バケット（または指定された上限まで）の1バッチを実行します。これにより最初のエポック中のコンパイル待ちを減らせる可能性がありますが、開始時間は長くなり、将来の再コンパイルを完全になくせるわけではありません。
 
 ### 追加のパフォーマンス引数
 

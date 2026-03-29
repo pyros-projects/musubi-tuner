@@ -1044,6 +1044,23 @@ class BucketBatchManager:
     def __len__(self):
         return len(self.bucket_batch_indices)
 
+    def get_representative_batch_indices(self, max_buckets: Optional[int] = None) -> list[int]:
+        representative_indices: list[int] = []
+        running_index = 0
+        for bucket_reso in self.bucket_resos:
+            bucket = self.buckets[bucket_reso]
+            num_batches = math.ceil(len(bucket) / self.batch_size)
+            if num_batches > 0:
+                representative_indices.append(running_index)
+            running_index += num_batches
+
+        if max_buckets is not None:
+            if max_buckets <= 0:
+                return []
+            representative_indices = representative_indices[:max_buckets]
+
+        return representative_indices
+
     def __getitem__(self, idx):
         bucket_reso, batch_idx = self.bucket_batch_indices[idx]
         bucket = self.buckets[bucket_reso]
@@ -2396,6 +2413,12 @@ class BaseDataset(torch.utils.data.Dataset):
     def set_max_train_steps(self, max_train_steps):
         self.max_train_steps = max_train_steps
 
+    def get_representative_batch_indices(self, max_buckets: Optional[int] = None) -> list[int]:
+        batch_manager = getattr(self, "batch_manager", None)
+        if batch_manager is None:
+            return []
+        return batch_manager.get_representative_batch_indices(max_buckets=max_buckets)
+
     def shuffle_buckets(self):
         raise NotImplementedError
 
@@ -3520,4 +3543,3 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def set_max_train_steps(self, max_train_steps):
         for dataset in self.datasets:
             dataset.set_max_train_steps(max_train_steps)
-
