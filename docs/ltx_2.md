@@ -1294,6 +1294,28 @@ It also forces `guidance_scale=1.0` and `cfg_scale=1.0`, enables stage-1 distill
 
 When using prompt files, the same stage-specific multipliers can be overridden per sample with `stage1_distilled_lora_multiplier` and `stage2_distilled_lora_multiplier`.
 
+Prompt-file TOML now also supports per-prompt LoRA stacks:
+
+- root `[prompt].loras = [...]` defines a baseline stack shared by every subset prompt
+- each `[[prompt.subset]]` may define its own `loras = [...]`
+- `lora_mode = "extend"` stacks subset LoRAs on top of the root baseline
+- `lora_mode = "replace"` uses only the subset LoRAs for that prompt
+
+Each prompt-file LoRA entry uses this shape:
+
+```toml
+{ path = "/abs/path/to/lora.safetensors", weight = 0.8, merge = false }
+```
+
+Notes:
+
+- `weight` defaults to `1.0`
+- `merge` defaults to `false`
+- `merge = false` is recommended because prompt-file LoRAs are intended to be applied and restored per sample
+- distilled two-stage LoRA (`--distilled_lora_path`) stays separate from these prompt-file concept/style LoRAs
+
+For standalone prompt-file inference, CLI `--lora_weight/--lora_multiplier` act as the baseline stack. A subset using `lora_mode = "replace"` overrides that baseline for just that prompt.
+
 #### Checkpoint Output Format
 
 Saved LoRA checkpoints are converted to ComfyUI format by default. Both the original musubi-tuner format and the ComfyUI format are kept.

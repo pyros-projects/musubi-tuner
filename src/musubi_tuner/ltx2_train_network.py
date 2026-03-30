@@ -77,6 +77,7 @@ from musubi_tuner.ltx2_lora_utils import (
     looks_like_comfy_ltx_lora,
     normalize_ltx_comfy_lora_weights,
 )
+from musubi_tuner.ltx2_prompt_lora_utils import load_ltx_prompt_file_with_resolved_loras
 
 # LTX-2 latent normalization defaults.
 # These are identity stats (mean=0, std=1). We keep them as a safe fallback and
@@ -87,6 +88,22 @@ LTX2_LATENTS_STD = [1.0]
 DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
 DEFAULT_SAMPLE_LATENTS_CACHE = "ltx2_sample_latents_cache.pt"
 IC_LORA_STRATEGIES = ("auto", "none", "v2v", "audio_ref_only_ic")
+
+
+def build_ltx_prompt_file_baseline_loras(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    weights = list(getattr(args, "lora_weight", None) or [])
+    multipliers = list(getattr(args, "lora_multiplier", None) or [])
+    baseline_loras: List[Dict[str, Any]] = []
+    for idx, weight_path in enumerate(weights):
+        multiplier = float(multipliers[idx]) if idx < len(multipliers) else 1.0
+        baseline_loras.append(
+            {
+                "path": str(weight_path),
+                "weight": multiplier,
+                "merge": False,
+            }
+        )
+    return baseline_loras
 
 
 def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str:
@@ -784,6 +801,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._self_flow = None
         self._self_flow_active: bool = False
         self._self_flow_step_context: Optional[Dict[str, Any]] = None
+
+    def _default_sampling_lora_network_module_name(self) -> Optional[str]:
+        return "musubi_tuner.networks.lora_ltx2"
 
     def normalize_sampling_lora_weights(
         self,
@@ -4047,7 +4067,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         if args.sample_prompts is None:
             raise ValueError("--sample_prompts is required when --use_precached_sample_prompts is set")
-        prompts = load_prompts(args.sample_prompts)
+        if str(args.sample_prompts).endswith(".toml"):
+            prompts = load_ltx_prompt_file_with_resolved_loras(
+                args.sample_prompts,
+                baseline_loras=build_ltx_prompt_file_baseline_loras(args),
+            )
+        else:
+            prompts = load_prompts(args.sample_prompts)
         if not prompts:
             raise ValueError(f"No prompts found in {args.sample_prompts}")
 
@@ -4221,7 +4247,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sample_params = self._load_precached_sample_prompts(args)
         else:
             logger.info("LTX-2 sampling: deferring Gemma encoding until sampling")
-            prompts = load_prompts(sample_prompts)
+            if str(sample_prompts).endswith(".toml"):
+                prompts = load_ltx_prompt_file_with_resolved_loras(
+                    sample_prompts,
+                    baseline_loras=build_ltx_prompt_file_baseline_loras(args),
+                )
+            else:
+                prompts = load_prompts(sample_prompts)
             if not prompts:
                 return None
             sample_params = self._apply_sample_defaults(args, prompts)
@@ -4506,14 +4538,30 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 audio_decoder, vocoder = None, None
 
         try:
-            if args.compile and self._get_sampling_lora_specs(args) and self._sampling_lora_requires_eager_fallback(transformer):
+            has_prompt_local_loras = any(bool(sample_parameter.get("resolved_loras")) for sample_parameter in sample_parameters)
+            global_sampling_lora_specs = [] if has_prompt_local_loras else self._get_sampling_lora_specs(args)
+            if has_prompt_local_loras and self._get_sampling_lora_specs(args):
+                logger.warning(
+                    "Prompt-local resolved_loras are active; skipping global sampling_lora_weight application for this sampling run."
+                )
+
+            if args.compile and global_sampling_lora_specs and self._sampling_lora_requires_eager_fallback(transformer):
                 eager_sampling_swaps = model_utils.swap_compiled_modules_with_eager(transformer)
                 logger.info(
                     "Sampling LoRA requested on a compiled FP8 transformer; switched %d compiled modules to eager for sampling only.",
                     len(eager_sampling_swaps),
                 )
 
-            applied_sampling_lora = self._apply_sampling_lora(args, transformer, accelerator.device)
+            applied_sampling_lora = self._apply_sampling_lora(args, transformer, accelerator.device) if global_sampling_lora_specs else []
+
+            def _get_prompt_local_lora_specs(sample_parameter: Dict) -> list[tuple[str, float]]:
+                specs = []
+                for entry in sample_parameter.get("resolved_loras", []) or []:
+                    path = entry.get("path")
+                    if not path:
+                        continue
+                    specs.append((str(path), float(entry.get("weight", 1.0))))
+                return specs
 
             if distributed_state.num_processes <= 1:
                 # Batch encode all prompts upfront when offloading is enabled
@@ -4531,7 +4579,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
                 with torch.no_grad(), accelerator.autocast():
                     for sample_parameter in sample_parameters:
+                        prompt_local_applied = []
                         try:
+                            prompt_local_specs = _get_prompt_local_lora_specs(sample_parameter)
+                            if prompt_local_specs:
+                                prompt_local_applied = self._apply_sampling_lora_specs(
+                                    args, transformer, accelerator.device, prompt_local_specs
+                                )
                             if transformer_offloaded:
                                 ensure_transformer_on_device()
                                 self.sample_image_inference(
@@ -4548,6 +4602,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
                                 )
                         except Exception as exc:
                             logger.error("Sampling failed for prompt, skipping: %s", exc, exc_info=True)
+                        finally:
+                            if prompt_local_applied:
+                                self._restore_sampling_lora_specs(
+                                    args, transformer, accelerator.device, prompt_local_applied
+                                )
                         clean_memory_on_device(accelerator.device)
                         self._cleanup_cuda(accelerator.device)
 
@@ -4581,7 +4640,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
 
                         for sample_parameter in my_sample_params:
+                            prompt_local_applied = []
                             try:
+                                prompt_local_specs = _get_prompt_local_lora_specs(sample_parameter)
+                                if prompt_local_specs:
+                                    prompt_local_applied = self._apply_sampling_lora_specs(
+                                        args, transformer, accelerator.device, prompt_local_specs
+                                    )
                                 if transformer_offloaded:
                                     ensure_transformer_on_device()
                                     self.sample_image_inference(
@@ -4607,6 +4672,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
                                     )
                             except Exception as exc:
                                 logger.error("Sampling failed for prompt, skipping: %s", exc, exc_info=True)
+                            finally:
+                                if prompt_local_applied:
+                                    self._restore_sampling_lora_specs(
+                                        args, transformer, accelerator.device, prompt_local_applied
+                                    )
                             self._cleanup_cuda(accelerator.device)
 
                         if vae_for_sampling is not None:

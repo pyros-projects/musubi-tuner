@@ -39,16 +39,30 @@ cfg_scale = 1.0
 negative_prompt = ""
 stage1_distilled_lora_multiplier = 1.0
 stage2_distilled_lora_multiplier = 1.0
+loras = [
+  # Baseline LoRAs applied to every prompt unless a subset uses lora_mode = "replace".
+  { path = "/abs/path/to/base_style.safetensors", weight = 0.35, merge = false },
+  { path = "/abs/path/to/camera_motion_helper.safetensors", weight = 0.20, merge = false },
+]
 
 [[prompt.subset]]
 prompt = "cinematic close-up of a woman walking through neon rain at night, shallow depth of field, realistic lighting"
 seed = 1234
+lora_mode = "extend"
+loras = [
+  { path = "/abs/path/to/concept_a.safetensors", weight = 0.85, merge = false },
+  { path = "/abs/path/to/concept_b.safetensors", weight = 0.60, merge = false },
+]
 
 [[prompt.subset]]
 prompt = "two tennis players rallying on an outdoor clay court, long lens sports footage, natural motion, realistic sunlight"
 seed = 2345
 stage1_distilled_lora_multiplier = 0.75
 stage2_distilled_lora_multiplier = 1.0
+lora_mode = "replace"
+loras = [
+  { path = "/abs/path/to/concept_c.safetensors", weight = 0.90, merge = false },
+]
 
 [[prompt.subset]]
 prompt = "slow drone shot over a pine forest valley at sunrise, mist between trees, realistic aerial cinematography"
@@ -56,3 +70,4 @@ seed = 3456
 frame_count = 81
 stage1_distilled_lora_multiplier = 0.6
 stage2_distilled_lora_multiplier = 0.9
+# No subset loras here -> uses the root [prompt].loras baseline only.

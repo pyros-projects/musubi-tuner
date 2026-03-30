@@ -2002,13 +2002,34 @@ class NetworkTrainer:
             return convert_lora.convert_from_diffusers("lora_unet_", weights_sd)
         return weights_sd  # unknown format, return as is
 
+    def _default_sampling_lora_network_module_name(self) -> Optional[str]:
+        return None
+
+    def _get_sampling_lora_network_module_name(self, args: argparse.Namespace) -> str:
+        network_module_name = (
+            self._network_module_name
+            or getattr(args, "network_module", None)
+            or self._default_sampling_lora_network_module_name()
+        )
+        if not network_module_name:
+            raise ValueError(
+                "Sampling LoRA application requires a network module. "
+                "Pass --network_module or use a trainer that provides a default sampling LoRA module."
+            )
+        return str(network_module_name)
+
+    def _get_sampling_lora_network_module(self, args: argparse.Namespace):
+        if self._network_module is not None:
+            return self._network_module
+        return importlib.import_module(self._get_sampling_lora_network_module_name(args))
+
     def normalize_sampling_lora_weights(
         self,
         args: argparse.Namespace,
         weights_sd: dict[str, torch.Tensor],
         weight_path: str,
     ) -> dict[str, torch.Tensor]:
-        network_module_name = self._network_module_name or args.network_module
+        network_module_name = self._get_sampling_lora_network_module_name(args)
         return self.convert_weight_keys(weights_sd, network_module_name)
 
     def _get_sampling_lora_specs(self, args: argparse.Namespace) -> list[tuple[str, float]]:
@@ -2042,11 +2063,19 @@ class NetworkTrainer:
         transformer: torch.nn.Module,
         device: torch.device,
     ) -> list[tuple[str, dict[int, tuple[torch.nn.Module, torch.Tensor]]]]:
-        specs = self._get_sampling_lora_specs(args)
+        return self._apply_sampling_lora_specs(args, transformer, device, self._get_sampling_lora_specs(args))
+
+    def _apply_sampling_lora_specs(
+        self,
+        args: argparse.Namespace,
+        transformer: torch.nn.Module,
+        device: torch.device,
+        specs: list[tuple[str, float]],
+    ) -> list[tuple[str, dict[int, tuple[torch.nn.Module, torch.Tensor]]]]:
         if not specs:
             return []
 
-        network_module = self._network_module or importlib.import_module(args.network_module)
+        network_module = self._get_sampling_lora_network_module(args)
         applied: list[tuple[str, dict[int, tuple[torch.nn.Module, torch.Tensor]]]] = []
         stale_overlays = self._clear_sampling_lora_runtime_overlays(transformer)
         if stale_overlays:
@@ -2080,12 +2109,23 @@ class NetworkTrainer:
         device: torch.device,
         applied: list[tuple[str, dict[int, tuple[torch.nn.Module, torch.Tensor]]]],
     ) -> None:
+        self._restore_sampling_lora_specs(args, transformer, device, applied)
+
+    def _restore_sampling_lora_specs(
+        self,
+        args: argparse.Namespace,
+        transformer: torch.nn.Module,
+        device: torch.device,
+        applied: list[tuple[str, dict[int, tuple[torch.nn.Module, torch.Tensor]]]],
+    ) -> None:
         if not applied:
             return
 
         runtime_cleared = self._clear_sampling_lora_runtime_overlays(transformer)
         for weight_path, backups in reversed(applied):
             logger.info(f"Restoring sampling LoRA weights from {weight_path}")
+            if not backups:
+                continue
             restored = self._restore_sampling_lora_network(backups)
             logger.info(f"Restored sampling LoRA {weight_path}: restored_modules={restored}")
         if runtime_cleared:

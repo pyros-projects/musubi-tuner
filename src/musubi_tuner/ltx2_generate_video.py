@@ -383,6 +383,14 @@ def _build_prompt_list(
     return [sample]
 
 
+def _should_merge_cli_loras_once(args: argparse.Namespace) -> bool:
+    if not getattr(args, "lora_weight", None):
+        return False
+    if getattr(args, "sample_prompts", None):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -423,7 +431,7 @@ def main() -> None:
     )
 
     # -- Merge LoRAs --
-    if args.lora_weight:
+    if _should_merge_cli_loras_once(args):
         _merge_lora_weights(
             trainer,
             transformer,

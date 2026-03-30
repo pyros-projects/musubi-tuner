@@ -18,6 +18,7 @@ from musubi_tuner.ltx2_generate_video import (
     _apply_official_distilled_pipeline_args,
     _build_prompt_list,
     _merge_lora_weights,
+    _should_merge_cli_loras_once,
     parse_args,
 )
 from musubi_tuner.ltx2_inference import (
@@ -118,6 +119,39 @@ class _SamplingHooksTrainer(LTX2NetworkTrainer):
 
     def _restore_sampling_lora(self, args, transformer, device, applied):
         self.events.append(("restore", len(applied), device.type))
+
+    def sample_image_inference(
+        self,
+        accelerator,
+        args,
+        transformer,
+        dit_dtype,
+        vae,
+        save_dir,
+        sample_parameter,
+        epoch,
+        steps,
+        audio_decoder=None,
+        vocoder=None,
+    ):
+        self.events.append(("sample", sample_parameter["prompt"]))
+
+
+class _PromptLocalSamplingTrainer(LTX2NetworkTrainer):
+    def __init__(self):
+        super().__init__()
+        self.events = []
+
+    def _apply_sampling_lora_specs(self, args, transformer, device, specs):
+        if not specs:
+            return []
+        self.events.append(("apply_specs", tuple(specs), device.type))
+        return [("prompt-local", {"backups": len(specs)})]
+
+    def _restore_sampling_lora_specs(self, args, transformer, device, applied):
+        if not applied:
+            return
+        self.events.append(("restore_specs", tuple(applied), device.type))
 
     def sample_image_inference(
         self,
@@ -979,6 +1013,175 @@ class LTX2SamplingLoraTests(unittest.TestCase):
         self.assertIn(
             "lora_unet_model_transformer_blocks_0_audio_attn2_to_out_0.lora_up.weight",
             normalized,
+        )
+
+    def test_normalize_sampling_lora_weights_uses_ltx2_default_module_when_args_field_missing(self):
+        trainer = LTX2NetworkTrainer()
+        weights_sd = {"lora_unet_model_dummy.lora_down.weight": torch.randn(2, 2)}
+
+        with mock.patch.object(trainer, "convert_weight_keys", side_effect=lambda sd, network_module_name: (sd, network_module_name)) as convert:
+            normalized, network_module_name = trainer.normalize_sampling_lora_weights(
+                Namespace(),
+                weights_sd,
+                "/tmp/a.safetensors",
+            )
+
+        self.assertIs(normalized, weights_sd)
+        self.assertEqual(network_module_name, "musubi_tuner.networks.lora_ltx2")
+        convert.assert_called_once_with(weights_sd, "musubi_tuner.networks.lora_ltx2")
+
+    def test_apply_sampling_lora_specs_uses_explicit_specs_and_restore_clears_them(self):
+        trainer = LTX2NetworkTrainer()
+        transformer = _FakeTransformer()
+        args = Namespace(network_module="musubi_tuner.networks.lora_ltx2")
+        network_module = mock.Mock()
+        network_module.create_arch_network_from_weights.side_effect = lambda multiplier, weights_sd, unet, for_inference: {
+            "multiplier": multiplier,
+            "weights_sd": weights_sd,
+            "unet": unet,
+            "for_inference": for_inference,
+        }
+
+        with mock.patch("musubi_tuner.hv_train_network.importlib.import_module", return_value=network_module), \
+             mock.patch.object(trainer, "_load_sampling_lora_weights", side_effect=[{"w": "a"}, {"w": "b"}]) as load_weights, \
+             mock.patch.object(trainer, "_apply_sampling_lora_network", side_effect=[(0, 1, {}), (1, 0, {123: ("module", "backup")})]) as apply_network, \
+             mock.patch.object(trainer, "_clear_sampling_lora_runtime_overlays", side_effect=[0, 1]) as clear_runtime, \
+             mock.patch.object(trainer, "_restore_sampling_lora_network", return_value=1) as restore_network:
+            applied = trainer._apply_sampling_lora_specs(
+                args,
+                transformer,
+                torch.device("cpu"),
+                specs=[("/tmp/a.safetensors", 0.5), ("/tmp/b.safetensors", 1.0)],
+            )
+            trainer._restore_sampling_lora_specs(
+                args,
+                transformer,
+                torch.device("cpu"),
+                applied,
+            )
+
+        self.assertEqual(
+            load_weights.call_args_list,
+            [mock.call(args, "/tmp/a.safetensors"), mock.call(args, "/tmp/b.safetensors")],
+        )
+        self.assertEqual(network_module.create_arch_network_from_weights.call_count, 2)
+        self.assertEqual(apply_network.call_count, 2)
+        self.assertEqual(applied, [("/tmp/a.safetensors", {}), ("/tmp/b.safetensors", {123: ("module", "backup")})])
+        self.assertEqual(clear_runtime.call_count, 2)
+        restore_network.assert_called_once_with({123: ("module", "backup")})
+
+    def test_apply_sampling_lora_specs_uses_ltx2_default_module_when_args_field_missing(self):
+        trainer = LTX2NetworkTrainer()
+        transformer = _FakeTransformer()
+        network_module = mock.Mock()
+        network_module.create_arch_network_from_weights.side_effect = lambda multiplier, weights_sd, unet, for_inference: {
+            "multiplier": multiplier,
+            "weights_sd": weights_sd,
+            "unet": unet,
+            "for_inference": for_inference,
+        }
+
+        with mock.patch("musubi_tuner.hv_train_network.importlib.import_module", return_value=network_module) as import_module, \
+             mock.patch.object(trainer, "_load_sampling_lora_weights", return_value={"w": "a"}) as load_weights, \
+             mock.patch.object(trainer, "_apply_sampling_lora_network", return_value=(0, 1, {})) as apply_network:
+            applied = trainer._apply_sampling_lora_specs(
+                Namespace(),
+                transformer,
+                torch.device("cpu"),
+                specs=[("/tmp/a.safetensors", 0.5)],
+            )
+
+        import_module.assert_called_once_with("musubi_tuner.networks.lora_ltx2")
+        load_weights.assert_called_once()
+        apply_network.assert_called_once()
+        self.assertEqual(applied, [("/tmp/a.safetensors", {})])
+
+    def test_should_merge_cli_loras_once_skips_prompt_file_mode(self):
+        args = Namespace(
+            lora_weight=["/tmp/a.safetensors"],
+            sample_prompts="/tmp/prompts.toml",
+            prompt=None,
+        )
+
+        self.assertFalse(_should_merge_cli_loras_once(args))
+
+    def test_should_merge_cli_loras_once_keeps_single_prompt_mode(self):
+        args = Namespace(
+            lora_weight=["/tmp/a.safetensors"],
+            sample_prompts=None,
+            prompt="hello world",
+        )
+
+        self.assertTrue(_should_merge_cli_loras_once(args))
+
+    def test_sample_images_applies_prompt_local_loras_per_sample_without_leakage(self):
+        trainer = _PromptLocalSamplingTrainer()
+        accelerator = _FakeAccelerator()
+        transformer = _FakeTransformer()
+        args = Namespace(
+            sample_at_first=True,
+            sample_every_n_steps=None,
+            sample_every_n_epochs=None,
+            sample_prompts="dummy.toml",
+            output_dir=tempfile.mkdtemp(prefix="ltx2-prompt-local-"),
+            sample_with_offloading=False,
+            use_precached_sample_prompts=False,
+            precache_sample_prompts=False,
+            sample_audio_subprocess=True,
+            sample_disable_audio=False,
+            sample_audio_only=False,
+            ltx_mode="video",
+            vae_dtype=None,
+            sampling_lora_weight=None,
+            sampling_lora_multiplier=None,
+            compile=False,
+        )
+        sample_parameters = [
+            {
+                "prompt": "Prompt A",
+                "enum": 0,
+                "resolved_loras": [
+                    {"path": "/a.safetensors", "weight": 0.5, "merge": False},
+                    {"path": "/b.safetensors", "weight": 0.8, "merge": False},
+                ],
+            },
+            {
+                "prompt": "Prompt B",
+                "enum": 1,
+                "resolved_loras": [{"path": "/c.safetensors", "weight": 0.9, "merge": False}],
+            },
+            {
+                "prompt": "Prompt C",
+                "enum": 2,
+                "resolved_loras": [],
+            },
+        ]
+
+        with mock.patch("musubi_tuner.ltx2_train_network.PartialState", _FakePartialState), mock.patch(
+            "musubi_tuner.ltx2_train_network.clean_memory_on_device", lambda device: None
+        ):
+            trainer.sample_images(
+                accelerator=accelerator,
+                args=args,
+                epoch=0,
+                steps=0,
+                vae=object(),
+                transformer=transformer,
+                sample_parameters=sample_parameters,
+                dit_dtype=torch.bfloat16,
+            )
+
+        self.assertEqual(
+            trainer.events,
+            [
+                ("apply_specs", (("/a.safetensors", 0.5), ("/b.safetensors", 0.8)), "cpu"),
+                ("sample", "Prompt A"),
+                ("restore_specs", (("prompt-local", {"backups": 2}),), "cpu"),
+                ("apply_specs", (("/c.safetensors", 0.9),), "cpu"),
+                ("sample", "Prompt B"),
+                ("restore_specs", (("prompt-local", {"backups": 1}),), "cpu"),
+                ("sample", "Prompt C"),
+            ],
         )
 
     def test_sample_images_temporarily_applies_sampling_lora(self):
