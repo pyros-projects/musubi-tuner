@@ -428,9 +428,9 @@ class FineTuningTrainer:
                 from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
             except ImportError as exc:
                 raise ImportError(
-                    "ProdigyPlusScheduleFree requires the optional package "
-                    "'prodigy-plus-schedule-free'. Install it with "
-                    "`pip install prodigy-plus-schedule-free`."
+                    "ProdigyPlusScheduleFree could not be imported. "
+                    "The optimizer is vendored under `src/prodigyplus`, so this usually means "
+                    "the repo `src/` directory is not on PYTHONPATH or the package was removed."
                 ) from exc
 
             logger.info(f"use ProdigyPlusScheduleFree optimizer | {optimizer_kwargs}")

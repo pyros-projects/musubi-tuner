@@ -1021,6 +1021,20 @@ class NetworkTrainer:
             optimizer_class = torch.optim.AdamW
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type == "ProdigyPlusScheduleFree".lower():
+            try:
+                from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
+            except ImportError as exc:
+                raise ImportError(
+                    "ProdigyPlusScheduleFree could not be imported. "
+                    "The optimizer is vendored under `src/prodigyplus`, so this usually means "
+                    "the repo `src/` directory is not on PYTHONPATH or the package was removed."
+                ) from exc
+
+            logger.info(f"use ProdigyPlusScheduleFree optimizer | {optimizer_kwargs}")
+            optimizer_class = ProdigyPlusScheduleFree
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         elif optimizer_type == "automagic":
             from musubi_tuner.optimizers.automagic import Automagic
             logger.info(f"use Automagic optimizer | lr={lr} | {optimizer_kwargs}")

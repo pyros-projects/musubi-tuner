@@ -786,7 +786,7 @@ Specify the optimizer with the `--optimizer_type` argument, using the format `pa
 
 You can specify multiple arguments for the optimizer using the `--optimizer_args` argument in the form `arg_name=value` (e.g., `--optimizer_args "weight_decay=0.01" "betas=(0.9,0.95)"`).
 
-`ProdigyPlusScheduleFree` is also supported as a built-in shorthand. Install it with `pip install prodigy-plus-schedule-free` and then use `--optimizer_type ProdigyPlusScheduleFree`.
+`ProdigyPlusScheduleFree` is also supported as a built-in shorthand. In this repo the optimizer is vendored under `src/prodigyplus`, so you can use `--optimizer_type ProdigyPlusScheduleFree` directly as long as you run with the repo `src/` on `PYTHONPATH`.
 
 <details>
 <summary>日本語</summary>
@@ -797,7 +797,7 @@ You can specify multiple arguments for the optimizer using the `--optimizer_args
 
 `--optimizer_type`引数に、` --optimizer_type schedulefree.AdamWScheduleFree`のように、`パッケージ名.クラス名`の形式で指定します。オプティマイザへの引数は、`--optimizer_args`に`引数名=値`の形で複数指定できます（例：`--optimizer_args "weight_decay=0.01" "betas=(0.9,0.95)"`）。
 
-`ProdigyPlusScheduleFree` も組み込みの短縮名としてサポートされています。`pip install prodigy-plus-schedule-free` でインストールし、`--optimizer_type ProdigyPlusScheduleFree` のように指定できます。
+`ProdigyPlusScheduleFree` も組み込みの短縮名としてサポートされています。このリポジトリではオプティマイザ本体を `src/prodigyplus` に同梱しているため、リポジトリの `src/` が `PYTHONPATH` に入っていれば `--optimizer_type ProdigyPlusScheduleFree` をそのまま指定できます。
 
 </details>
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import importlib
 import sys
 import types
 import unittest
 import tempfile
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -114,6 +116,14 @@ class _SamplingCompatTrainer(NetworkTrainer):
 
 
 class RemainingMigrationPortsTest(unittest.TestCase):
+    def test_prodigyplus_optimizer_package_is_available_from_repo_src(self) -> None:
+        module = importlib.import_module("prodigyplus.prodigy_plus_schedulefree")
+        module_path = Path(module.__file__).resolve()
+        repo_src = Path(__file__).resolve().parents[1] / "src"
+
+        self.assertTrue(module_path.is_relative_to(repo_src), module_path)
+        self.assertTrue(hasattr(module, "ProdigyPlusScheduleFree"))
+
     def test_shared_sample_images_applies_and_restores_sampling_lora(self) -> None:
         trainer = _SamplingCompatTrainer()
         accelerator = _FakeAccelerator()
@@ -237,6 +247,45 @@ class RemainingMigrationPortsTest(unittest.TestCase):
 
     def test_hv_trainer_supports_prodigy_plus_schedule_free_optimizer(self) -> None:
         trainer = FineTuningTrainer()
+        params = [nn.Parameter(torch.ones(1))]
+        args = types.SimpleNamespace(
+            optimizer_type="ProdigyPlusScheduleFree",
+            optimizer_args=["betas=(0.9, 0.99)", "weight_decay=0.0"],
+            learning_rate=1.0,
+            lr_scheduler="constant",
+            max_grad_norm=0.0,
+        )
+
+        fake_pkg = types.ModuleType("prodigyplus")
+        fake_submodule = types.ModuleType("prodigyplus.prodigy_plus_schedulefree")
+
+        class ProdigyPlusScheduleFree(torch.optim.Optimizer):
+            def __init__(self, params, lr=1.0, **kwargs):
+                defaults = {"lr": lr, **kwargs}
+                super().__init__(params, defaults)
+
+            def step(self, closure=None):
+                return None
+
+        ProdigyPlusScheduleFree.__module__ = "prodigyplus.prodigy_plus_schedulefree"
+        fake_submodule.ProdigyPlusScheduleFree = ProdigyPlusScheduleFree
+        fake_pkg.prodigy_plus_schedulefree = fake_submodule
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "prodigyplus": fake_pkg,
+                "prodigyplus.prodigy_plus_schedulefree": fake_submodule,
+            },
+        ):
+            optimizer_name, optimizer_args, optimizer, _train_fn, _eval_fn = trainer.get_optimizer(args, params)
+
+        self.assertEqual(optimizer_name, "prodigyplus.prodigy_plus_schedulefree.ProdigyPlusScheduleFree")
+        self.assertEqual(optimizer.__class__.__name__, "ProdigyPlusScheduleFree")
+        self.assertIn("betas=(0.9, 0.99)", optimizer_args)
+
+    def test_hv_network_trainer_supports_prodigy_plus_schedule_free_optimizer(self) -> None:
+        trainer = NetworkTrainer()
         params = [nn.Parameter(torch.ones(1))]
         args = types.SimpleNamespace(
             optimizer_type="ProdigyPlusScheduleFree",
