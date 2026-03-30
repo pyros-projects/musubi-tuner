@@ -2,6 +2,8 @@
 
 import argparse
 import gc
+import hashlib
+import json
 import math
 import os
 import random
@@ -4371,6 +4373,199 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if accelerator.device.type == "cuda":
             torch.cuda.empty_cache()
 
+    def _resolve_standalone_autocache_dir(self, args: argparse.Namespace) -> Optional[str]:
+        autocache = getattr(args, "autocache", None)
+        if not autocache:
+            return None
+        if autocache == "__cwd__":
+            return os.path.join(os.getcwd(), ".cache", "ltx2_prompt_embeddings")
+        return os.path.abspath(os.path.expanduser(str(autocache)))
+
+    def _build_standalone_prompt_embedding_cache_key(self, prompt_text: str, args: argparse.Namespace) -> str:
+        gemma_root = getattr(args, "gemma_root", None)
+        gemma_safetensors = getattr(args, "gemma_safetensors", None)
+        payload = {
+            "text": prompt_text,
+            "ltx_mode": getattr(args, "ltx_mode", None),
+            "ltx_version": getattr(args, "ltx_version", None),
+            "audio_video": bool(self._audio_video),
+            "ltx2_checkpoint": os.path.abspath(str(getattr(args, "ltx2_checkpoint", ""))),
+            "gemma_root": os.path.abspath(str(gemma_root)) if gemma_root else None,
+            "gemma_safetensors": os.path.abspath(str(gemma_safetensors)) if gemma_safetensors else None,
+            "gemma_load_in_8bit": bool(getattr(args, "gemma_load_in_8bit", False)),
+            "gemma_load_in_4bit": bool(getattr(args, "gemma_load_in_4bit", False)),
+            "gemma_bnb_4bit_quant_type": getattr(args, "gemma_bnb_4bit_quant_type", None),
+            "gemma_bnb_4bit_disable_double_quant": bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _get_standalone_prompt_embedding_cache_path(cache_dir: str, cache_key: str) -> str:
+        return os.path.join(cache_dir, f"{cache_key}.safetensors")
+
+    def _load_standalone_prompt_embedding_cache(
+        self,
+        cache_dir: str,
+        cache_key: str,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        cache_path = self._get_standalone_prompt_embedding_cache_path(cache_dir, cache_key)
+        if not os.path.isfile(cache_path):
+            return None
+
+        from safetensors.torch import load_file
+
+        sd = load_file(cache_path)
+        prompt_embeds = sd.get("prompt_embeds")
+        prompt_attention_mask = sd.get("prompt_attention_mask")
+        if prompt_embeds is None or prompt_attention_mask is None:
+            logger.warning("Standalone autocache file is missing required tensors, ignoring: %s", cache_path)
+            return None
+
+        logger.info("Standalone autocache hit: %s", cache_path)
+        return prompt_embeds.detach().cpu(), prompt_attention_mask.detach().cpu()
+
+    def _save_standalone_prompt_embedding_cache(
+        self,
+        cache_dir: str,
+        cache_key: str,
+        prompt_text: str,
+        prompt_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        args: argparse.Namespace,
+    ) -> str:
+        from safetensors.torch import save_file
+
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = self._get_standalone_prompt_embedding_cache_path(cache_dir, cache_key)
+        metadata = {
+            "text": prompt_text,
+            "ltx_mode": str(getattr(args, "ltx_mode", "")),
+            "ltx_version": str(getattr(args, "ltx_version", "")),
+            "ltx2_checkpoint": os.path.abspath(str(getattr(args, "ltx2_checkpoint", ""))),
+        }
+        save_file(
+            {
+                "prompt_embeds": prompt_embeds.detach().cpu().contiguous(),
+                "prompt_attention_mask": prompt_attention_mask.detach().cpu().contiguous(),
+            },
+            cache_path,
+            metadata=metadata,
+        )
+        logger.info("Standalone autocache save: %s", cache_path)
+        return cache_path
+
+    def _sample_parameter_requires_negative_embeddings(self, sample_parameter: Dict) -> bool:
+        cfg_scale = sample_parameter.get("cfg_scale", None)
+        guidance_scale = sample_parameter.get("guidance_scale", self.default_guidance_scale)
+        effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+        try:
+            return float(effective_cfg_scale) != 1.0
+        except (TypeError, ValueError):
+            return False
+
+    def _prepare_sample_prompt_embeddings_batch(
+        self,
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        sample_params_list: List[Dict],
+    ) -> None:
+        missing_indices = []
+        autocache_dir = self._resolve_standalone_autocache_dir(args)
+
+        if autocache_dir:
+            logger.info("Standalone autocache enabled: %s", autocache_dir)
+            for sample_parameter in sample_params_list:
+                if sample_parameter.get("prompt_embeds") is None:
+                    prompt_text = sample_parameter.get("prompt", "")
+                    prompt_cache_key = self._build_standalone_prompt_embedding_cache_key(prompt_text, args)
+                    cached = self._load_standalone_prompt_embedding_cache(autocache_dir, prompt_cache_key)
+                    if cached is not None:
+                        prompt_embeds, prompt_mask = cached
+                        sample_parameter["prompt_embeds"] = prompt_embeds
+                        sample_parameter["prompt_attention_mask"] = prompt_mask
+
+                if (
+                    self._sample_parameter_requires_negative_embeddings(sample_parameter)
+                    and sample_parameter.get("negative_prompt_embeds") is None
+                ):
+                    negative_prompt = sample_parameter.get("negative_prompt")
+                    if negative_prompt is None:
+                        negative_prompt = ""
+                        sample_parameter["negative_prompt"] = negative_prompt
+                    negative_cache_key = self._build_standalone_prompt_embedding_cache_key(negative_prompt, args)
+                    cached = self._load_standalone_prompt_embedding_cache(autocache_dir, negative_cache_key)
+                    if cached is not None:
+                        neg_embeds, neg_mask = cached
+                        sample_parameter["negative_prompt_embeds"] = neg_embeds
+                        sample_parameter["negative_prompt_attention_mask"] = neg_mask
+
+        for idx, sample_parameter in enumerate(sample_params_list):
+            needs_prompt = sample_parameter.get("prompt_embeds") is None
+            needs_negative = self._sample_parameter_requires_negative_embeddings(sample_parameter) and sample_parameter.get(
+                "negative_prompt_embeds"
+            ) is None
+            if needs_prompt or needs_negative:
+                missing_indices.append(idx)
+
+        if not missing_indices:
+            return
+
+        strict_precached = bool(getattr(args, "use_precached_sample_prompts", False)) or bool(
+            getattr(args, "precache_sample_prompts", False)
+        )
+        if strict_precached:
+            preview = ",".join(str(i) for i in missing_indices[:10])
+            if len(missing_indices) > 10:
+                preview += ",..."
+            raise ValueError(
+                "Precached sample prompt embeddings are incomplete; refusing to load Gemma during training. "
+                f"Missing prompt/negative embeddings for sample indices [{preview}]. "
+                "Rebuild sample prompt cache with ltx2_cache_text_encoder_outputs.py."
+            )
+
+        text_encoder_dtype = self._build_text_encoder(args, accelerator)
+        logger.info("Sampling batch: loaded text encoder for %d prompts", len(sample_params_list))
+
+        for sample_parameter in sample_params_list:
+            if sample_parameter.get("prompt_embeds") is None:
+                prompt_text = sample_parameter.get("prompt", "")
+                prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt_text, text_encoder_dtype)
+                sample_parameter["prompt_embeds"] = prompt_embeds
+                sample_parameter["prompt_attention_mask"] = prompt_mask
+                if autocache_dir:
+                    prompt_cache_key = self._build_standalone_prompt_embedding_cache_key(prompt_text, args)
+                    self._save_standalone_prompt_embedding_cache(
+                        autocache_dir,
+                        prompt_cache_key,
+                        prompt_text,
+                        prompt_embeds,
+                        prompt_mask,
+                        args,
+                    )
+
+            if self._sample_parameter_requires_negative_embeddings(sample_parameter) and sample_parameter.get("negative_prompt_embeds") is None:
+                negative_prompt = sample_parameter.get("negative_prompt")
+                if negative_prompt is None:
+                    negative_prompt = ""
+                    sample_parameter["negative_prompt"] = negative_prompt
+                neg_embeds, neg_mask = self._encode_prompt_text(accelerator, negative_prompt, text_encoder_dtype)
+                sample_parameter["negative_prompt_embeds"] = neg_embeds
+                sample_parameter["negative_prompt_attention_mask"] = neg_mask
+                if autocache_dir:
+                    negative_cache_key = self._build_standalone_prompt_embedding_cache_key(negative_prompt, args)
+                    self._save_standalone_prompt_embedding_cache(
+                        autocache_dir,
+                        negative_cache_key,
+                        negative_prompt,
+                        neg_embeds,
+                        neg_mask,
+                        args,
+                    )
+
+        self._cleanup_text_encoder(accelerator)
+        logger.info("Sampling batch: unloaded text encoder after encoding all prompts")
+        self._cleanup_cuda(accelerator.device)
+
     def sample_images(
         self,
         accelerator: Accelerator,
@@ -4447,65 +4642,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sample_parameter.pop("negative_prompt_embeds", None)
             sample_parameter.pop("negative_prompt_attention_mask", None)
 
-        def prepare_all_embeddings_batch(sample_params_list: List[Dict]) -> None:
-            """Load text encoder once and encode ALL prompts before unloading."""
-            def _requires_negative_embeddings(sample_parameter: Dict) -> bool:
-                cfg_scale = sample_parameter.get("cfg_scale", None)
-                guidance_scale = sample_parameter.get("guidance_scale", self.default_guidance_scale)
-                effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
-                try:
-                    return float(effective_cfg_scale) != 1.0
-                except (TypeError, ValueError):
-                    return False
-
-            missing_indices = []
-            for idx, sample_parameter in enumerate(sample_params_list):
-                needs_prompt = sample_parameter.get("prompt_embeds") is None
-                needs_negative = _requires_negative_embeddings(sample_parameter) and sample_parameter.get(
-                    "negative_prompt_embeds"
-                ) is None
-                if needs_prompt or needs_negative:
-                    missing_indices.append(idx)
-
-            if not missing_indices:
-                return
-
-            strict_precached = bool(getattr(args, "use_precached_sample_prompts", False)) or bool(
-                getattr(args, "precache_sample_prompts", False)
-            )
-            if strict_precached:
-                preview = ",".join(str(i) for i in missing_indices[:10])
-                if len(missing_indices) > 10:
-                    preview += ",..."
-                raise ValueError(
-                    "Precached sample prompt embeddings are incomplete; refusing to load Gemma during training. "
-                    f"Missing prompt/negative embeddings for sample indices [{preview}]. "
-                    "Rebuild sample prompt cache with ltx2_cache_text_encoder_outputs.py."
-                )
-
-            text_encoder_dtype = self._build_text_encoder(args, accelerator)
-            logger.info("Sampling batch: loaded text encoder for %d prompts", len(sample_params_list))
-
-            for sample_parameter in sample_params_list:
-                if sample_parameter.get("prompt_embeds") is None:
-                    prompt_text = sample_parameter.get("prompt", "")
-                    prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt_text, text_encoder_dtype)
-                    sample_parameter["prompt_embeds"] = prompt_embeds
-                    sample_parameter["prompt_attention_mask"] = prompt_mask
-
-                if _requires_negative_embeddings(sample_parameter) and sample_parameter.get("negative_prompt_embeds") is None:
-                    negative_prompt = sample_parameter.get("negative_prompt")
-                    if negative_prompt is None:
-                        negative_prompt = ""
-                        sample_parameter["negative_prompt"] = negative_prompt
-                    neg_embeds, neg_mask = self._encode_prompt_text(accelerator, negative_prompt, text_encoder_dtype)
-                    sample_parameter["negative_prompt_embeds"] = neg_embeds
-                    sample_parameter["negative_prompt_attention_mask"] = neg_mask
-
-            self._cleanup_text_encoder(accelerator)
-            logger.info("Sampling batch: unloaded text encoder after encoding all prompts")
-            self._cleanup_cuda(accelerator.device)
-
         # Check if using precached prompts (don't cleanup precached embeddings - they're reused)
         use_precached = bool(getattr(args, "use_precached_sample_prompts", False)) or bool(
             getattr(args, "precache_sample_prompts", False)
@@ -4567,7 +4703,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 # Batch encode all prompts upfront when offloading is enabled
                 if transformer_offloaded:
                     offload_transformer_if_needed()
-                    prepare_all_embeddings_batch(sample_parameters)
+                    self._prepare_sample_prompt_embeddings_batch(accelerator, args, sample_parameters)
 
                 # Load VAE once before the prompt loop to avoid repeated disk reads from the
                 # (potentially huge) safetensors checkpoint.  Keep it on CPU between prompts.
@@ -4630,7 +4766,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         # Batch encode all prompts for this process upfront
                         if transformer_offloaded:
                             offload_transformer_if_needed()
-                            prepare_all_embeddings_batch(my_sample_params)
+                            self._prepare_sample_prompt_embeddings_batch(accelerator, args, my_sample_params)
 
                         # Load VAE once before the prompt loop
                         vae_for_sampling = None

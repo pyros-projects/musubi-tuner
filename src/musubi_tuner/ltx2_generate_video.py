@@ -113,6 +113,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--negative_prompt", type=str, default=None, help="Negative prompt (enables CFG)")
     parser.add_argument("--sample_prompts", "--from_file", type=str, default=None, dest="sample_prompts",
                         help="Read prompts from a .txt file (one per line or TOML-style; same format as training --sample_prompts)")
+    parser.add_argument(
+        "--autocache",
+        type=str,
+        nargs="?",
+        const="__cwd__",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Standalone-only prompt embedding disk cache. "
+            "Use '--autocache' for ./.cache/ltx2_prompt_embeddings under the current working directory, "
+            "or '--autocache DIR' to use DIR directly."
+        ),
+    )
+    parser.add_argument(
+        "--cache_prompt_file",
+        "--cach_prompt_file",
+        action="store_true",
+        help=(
+            "Standalone-only helper: resolve prompts, warm the prompt embedding disk cache, "
+            "then exit before transformer/video generation."
+        ),
+    )
 
     # -- Output --
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save outputs")
@@ -249,6 +271,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("Either --prompt or --sample_prompts (--from_file) must be specified")
     if args.gemma_root is None and not args.gemma_safetensors and not args.use_precached_sample_prompts:
         raise ValueError("--gemma_root or --gemma_safetensors is required (unless using --use_precached_sample_prompts)")
+    if getattr(args, "cache_prompt_file", False) and getattr(args, "autocache", None) is None:
+        args.autocache = "__cwd__"
 
     return args
 
@@ -418,6 +442,17 @@ def main() -> None:
     trainer.blocks_to_swap = int(args.blocks_to_swap or 0)
     trainer.handle_model_specific_args(args)
 
+    prompts = _build_prompt_list(trainer, args, accelerator)
+    if not prompts:
+        logger.error("No prompts to generate. Exiting.")
+        return
+
+    if getattr(args, "cache_prompt_file", False):
+        logger.info("Caching prompt embeddings for %d sample(s) and exiting...", len(prompts))
+        trainer._prepare_sample_prompt_embeddings_batch(accelerator, args, prompts)
+        logger.info("Prompt cache warmup complete.")
+        return
+
     # -- Load transformer --
     loading_device = "cpu" if trainer.blocks_to_swap > 0 else device
     transformer = trainer.load_transformer(
@@ -461,10 +496,6 @@ def main() -> None:
         transformer = trainer.compile_transformer(args, transformer)
 
     os.makedirs(args.output_dir, exist_ok=True)
-    prompts = _build_prompt_list(trainer, args, accelerator)
-    if not prompts:
-        logger.error("No prompts to generate. Exiting.")
-        return
 
     logger.info("Generating %d sample(s)...", len(prompts))
 

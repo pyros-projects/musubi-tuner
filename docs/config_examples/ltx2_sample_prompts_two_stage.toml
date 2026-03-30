@@ -22,8 +22,30 @@
 #     --sample_tiled_vae \
 #     --sample_vae_tile_size 512 \
 #     --sample_vae_tile_overlap 64 \
+#     --autocache \
 #     --output_dir /abs/path/to/output/ltx23_promptfile \
 #     --output_name ltx23_promptfile
+#
+# Standalone autocache notes:
+# - `--autocache` stores per-prompt Gemma embeddings under `./.cache/ltx2_prompt_embeddings/`
+# - `--autocache /abs/path/to/cache` uses that directory directly
+# - cache lookup happens before Gemma is loaded, so fully cached prompt files skip Gemma startup entirely
+# - `--cache_prompt_file` warms the cache and exits without generating video
+#
+# Example cache warmup only:
+#   source .venv/bin/activate
+#   PYTHONPATH=src python -m musubi_tuner.ltx2_generate_video \
+#     --device cuda \
+#     --mixed_precision bf16 \
+#     --ltx2_checkpoint /abs/path/to/ltx-2.3-22b-dev-nf4.safetensors \
+#     --vae /abs/path/to/ltx-2.3-22b-dev-nf4.safetensors \
+#     --ltx_version 2.3 \
+#     --ltx_version_check_mode error \
+#     --nf4_base \
+#     --gemma_root /abs/path/to/gemma-3-12b-it-qat-q4_0-unquantized \
+#     --gemma_load_in_4bit \
+#     --sample_prompts /abs/path/to/ltx2_sample_prompts_two_stage.toml \
+#     --cache_prompt_file
 #
 # Omit `seed` in a subset to use a random seed for that sample.
 

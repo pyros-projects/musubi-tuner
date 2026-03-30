@@ -19,6 +19,7 @@ from musubi_tuner.ltx2_generate_video import (
     _build_prompt_list,
     _merge_lora_weights,
     _should_merge_cli_loras_once,
+    main,
     parse_args,
 )
 from musubi_tuner.ltx2_inference import (
@@ -152,6 +153,28 @@ class _PromptLocalSamplingTrainer(LTX2NetworkTrainer):
         if not applied:
             return
         self.events.append(("restore_specs", tuple(applied), device.type))
+
+    def sample_image_inference(
+        self,
+        accelerator,
+        args,
+        transformer,
+        dit_dtype,
+        vae,
+        save_dir,
+        sample_parameter,
+        epoch,
+        steps,
+        audio_decoder=None,
+        vocoder=None,
+    ):
+        self.events.append(("sample", sample_parameter["prompt"]))
+
+
+class _AutocacheSamplingTrainer(LTX2NetworkTrainer):
+    def __init__(self):
+        super().__init__()
+        self.events = []
 
     def sample_image_inference(
         self,
@@ -624,6 +647,65 @@ class LTX2SamplingLoraTests(unittest.TestCase):
         self.assertEqual(args.sample_stage1_distilled_lora_multiplier, 0.75)
         self.assertEqual(args.sample_stage2_distilled_lora_multiplier, 0.25)
 
+    def test_generator_parse_args_accepts_autocache_flag_without_value(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "ltx2_generate_video.py",
+                "--ltx2_checkpoint",
+                "/tmp/ltx.safetensors",
+                "--gemma_root",
+                "/tmp/gemma",
+                "--prompt",
+                "hello",
+                "--autocache",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.autocache, "__cwd__")
+
+    def test_generator_parse_args_accepts_autocache_explicit_path(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "ltx2_generate_video.py",
+                "--ltx2_checkpoint",
+                "/tmp/ltx.safetensors",
+                "--gemma_root",
+                "/tmp/gemma",
+                "--prompt",
+                "hello",
+                "--autocache",
+                "/tmp/cache",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.autocache, "/tmp/cache")
+
+    def test_generator_parse_args_accepts_cache_prompt_file_and_defaults_autocache(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "ltx2_generate_video.py",
+                "--ltx2_checkpoint",
+                "/tmp/ltx.safetensors",
+                "--gemma_root",
+                "/tmp/gemma",
+                "--prompt",
+                "hello",
+                "--cache_prompt_file",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertTrue(args.cache_prompt_file)
+        self.assertEqual(args.autocache, "__cwd__")
+
     def test_training_parser_accepts_stage_specific_distilled_multipliers(self):
         parser = ltx2_setup_parser(argparse.ArgumentParser())
 
@@ -1095,6 +1177,113 @@ class LTX2SamplingLoraTests(unittest.TestCase):
         load_weights.assert_called_once()
         apply_network.assert_called_once()
         self.assertEqual(applied, [("/tmp/a.safetensors", {})])
+
+    def test_resolve_standalone_autocache_dir_uses_cwd_default(self):
+        trainer = LTX2NetworkTrainer()
+
+        with mock.patch("musubi_tuner.ltx2_train_network.os.getcwd", return_value="/tmp/run"):
+            cache_dir = trainer._resolve_standalone_autocache_dir(Namespace(autocache="__cwd__"))
+
+        self.assertEqual(cache_dir, "/tmp/run/.cache/ltx2_prompt_embeddings")
+
+    def test_prepare_sample_prompt_embeddings_batch_uses_autocache_without_loading_gemma_when_all_cached(self):
+        trainer = _AutocacheSamplingTrainer()
+        accelerator = _FakeAccelerator()
+        prompt_embeds = torch.randn(3, 4)
+        prompt_mask = torch.ones(3, dtype=torch.bool)
+        neg_embeds = torch.randn(2, 4)
+        neg_mask = torch.ones(2, dtype=torch.bool)
+        sample_parameter = {
+            "prompt": "Prompt A",
+            "negative_prompt": "Negative A",
+            "guidance_scale": 3.0,
+        }
+
+        with mock.patch.object(trainer, "_resolve_standalone_autocache_dir", return_value="/tmp/cache"), \
+             mock.patch.object(
+                 trainer,
+                 "_load_standalone_prompt_embedding_cache",
+                 side_effect=[(prompt_embeds, prompt_mask), (neg_embeds, neg_mask)],
+             ) as load_cache, \
+             mock.patch.object(trainer, "_build_text_encoder") as build_text_encoder, \
+             mock.patch.object(trainer, "_encode_prompt_text") as encode_prompt_text, \
+             mock.patch.object(trainer, "_cleanup_text_encoder") as cleanup_text_encoder:
+            trainer._prepare_sample_prompt_embeddings_batch(
+                accelerator,
+                Namespace(autocache="__cwd__", use_precached_sample_prompts=False, precache_sample_prompts=False),
+                [sample_parameter],
+            )
+
+        self.assertTrue(torch.equal(sample_parameter["prompt_embeds"], prompt_embeds))
+        self.assertTrue(torch.equal(sample_parameter["prompt_attention_mask"], prompt_mask))
+        self.assertTrue(torch.equal(sample_parameter["negative_prompt_embeds"], neg_embeds))
+        self.assertTrue(torch.equal(sample_parameter["negative_prompt_attention_mask"], neg_mask))
+        self.assertEqual(load_cache.call_count, 2)
+        build_text_encoder.assert_not_called()
+        encode_prompt_text.assert_not_called()
+        cleanup_text_encoder.assert_not_called()
+
+    def test_prepare_sample_prompt_embeddings_batch_saves_missing_autocache_entries_after_encoding(self):
+        trainer = _AutocacheSamplingTrainer()
+        accelerator = _FakeAccelerator()
+        prompt_embeds = torch.randn(3, 4)
+        prompt_mask = torch.ones(3, dtype=torch.bool)
+        sample_parameter = {
+            "prompt": "Prompt A",
+            "guidance_scale": 1.0,
+        }
+
+        with mock.patch.object(trainer, "_resolve_standalone_autocache_dir", return_value="/tmp/cache"), \
+             mock.patch.object(trainer, "_load_standalone_prompt_embedding_cache", return_value=None) as load_cache, \
+             mock.patch.object(trainer, "_build_text_encoder", return_value=torch.bfloat16) as build_text_encoder, \
+             mock.patch.object(trainer, "_encode_prompt_text", return_value=(prompt_embeds, prompt_mask)) as encode_prompt_text, \
+             mock.patch.object(trainer, "_save_standalone_prompt_embedding_cache") as save_cache, \
+             mock.patch.object(trainer, "_cleanup_text_encoder") as cleanup_text_encoder:
+            trainer._prepare_sample_prompt_embeddings_batch(
+                accelerator,
+                Namespace(autocache="/tmp/cache", use_precached_sample_prompts=False, precache_sample_prompts=False),
+                [sample_parameter],
+            )
+
+        self.assertEqual(load_cache.call_count, 1)
+        build_text_encoder.assert_called_once()
+        encode_prompt_text.assert_called_once_with(accelerator, "Prompt A", torch.bfloat16)
+        save_cache.assert_called_once()
+        cleanup_text_encoder.assert_called_once_with(accelerator)
+        self.assertTrue(torch.equal(sample_parameter["prompt_embeds"], prompt_embeds))
+        self.assertTrue(torch.equal(sample_parameter["prompt_attention_mask"], prompt_mask))
+
+    def test_main_cache_prompt_file_warms_cache_without_loading_transformer(self):
+        fake_accelerator = _FakeAccelerator()
+        trainer = mock.Mock()
+        trainer.blocks_to_swap = 0
+        trainer.dit_dtype = torch.bfloat16
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "ltx2_generate_video.py",
+                "--ltx2_checkpoint",
+                "/tmp/ltx.safetensors",
+                "--gemma_root",
+                "/tmp/gemma",
+                "--prompt",
+                "hello",
+                "--cache_prompt_file",
+            ],
+        ), mock.patch("musubi_tuner.ltx2_generate_video.Accelerator", return_value=fake_accelerator), \
+             mock.patch("musubi_tuner.ltx2_generate_video.LTX2NetworkTrainer", return_value=trainer), \
+             mock.patch("musubi_tuner.ltx2_generate_video._build_prompt_list", return_value=[{"prompt": "hello"}]) as build_prompt_list, \
+             mock.patch("musubi_tuner.ltx2_generate_video.os.makedirs"), \
+             mock.patch("musubi_tuner.ltx2_generate_video.clean_memory_on_device"):
+            main()
+
+        trainer.handle_model_specific_args.assert_called_once()
+        build_prompt_list.assert_called_once()
+        trainer._prepare_sample_prompt_embeddings_batch.assert_called_once()
+        trainer.load_transformer.assert_not_called()
+        trainer.sample_images.assert_not_called()
 
     def test_should_merge_cli_loras_once_skips_prompt_file_mode(self):
         args = Namespace(

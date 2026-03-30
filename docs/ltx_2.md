@@ -1316,6 +1316,27 @@ Notes:
 
 For standalone prompt-file inference, CLI `--lora_weight/--lora_multiplier` act as the baseline stack. A subset using `lora_mode = "replace"` overrides that baseline for just that prompt.
 
+#### Standalone Prompt Embedding Autocache
+
+Standalone `ltx2_generate_video.py` also supports a lightweight per-prompt disk cache for Gemma embeddings.
+
+- `--autocache` uses `./.cache/ltx2_prompt_embeddings/` under the current working directory
+- `--autocache /abs/path/to/cache` uses that directory directly
+- cache lookup happens before Gemma is loaded, so if all needed prompt and negative-prompt embeddings already exist, Gemma is never constructed for that run
+- cache keys are based on prompt text plus the text-encoder-relevant LTX/Gemma config, so changing encoder inputs produces a new cache file instead of silently reusing an incompatible one
+
+To prewarm the cache without generating video, use:
+
+```bash
+PYTHONPATH=src python -m musubi_tuner.ltx2_generate_video \
+  --ltx2_checkpoint /abs/path/to/ltx-2.3-22b-dev-nf4.safetensors \
+  --gemma_root /abs/path/to/gemma \
+  --sample_prompts /abs/path/to/prompts.toml \
+  --cache_prompt_file
+```
+
+`--cache_prompt_file` also works with a single `--prompt ...`. If `--autocache` is omitted, it automatically uses the default cwd cache location.
+
 #### Checkpoint Output Format
 
 Saved LoRA checkpoints are converted to ComfyUI format by default. Both the original musubi-tuner format and the ComfyUI format are kept.
