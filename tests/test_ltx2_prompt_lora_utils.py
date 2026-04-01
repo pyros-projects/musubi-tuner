@@ -1,8 +1,10 @@
+import base64
 import sys
 import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +18,15 @@ from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
 
 
 class LTX2PromptLoraUtilsTests(unittest.TestCase):
+    @staticmethod
+    def _write_png(path: Path) -> str:
+        path.write_bytes(
+            base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+            )
+        )
+        return str(path)
+
     def test_root_loras_are_applied_as_baseline(self):
         data = {
             "prompt": {
@@ -165,6 +176,233 @@ class LTX2PromptLoraUtilsTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             resolve_ltx_prompt_file_data(data)
+
+    def test_unique_image_pool_assigns_distinct_image_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pool_dir = Path(tmpdir) / "pool"
+            pool_dir.mkdir()
+            image_a = self._write_png(pool_dir / "a.png")
+            image_b = self._write_png(pool_dir / "b.png")
+
+            data = {
+                "prompt": {
+                    "input_images_dir": str(pool_dir),
+                    "image_assignment": "unique",
+                    "subset": [
+                        {"prompt": "subset one"},
+                        {"prompt": "subset two"},
+                    ],
+                }
+            }
+
+            prompts = resolve_ltx_prompt_file_data(data)
+
+        self.assertCountEqual([prompt.get("image_path") for prompt in prompts], [image_a, image_b])
+
+    def test_random_image_input_order_uses_shuffled_pool_assignment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pool_dir = Path(tmpdir) / "pool"
+            pool_dir.mkdir()
+            image_1 = self._write_png(pool_dir / "1.png")
+            image_2 = self._write_png(pool_dir / "2.png")
+            image_3 = self._write_png(pool_dir / "3.png")
+
+            data = {
+                "prompt": {
+                    "input_images_dir": str(pool_dir),
+                    "image_assignment": "unique",
+                    "image_input_order": "random",
+                    "subset": [
+                        {"prompt": "subset one"},
+                        {"prompt": "subset two"},
+                        {"prompt": "subset three"},
+                    ],
+                }
+            }
+
+            with mock.patch("random.shuffle", side_effect=lambda seq: seq.reverse()) as shuffle_mock:
+                prompts = resolve_ltx_prompt_file_data(data)
+
+        self.assertEqual(
+            [prompt.get("image_path") for prompt in prompts],
+            [image_3, image_2, image_1],
+        )
+        shuffle_mock.assert_called_once()
+
+    def test_explicit_image_path_takes_precedence_over_pool_assignment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            pool_dir = tmpdir_path / "pool"
+            pool_dir.mkdir()
+            pool_image_1 = self._write_png(pool_dir / "pool_1.png")
+            pool_image_2 = self._write_png(pool_dir / "pool_2.png")
+            explicit_image = self._write_png(tmpdir_path / "explicit.png")
+
+            data = {
+                "prompt": {
+                    "input_images_dir": str(pool_dir),
+                    "image_assignment": "unique",
+                    "subset": [
+                        {"prompt": "explicit subset", "image_path": explicit_image},
+                        {"prompt": "pool subset"},
+                    ],
+                }
+            }
+
+            prompts = resolve_ltx_prompt_file_data(data)
+
+        self.assertEqual(prompts[0].get("image_path"), explicit_image)
+        self.assertIn(prompts[1].get("image_path"), {pool_image_1, pool_image_2})
+
+    def test_use_image_pool_false_leaves_image_path_unset(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pool_dir = Path(tmpdir) / "pool"
+            pool_dir.mkdir()
+            pool_image = self._write_png(pool_dir / "pool.png")
+
+            data = {
+                "prompt": {
+                    "input_images_dir": str(pool_dir),
+                    "subset": [
+                        {"prompt": "t2v subset", "use_image_pool": False},
+                        {"prompt": "pool subset"},
+                    ],
+                }
+            }
+
+            prompts = resolve_ltx_prompt_file_data(data)
+
+        self.assertNotIn("image_path", prompts[0])
+        self.assertEqual(prompts[1].get("image_path"), pool_image)
+
+    def test_mixed_prompt_file_supports_pool_explicit_and_t2v_subsets(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            pool_dir = tmpdir_path / "pool"
+            pool_dir.mkdir()
+            pool_image_1 = self._write_png(pool_dir / "pool_1.png")
+            pool_image_2 = self._write_png(pool_dir / "pool_2.png")
+            explicit_image = self._write_png(tmpdir_path / "explicit.png")
+
+            data = {
+                "prompt": {
+                    "input_images_dir": str(pool_dir),
+                    "image_assignment": "unique",
+                    "subset": [
+                        {"prompt": "pool subset"},
+                        {"prompt": "explicit subset", "image_path": explicit_image},
+                        {"prompt": "t2v subset", "use_image_pool": False},
+                    ],
+                }
+            }
+
+            prompts = resolve_ltx_prompt_file_data(data)
+
+        self.assertEqual(prompts[0].get("image_path"), pool_image_1)
+        self.assertEqual(prompts[1].get("image_path"), explicit_image)
+        self.assertNotIn("image_path", prompts[2])
+
+    def test_invalid_image_input_order_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pool_dir = Path(tmpdir) / "pool"
+            pool_dir.mkdir()
+            self._write_png(pool_dir / "image.png")
+
+            data = {
+                "prompt": {
+                    "input_images_dir": str(pool_dir),
+                    "image_input_order": "sideways",
+                    "subset": [{"prompt": "pool subset"}],
+                }
+            }
+
+            with self.assertRaises(ValueError):
+                resolve_ltx_prompt_file_data(data)
+
+    def test_invalid_image_assignment_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pool_dir = Path(tmpdir) / "pool"
+            pool_dir.mkdir()
+            self._write_png(pool_dir / "image.png")
+
+            data = {
+                "prompt": {
+                    "input_images_dir": str(pool_dir),
+                    "image_assignment": "invalid",
+                    "subset": [{"prompt": "pool subset"}],
+                }
+            }
+
+            with self.assertRaises(ValueError):
+                resolve_ltx_prompt_file_data(data)
+
+    def test_nonexistent_input_images_dir_raises_file_not_found_error(self):
+        data = {
+            "prompt": {
+                "input_images_dir": "/no/such/image-pool",
+                "subset": [{"prompt": "pool subset"}],
+            }
+        }
+
+        with self.assertRaises(FileNotFoundError):
+            resolve_ltx_prompt_file_data(data)
+
+    def test_nonexistent_explicit_image_path_raises_file_not_found_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pool_dir = Path(tmpdir) / "pool"
+            pool_dir.mkdir()
+            self._write_png(pool_dir / "pool.png")
+
+            data = {
+                "prompt": {
+                    "input_images_dir": str(pool_dir),
+                    "subset": [
+                        {
+                            "prompt": "explicit subset",
+                            "image_path": str(Path(tmpdir) / "missing.png"),
+                        }
+                    ],
+                }
+            }
+
+            with self.assertRaises(FileNotFoundError):
+                resolve_ltx_prompt_file_data(data)
+
+    def test_unique_image_assignment_requires_enough_images(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pool_dir = Path(tmpdir) / "pool"
+            pool_dir.mkdir()
+            self._write_png(pool_dir / "only.png")
+
+            data = {
+                "prompt": {
+                    "input_images_dir": str(pool_dir),
+                    "image_assignment": "unique",
+                    "subset": [
+                        {"prompt": "subset one"},
+                        {"prompt": "subset two"},
+                    ],
+                }
+            }
+
+            with self.assertRaises(ValueError):
+                resolve_ltx_prompt_file_data(data)
+
+    def test_empty_supported_image_pool_errors_when_subset_needs_pool_assignment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pool_dir = Path(tmpdir) / "pool"
+            pool_dir.mkdir()
+            (pool_dir / "notes.txt").write_text("not an image", encoding="utf-8")
+
+            data = {
+                "prompt": {
+                    "input_images_dir": str(pool_dir),
+                    "subset": [{"prompt": "pool subset"}],
+                }
+            }
+
+            with self.assertRaises(ValueError):
+                resolve_ltx_prompt_file_data(data)
 
     def test_process_sample_prompts_resolves_loras_for_toml_prompt_file(self):
         trainer = LTX2NetworkTrainer()
