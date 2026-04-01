@@ -66,10 +66,15 @@ loras = [
   { path = "/abs/path/to/base_style.safetensors", weight = 0.35, merge = false },
   { path = "/abs/path/to/camera_motion_helper.safetensors", weight = 0.20, merge = false },
 ]
+input_images_dir = "/abs/path/to/input_stills"
+image_input_order = "random"
+# v1 supports only unique assignment. Each eligible subset gets one distinct image.
+image_assignment = "unique"
 
 [[prompt.subset]]
 prompt = "cinematic close-up of a woman walking through neon rain at night, shallow depth of field, realistic lighting"
 seed = 1234
+# No explicit image_path here -> inherits one random image from [prompt].input_images_dir.
 lora_mode = "extend"
 loras = [
   { path = "/abs/path/to/concept_a.safetensors", weight = 0.85, merge = false },
@@ -79,6 +84,7 @@ loras = [
 [[prompt.subset]]
 prompt = "two tennis players rallying on an outdoor clay court, long lens sports footage, natural motion, realistic sunlight"
 seed = 2345
+image_path = "/abs/path/to/hero_frames/tennis_start.png"
 stage1_distilled_lora_multiplier = 0.75
 stage2_distilled_lora_multiplier = 1.0
 lora_mode = "replace"
@@ -90,6 +96,8 @@ loras = [
 prompt = "slow drone shot over a pine forest valley at sunrise, mist between trees, realistic aerial cinematography"
 seed = 3456
 frame_count = 81
+use_image_pool = false
 stage1_distilled_lora_multiplier = 0.6
 stage2_distilled_lora_multiplier = 0.9
+# This subset stays plain T2V even though the root prompt defines an image pool.
 # No subset loras here -> uses the root [prompt].loras baseline only.

@@ -1236,7 +1236,7 @@ Reference audio latents are precached automatically when using `--precache_sampl
 
 #### Sampling with Tiled VAE
 
-The prompt file format (`--sample_prompts`) — including guidance scale, negative prompt, and per-prompt inference parameters — is documented in the upstream [Sampling During Training guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/sampling_during_training.md). LTX-2 extends this with `--v <path>` (IC-LoRA reference) and `--ra <path>` (audio-reference IC-LoRA) prompt prefixes.
+The prompt file format (`--sample_prompts`) — including guidance scale, negative prompt, and per-prompt inference parameters — is documented in the upstream [Sampling During Training guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/sampling_during_training.md). LTX-2 extends this with `--v <path>` (IC-LoRA reference) and `--ra <path>` (audio-reference IC-LoRA) prompt prefixes for text prompt files, and adds prompt-file-native LoRA and image-pool fields for TOML prompt files.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -1315,6 +1315,53 @@ Notes:
 - distilled two-stage LoRA (`--distilled_lora_path`) stays separate from these prompt-file concept/style LoRAs
 
 For standalone prompt-file inference, CLI `--lora_weight/--lora_multiplier` act as the baseline stack. A subset using `lora_mode = "replace"` overrides that baseline for just that prompt.
+
+Prompt-file TOML also supports root-level image pools for I2V:
+
+- root `[prompt].input_images = ["/abs/a.png", "/abs/b.png"]` adds explicit candidate images
+- root `[prompt].input_images_dir = "/abs/path/to/images"` recursively collects supported image files from that directory
+- if both are present, the candidates are combined into one pool
+- `[prompt].image_input_order = "sorted" | "random"` controls pool order before assignment
+- `[prompt].image_assignment = "unique"` is the only supported assignment mode in v1
+
+Each `[[prompt.subset]]` then resolves to one of three states:
+
+- explicit `image_path = "/abs/path/to/start.png"` for prompt-local I2V
+- inherited `image_path` assigned from the root pool
+- no `image_path` at all, meaning plain T2V
+
+Subset image controls:
+
+- `image_path` always wins over the root pool
+- `use_image_pool = false` is the explicit T2V opt-out when a root pool exists
+- if a root pool exists and a subset does not set `image_path` or `use_image_pool = false`, it receives one pool image by default
+
+Example TOML shape:
+
+```toml
+[prompt]
+input_images_dir = "/abs/path/to/input_stills"
+image_input_order = "random"
+image_assignment = "unique"
+
+[[prompt.subset]]
+prompt = "inherits one random image from the root pool"
+
+[[prompt.subset]]
+prompt = "uses an explicit image"
+image_path = "/abs/path/to/hero_frame.png"
+
+[[prompt.subset]]
+prompt = "stays text-to-video"
+use_image_pool = false
+```
+
+Failure behavior:
+
+- invalid `image_input_order` or `image_assignment` values fail validation
+- nonexistent `input_images_dir`, `input_images`, or explicit `image_path` values fail validation
+- if `image_assignment = "unique"` and there are fewer resolved pool images than eligible subsets, prompt loading fails with an actionable error
+- if the configured pool resolves to zero supported image files and at least one subset needs pool assignment, prompt loading fails
 
 #### Standalone Prompt Embedding Autocache
 
