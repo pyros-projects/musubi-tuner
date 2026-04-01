@@ -1,0 +1,25 @@
+[general]
+caption_extension = ".txt"
+batch_size = 2
+enable_bucket = true
+bucket_no_upscale = false
+
+# [[datasets]]
+# resolution = 256
+# image_directory = "/home/pyro/datasets/iterator/cont400/backbend/regular"
+# cache_directory = "cache/bb3_256"
+# num_repeats = 1
+
+
+[[datasets]]
+resolution = 512
+image_directory = "/home/pyro/datasets/train/misc/bmi_non_nude"
+cache_directory = "cache/bmi_512"
+num_repeats = 1
+
+
+# [[datasets]]
+# resolution = 720
+# image_directory = "/home/pyro/datasets/iterator/cont400/backbend/regular"
+# cache_directory = "cache/bb3_720"
+# num_repeats = 1

@@ -173,9 +173,20 @@ class Kandinsky5NetworkTrainer(NetworkTrainer):
             "method": getattr(attn_conf, "method", "topcdf"),
         }
 
-    def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
+    def sample_images(
+        self,
+        accelerator: Accelerator,
+        args,
+        epoch,
+        steps,
+        vae,
+        transformer,
+        sample_parameters,
+        dit_dtype,
+        force_sample: bool = False,
+    ):
         """Use kandinsky5.generation_utils for quick qualitative checks with on-demand loading/offload."""
-        if not should_sample_images(args, steps, epoch):
+        if not force_sample and not should_sample_images(args, steps, epoch):
             return
         if not sample_parameters:
             logger.warning("No sample prompts provided; skipping sampling.")

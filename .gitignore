@@ -16,5 +16,6 @@ references/
 projects/
 .pyro/
 cache/
+.cache/
 output/
 .worktrees/

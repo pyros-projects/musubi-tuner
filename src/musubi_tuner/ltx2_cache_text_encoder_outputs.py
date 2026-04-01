@@ -119,6 +119,39 @@ def _resolve_default_sample_prompts_cache(datasets: list) -> str:
     return os.path.join(cache_dir, DEFAULT_SAMPLE_PROMPTS_CACHE)
 
 
+def _should_cache_sample_prompts_only(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "cache_sample_prompts_only", False))
+
+
+def _resolve_sample_prompts_cache_path(args: argparse.Namespace, datasets: list) -> str:
+    explicit_cache_path = getattr(args, "sample_prompts_cache", None)
+    if explicit_cache_path:
+        return explicit_cache_path
+    return _resolve_default_sample_prompts_cache(datasets)
+
+
+def _load_sample_prompts_for_precache(args: argparse.Namespace) -> list[dict]:
+    from musubi_tuner.hv_train_network import load_prompts
+    from musubi_tuner.ltx2_prompt_lora_utils import load_ltx_prompt_file_with_resolved_loras
+    from musubi_tuner.ltx2_train_network import build_ltx_prompt_file_baseline_loras
+
+    if args.sample_prompts is None:
+        raise ValueError("--sample_prompts is required when precaching sample prompts")
+
+    if str(args.sample_prompts).endswith(".toml"):
+        prompts = load_ltx_prompt_file_with_resolved_loras(
+            args.sample_prompts,
+            baseline_loras=build_ltx_prompt_file_baseline_loras(args),
+        )
+    else:
+        prompts = load_prompts(args.sample_prompts)
+
+    if not prompts:
+        raise ValueError(f"No prompts found in {args.sample_prompts}")
+
+    return prompts
+
+
 def _precache_sample_prompts(
     args: argparse.Namespace,
     *,
@@ -129,16 +162,8 @@ def _precache_sample_prompts(
     autocast_dtype: torch.dtype | None,
     device: torch.device,
 ) -> None:
-    from musubi_tuner.hv_train_network import load_prompts
-
-    if args.sample_prompts is None:
-        raise ValueError("--sample_prompts is required when --precache_sample_prompts is set")
-
-    prompts = load_prompts(args.sample_prompts)
-    if not prompts:
-        raise ValueError(f"No prompts found in {args.sample_prompts}")
-
-    cache_path = args.sample_prompts_cache or _resolve_default_sample_prompts_cache(datasets)
+    prompts = _load_sample_prompts_for_precache(args)
+    cache_path = _resolve_sample_prompts_cache_path(args, datasets)
 
     prompt_cache: list[dict] = []
     default_guidance_scale = float(getattr(args, "guidance_scale", 3.0))
@@ -255,6 +280,11 @@ def _precache_preservation_prompts(
 
 def main() -> None:
     parser = cache_text_encoder_outputs.setup_parser_common()
+    for action in parser._actions:
+        if action.dest == "dataset_config":
+            action.required = False
+            action.help = "path to dataset config .toml file (required unless using --cache_sample_prompts_only with --sample_prompts_cache)"
+            break
     parser = ltx2_setup_parser(parser)
     args = parser.parse_args()
     apply_ltx2_tweaks(args)
@@ -264,39 +294,53 @@ def main() -> None:
         args.ltx_mode = short_map[args.ltx_mode]
 
     device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
-
-    blueprint_generator = BlueprintGenerator(ConfigSanitizer())
-    logger.info("Load dataset config from %s", args.dataset_config)
-    user_config = config_utils.load_user_config(args.dataset_config)
     ltx_mode = getattr(args, "ltx_mode", "video")
-    if ltx_mode == "video" and _all_declared_datasets_are_audio(user_config):
-        logger.info("All datasets are audio-only; automatically switching to --ltx2_mode audio")
-        ltx_mode = "audio"
-        args.ltx_mode = "audio"
+    cache_sample_prompts_only = _should_cache_sample_prompts_only(args)
+    requires_datasets = (not cache_sample_prompts_only) or not bool(getattr(args, "sample_prompts_cache", None))
 
-    # For audio-only or AV mode, we need the AV encoder to get audio encodings
+    datasets = []
+    all_cache_files_for_dataset = []
+    all_cache_paths_for_dataset = []
     audio_video = ltx_mode in ("av", "audio")
+    if requires_datasets:
+        if not args.dataset_config:
+            raise ValueError(
+                "--dataset_config is required unless --cache_sample_prompts_only is used with --sample_prompts_cache"
+            )
 
-    blueprint = blueprint_generator.generate(user_config, args, architecture=ARCHITECTURE_LTX2)
-    train_dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        blueprint_generator = BlueprintGenerator(ConfigSanitizer())
+        logger.info("Load dataset config from %s", args.dataset_config)
+        user_config = config_utils.load_user_config(args.dataset_config)
+        if ltx_mode == "video" and _all_declared_datasets_are_audio(user_config):
+            logger.info("All datasets are audio-only; automatically switching to --ltx2_mode audio")
+            ltx_mode = "audio"
+            args.ltx_mode = "audio"
 
-    datasets = list(train_dataset_group.datasets)
+        # For audio-only or AV mode, we need the AV encoder to get audio encodings
+        audio_video = ltx_mode in ("av", "audio")
 
-    if user_config.get("validation_datasets"):
-        logger.info("Load validation datasets from dataset config")
-        validation_user_config = {
-            "general": user_config.get("general", {}),
-            "datasets": user_config.get("validation_datasets", []),
-        }
-        validation_blueprint = blueprint_generator.generate(
-            validation_user_config, args, architecture=ARCHITECTURE_LTX2
-        )
-        validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-            validation_blueprint.dataset_group
-        )
-        datasets.extend(validation_dataset_group.datasets)
+        blueprint = blueprint_generator.generate(user_config, args, architecture=ARCHITECTURE_LTX2)
+        train_dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
 
-    all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
+        datasets = list(train_dataset_group.datasets)
+
+        if user_config.get("validation_datasets"):
+            logger.info("Load validation datasets from dataset config")
+            validation_user_config = {
+                "general": user_config.get("general", {}),
+                "datasets": user_config.get("validation_datasets", []),
+            }
+            validation_blueprint = blueprint_generator.generate(
+                validation_user_config, args, architecture=ARCHITECTURE_LTX2
+            )
+            validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
+                validation_blueprint.dataset_group
+            )
+            datasets.extend(validation_dataset_group.datasets)
+
+        all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
+    elif not getattr(args, "sample_prompts_cache", None):
+        raise ValueError("--sample_prompts_cache is required when using --cache_sample_prompts_only without --dataset_config")
 
     if args.mixed_precision == "fp16":
         dtype = torch.float16
@@ -413,6 +457,10 @@ def main() -> None:
             device=device,
         )
 
+    if cache_sample_prompts_only:
+        logger.info("Sample prompt cache warmup complete; skipping dataset text encoder caching.")
+        return
+
     cache_text_encoder_outputs.process_text_encoder_batches(
         num_workers,
         args.skip_existing,
@@ -486,6 +534,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help=(
             "Path to write precached sample prompt embeddings (.pt). Defaults to "
             "the first dataset's cache_directory/ltx2_sample_prompts_cache.pt"
+        ),
+    )
+    parser.add_argument(
+        "--cache_sample_prompts_only",
+        action="store_true",
+        help=(
+            "Cache only --sample_prompts embeddings, then exit without caching dataset text encoder outputs. "
+            "Can be used without --dataset_config when --sample_prompts_cache is set explicitly."
         ),
     )
 

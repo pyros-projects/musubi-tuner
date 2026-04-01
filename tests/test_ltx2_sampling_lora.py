@@ -31,6 +31,7 @@ from musubi_tuner.ltx2_inference import (
 )
 from musubi_tuner.ltx2_lora_utils import normalize_ltx_comfy_lora_weights
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser
+from musubi_tuner.hv_train_network import resolve_step_sampling_requests
 from musubi_tuner.ltx_2.model.video_vae.video_vae import VideoDecoder, resolve_slice_bounds
 from musubi_tuner.ltx_2.model.video_vae.tiling import Tile
 
@@ -438,6 +439,232 @@ class LTX2SamplingLoraTests(unittest.TestCase):
         self.assertEqual(recorded_sigmas[0], [1.0, 0.5, 0.0])
         for got, expected in zip(recorded_sigmas[1], [0.9, 0.4, 0.0]):
             self.assertAlmostEqual(got, expected, places=6)
+
+    def test_two_stage_generate_offloads_transformer_before_vae_decode_when_requested(self):
+        class _RecordingTransformer(_FakeTransformer):
+            def __init__(self, events):
+                super().__init__()
+                self.events = events
+                self.move_calls = 0
+
+            def move_to_device_except_swap_blocks(self, device):
+                self.move_calls += 1
+                phase = {
+                    1: "transformer:offload_for_upsample",
+                    2: "transformer:restore_for_stage2",
+                    3: "transformer:offload_for_decode",
+                }.get(self.move_calls, f"transformer:move_{self.move_calls}")
+                self.events.append(phase)
+                return self
+
+        class _RecordingVAE:
+            def __init__(self, events):
+                self.events = events
+                self.device = torch.device("cpu")
+                self.dtype = torch.float32
+
+            def to_device(self, device):
+                self.device = torch.device(device)
+                self.events.append(f"vae:{self.device}")
+
+            def to_dtype(self, dtype):
+                self.dtype = dtype
+
+            def decode(self, items):
+                self.events.append("decode")
+                return [torch.zeros((3, 7, 8, 8), dtype=torch.float32)]
+
+        events = []
+        inferencer = LTX2Inferencer(
+            transformer=_RecordingTransformer(events),
+            vae=_RecordingVAE(events),
+            device=torch.device("cpu"),
+            dit_dtype=torch.float32,
+            audio_video_mode=False,
+        )
+        inferencer._spatial_upsampler = _FakeUpsampler()
+
+        def _record_denoise(latents, sigmas, *args, **kwargs):
+            events.append(f"denoise:{kwargs.get('progress_desc')}")
+            return latents, None
+
+        with mock.patch.object(inferencer, "_prepare_prompt_embeds", return_value=(torch.zeros(1, 1, 4), None)), \
+             mock.patch.object(inferencer, "_get_vae_factors", return_value=(8, 32)), \
+             mock.patch.object(inferencer, "_get_expected_embed_dim", return_value=None), \
+             mock.patch.object(inferencer, "_init_latents", return_value=torch.zeros((1, 1, 7, 2, 2))), \
+             mock.patch.object(inferencer, "_upsample_latents", side_effect=lambda latents, upsampler: latents), \
+             mock.patch.object(inferencer, "_denoise_loop", side_effect=_record_denoise):
+            inferencer.generate(
+                InferenceConfig(
+                    two_stage=True,
+                    offload_between_stages=True,
+                    spatial_upsampler_path="/tmp/upsampler.safetensors",
+                    width=768,
+                    height=512,
+                    frame_count=49,
+                    sample_steps=2,
+                    stage2_steps=1,
+                    cfg_scale=1.0,
+                    guidance_scale=1.0,
+                    prompt_embeds=torch.zeros(1, 1, 4),
+                ),
+                decode_video=True,
+            )
+
+        self.assertEqual(
+            events[0:4],
+            ["denoise:Stage 1", "transformer:offload_for_upsample", "transformer:restore_for_stage2", "denoise:Stage 2 refine"],
+        )
+        decode_idx = events.index("decode")
+        self.assertLess(events.index("denoise:Stage 2 refine"), decode_idx)
+        self.assertLess(events.index("transformer:offload_for_decode"), decode_idx)
+        self.assertEqual(events[decode_idx - 1], "vae:cpu")
+
+    def test_two_stage_generate_cleans_stage2_allocations_before_decode(self):
+        class _RecordingVAE:
+            def __init__(self, events):
+                self.events = events
+
+            def to_device(self, device):
+                self.events.append(f"vae:{device}")
+
+            def decode(self, items):
+                self.events.append("decode")
+                return [torch.zeros((3, 7, 8, 8), dtype=torch.float32)]
+
+        events = []
+        inferencer = LTX2Inferencer(
+            transformer=_FakeTransformer(),
+            vae=_RecordingVAE(events),
+            device=torch.device("cpu"),
+            dit_dtype=torch.float32,
+            audio_video_mode=False,
+        )
+        inferencer._spatial_upsampler = _FakeUpsampler()
+
+        def _record_denoise(latents, sigmas, *args, **kwargs):
+            events.append(f"denoise:{kwargs.get('progress_desc')}")
+            return latents, None
+
+        with mock.patch.object(inferencer, "_prepare_prompt_embeds", return_value=(torch.zeros(1, 1, 4), None)), \
+             mock.patch.object(inferencer, "_get_vae_factors", return_value=(8, 32)), \
+             mock.patch.object(inferencer, "_get_expected_embed_dim", return_value=None), \
+             mock.patch.object(inferencer, "_init_latents", return_value=torch.zeros((1, 1, 7, 2, 2))), \
+             mock.patch.object(inferencer, "_upsample_latents", side_effect=lambda latents, upsampler: latents), \
+             mock.patch.object(inferencer, "_denoise_loop", side_effect=_record_denoise), \
+             mock.patch("musubi_tuner.ltx2_inference.clean_memory_on_device", side_effect=lambda device: events.append("cleanup")):
+            inferencer.generate(
+                InferenceConfig(
+                    two_stage=True,
+                    spatial_upsampler_path="/tmp/upsampler.safetensors",
+                    width=768,
+                    height=512,
+                    frame_count=49,
+                    sample_steps=2,
+                    stage2_steps=1,
+                    cfg_scale=1.0,
+                    guidance_scale=1.0,
+                    prompt_embeds=torch.zeros(1, 1, 4),
+                ),
+                decode_video=True,
+            )
+
+        decode_idx = events.index("decode")
+        last_cleanup_before_decode = max(i for i, event in enumerate(events[:decode_idx]) if event == "cleanup")
+        self.assertLess(events.index("denoise:Stage 2 refine"), last_cleanup_before_decode)
+
+    def test_two_stage_generate_releases_stage2_noise_before_refine(self):
+        events = []
+        inferencer = LTX2Inferencer(
+            transformer=_FakeTransformer(),
+            vae=object(),
+            device=torch.device("cpu"),
+            dit_dtype=torch.float32,
+            audio_video_mode=False,
+        )
+        inferencer._spatial_upsampler = _FakeUpsampler()
+
+        def _record_denoise(latents, sigmas, *args, **kwargs):
+            events.append(f"denoise:{kwargs.get('progress_desc')}")
+            return latents, None
+
+        with mock.patch.object(inferencer, "_prepare_prompt_embeds", return_value=(torch.zeros(1, 1, 4), None)), \
+             mock.patch.object(inferencer, "_get_vae_factors", return_value=(8, 32)), \
+             mock.patch.object(inferencer, "_get_expected_embed_dim", return_value=None), \
+             mock.patch.object(inferencer, "_init_latents", return_value=torch.zeros((1, 1, 7, 2, 2))), \
+             mock.patch.object(inferencer, "_upsample_latents", side_effect=lambda latents, upsampler: latents), \
+             mock.patch.object(inferencer, "_denoise_loop", side_effect=_record_denoise), \
+             mock.patch("musubi_tuner.ltx2_inference.clean_memory_on_device", side_effect=lambda device: events.append("cleanup")):
+            inferencer.generate(
+                InferenceConfig(
+                    two_stage=True,
+                    spatial_upsampler_path="/tmp/upsampler.safetensors",
+                    width=768,
+                    height=512,
+                    frame_count=49,
+                    sample_steps=2,
+                    stage2_steps=1,
+                    cfg_scale=1.0,
+                    guidance_scale=1.0,
+                    prompt_embeds=torch.zeros(1, 1, 4),
+                ),
+                decode_video=False,
+            )
+
+        refine_idx = events.index("denoise:Stage 2 refine")
+        cleanup_before_refine = [i for i, event in enumerate(events[:refine_idx]) if event == "cleanup"]
+        self.assertEqual(len(cleanup_before_refine), 2)
+
+    def test_two_stage_generate_converts_av_cached_prompts_for_video_only_sampling(self):
+        class _VideoOnlyTransformer(_FakeTransformer):
+            def __init__(self):
+                super().__init__()
+                self.cross_attention_dim = 4096
+                self.audio_cross_attention_dim = 2048
+
+        inferencer = LTX2Inferencer(
+            transformer=_VideoOnlyTransformer(),
+            vae=object(),
+            device=torch.device("cpu"),
+            dit_dtype=torch.float32,
+            audio_video_mode=False,
+        )
+        inferencer._spatial_upsampler = _FakeUpsampler()
+
+        recorded_prompt_shapes = []
+
+        def _record_denoise(latents, sigmas, prompt_embeds, prompt_mask, *args, **kwargs):
+            recorded_prompt_shapes.append(tuple(prompt_embeds.shape))
+            return latents, None
+
+        av_prompt = torch.zeros((1, 3, 6144), dtype=torch.float32)
+        av_negative = torch.zeros((1, 3, 6144), dtype=torch.float32)
+        prompt_mask = torch.ones((1, 3), dtype=torch.int64)
+
+        with mock.patch.object(inferencer, "_get_vae_factors", return_value=(8, 32)), \
+             mock.patch.object(inferencer, "_init_latents", return_value=torch.zeros((1, 1, 7, 2, 2))), \
+             mock.patch.object(inferencer, "_upsample_latents", side_effect=lambda latents, upsampler: latents), \
+             mock.patch.object(inferencer, "_denoise_loop", side_effect=_record_denoise):
+            inferencer.generate(
+                InferenceConfig(
+                    two_stage=True,
+                    spatial_upsampler_path="/tmp/upsampler.safetensors",
+                    width=768,
+                    height=512,
+                    frame_count=49,
+                    sample_steps=2,
+                    stage2_steps=1,
+                    cfg_scale=3.0,
+                    guidance_scale=3.0,
+                    prompt_embeds=av_prompt,
+                    prompt_attention_mask=prompt_mask,
+                    negative_prompt_embeds=av_negative,
+                    negative_prompt_attention_mask=prompt_mask,
+                ),
+                decode_video=False,
+            )
+
+        self.assertEqual(recorded_prompt_shapes, [(2, 3, 4096), (1, 3, 4096)])
 
     def test_distilled_lora_runtime_restore_preserves_existing_sampling_overlay(self):
         trainer = LTX2NetworkTrainer()
@@ -1321,8 +1548,8 @@ class LTX2SamplingLoraTests(unittest.TestCase):
             sample_audio_only=False,
             ltx_mode="video",
             vae_dtype=None,
-            sampling_lora_weight=None,
-            sampling_lora_multiplier=None,
+            sampling_lora_weight=[],
+            sampling_lora_multiplier=[],
             compile=False,
         )
         sample_parameters = [
@@ -1373,6 +1600,89 @@ class LTX2SamplingLoraTests(unittest.TestCase):
             ],
         )
 
+    def test_sample_images_live_reload_updates_prompt_local_loras_from_toml(self):
+        trainer = _PromptLocalSamplingTrainer()
+        accelerator = _FakeAccelerator()
+        transformer = _FakeTransformer()
+        prompt_path = Path(tempfile.mkdtemp(prefix="ltx2-live-reload-")) / "prompts.toml"
+        prompt_path.write_text(
+            """
+[prompt]
+
+[[prompt.subset]]
+prompt = "Prompt A"
+loras = [{ path = "/fresh.safetensors", weight = 0.75, merge = false }]
+""".strip(),
+            encoding="utf-8",
+        )
+        args = Namespace(
+            sample_at_first=True,
+            sample_every_n_steps=None,
+            sample_every_n_epochs=None,
+            sample_prompts=str(prompt_path),
+            output_dir=tempfile.mkdtemp(prefix="ltx2-prompt-live-reload-"),
+            sample_with_offloading=False,
+            use_precached_sample_prompts=False,
+            precache_sample_prompts=False,
+            sample_audio_subprocess=True,
+            sample_disable_audio=False,
+            sample_audio_only=False,
+            sample_live_reload_loras=True,
+            ltx_mode="video",
+            vae_dtype=None,
+            sampling_lora_weight=[],
+            sampling_lora_multiplier=[],
+            compile=False,
+        )
+        prompt_embeds = torch.randn(1, 2, 4)
+        sample_parameters = [
+            {
+                "prompt": "Prompt A",
+                "enum": 0,
+                "prompt_embeds": prompt_embeds,
+                "prompt_attention_mask": torch.ones(1, 2, dtype=torch.int64),
+                "resolved_loras": [{"path": "/stale.safetensors", "weight": 0.25, "merge": False}],
+            }
+        ]
+
+        with mock.patch("musubi_tuner.ltx2_train_network.PartialState", _FakePartialState), mock.patch(
+            "musubi_tuner.ltx2_train_network.clean_memory_on_device", lambda device: None
+        ):
+            trainer.sample_images(
+                accelerator=accelerator,
+                args=args,
+                epoch=0,
+                steps=0,
+                vae=object(),
+                transformer=transformer,
+                sample_parameters=sample_parameters,
+                dit_dtype=torch.bfloat16,
+            )
+
+        self.assertEqual(
+            trainer.events,
+            [
+                ("apply_specs", (("/fresh.safetensors", 0.75),), "cpu"),
+                ("sample", "Prompt A"),
+                ("restore_specs", (("prompt-local", {"backups": 1}),), "cpu"),
+            ],
+        )
+        self.assertIs(sample_parameters[0]["prompt_embeds"], prompt_embeds)
+
+    def test_refresh_live_sampling_loras_clears_sampling_lora_cache_when_enabled(self):
+        trainer = LTX2NetworkTrainer()
+        trainer._sampling_lora_cache["/tmp/example.safetensors"] = {"w": torch.tensor(1.0)}
+        args = Namespace(
+            sample_live_reload_loras=True,
+            sample_prompts="dummy.txt",
+            sampling_lora_weight=[],
+            sampling_lora_multiplier=[],
+        )
+
+        trainer._refresh_live_sampling_loras(args, sample_parameters=[{"prompt": "Prompt A", "enum": 0}])
+
+        self.assertEqual(trainer._sampling_lora_cache, {})
+
     def test_sample_images_temporarily_applies_sampling_lora(self):
         trainer = _RecordingTrainer()
         accelerator = _FakeAccelerator()
@@ -1414,6 +1724,83 @@ class LTX2SamplingLoraTests(unittest.TestCase):
         self.assertEqual(trainer.applied, [(("/tmp/sample-lora.safetensors",), "cpu")])
         self.assertEqual(trainer.restored, [(("/tmp/sample-lora.safetensors",), 1, "cpu")])
         self.assertEqual(trainer.sampled, ["hello world"])
+        self.assertEqual(transformer.inference_switches, 1)
+        self.assertEqual(transformer.training_switches, 1)
+
+    def test_resolve_step_sampling_requests_moves_sample_at_first_to_step_one(self):
+        args = Namespace(
+            sample_at_first=True,
+            sample_every_n_steps=None,
+            sample_every_n_epochs=None,
+        )
+
+        initial, regular = resolve_step_sampling_requests(
+            args,
+            global_step=1,
+            epoch=None,
+            initial_sample_pending=True,
+        )
+
+        self.assertTrue(initial)
+        self.assertFalse(regular)
+
+    def test_resolve_step_sampling_requests_dedupes_initial_and_regular_step_one_sample(self):
+        args = Namespace(
+            sample_at_first=True,
+            sample_every_n_steps=1,
+            sample_every_n_epochs=None,
+        )
+
+        initial, regular = resolve_step_sampling_requests(
+            args,
+            global_step=1,
+            epoch=None,
+            initial_sample_pending=True,
+        )
+
+        self.assertTrue(initial)
+        self.assertFalse(regular)
+
+    def test_sample_images_force_sample_bypasses_regular_schedule_gate(self):
+        trainer = _RecordingTrainer()
+        accelerator = _FakeAccelerator()
+        transformer = _FakeTransformer()
+        args = Namespace(
+            sample_at_first=True,
+            sample_every_n_steps=None,
+            sample_every_n_epochs=None,
+            sample_prompts="dummy.txt",
+            output_dir=tempfile.mkdtemp(prefix="ltx2-force-sample-"),
+            sample_with_offloading=False,
+            use_precached_sample_prompts=False,
+            precache_sample_prompts=False,
+            sample_audio_subprocess=True,
+            sample_disable_audio=False,
+            sample_audio_only=False,
+            ltx_mode="video",
+            vae_dtype=None,
+            sampling_lora_weight=[],
+            sampling_lora_multiplier=[],
+            compile=False,
+        )
+        sample_parameters = [{"prompt": "hello delayed first sample", "enum": 0}]
+
+        with mock.patch("musubi_tuner.ltx2_train_network.PartialState", _FakePartialState), mock.patch(
+            "musubi_tuner.ltx2_train_network.clean_memory_on_device", lambda device: None
+        ):
+            trainer.sample_images(
+                accelerator=accelerator,
+                args=args,
+                epoch=None,
+                steps=1,
+                vae=object(),
+                transformer=transformer,
+                sample_parameters=sample_parameters,
+                dit_dtype=torch.bfloat16,
+                force_sample=True,
+            )
+
+        self.assertEqual(trainer.sampled, ["hello delayed first sample"])
         self.assertEqual(transformer.inference_switches, 1)
         self.assertEqual(transformer.training_switches, 1)
 

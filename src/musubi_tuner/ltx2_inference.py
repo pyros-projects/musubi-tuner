@@ -358,6 +358,66 @@ class LTX2Inferencer:
         # Legacy fallback for older checkpoints/configs that don't expose dims.
         return 3840 if self._audio_video else 1920
 
+    def _normalize_prompt_embed_dim(
+        self,
+        prompt_embeds: torch.Tensor,
+        *,
+        label: str = "Prompt embeddings",
+    ) -> torch.Tensor:
+        """Match cached prompt embedding width to the active transformer modality."""
+        expected_dim = int(self._get_expected_embed_dim() or 0)
+        current_dim = int(prompt_embeds.shape[-1])
+        if expected_dim <= 0 or current_dim == expected_dim:
+            return prompt_embeds
+
+        base_model = self.transformer.model if hasattr(self.transformer, "model") else self.transformer
+        video_dim = int(getattr(base_model, "cross_attention_dim", 0) or 0)
+        audio_dim = int(getattr(base_model, "audio_cross_attention_dim", 0) or 0)
+
+        if self._audio_video and current_dim < expected_dim:
+            pad_dim = 0
+            if video_dim > 0 and audio_dim > 0 and current_dim == video_dim:
+                pad_dim = audio_dim
+            elif current_dim * 2 == expected_dim:
+                pad_dim = current_dim
+            if pad_dim > 0:
+                logger.warning(
+                    "%s are video-only (%d) but model expects AV (%d). Padding audio portion with zeros.",
+                    label,
+                    current_dim,
+                    expected_dim,
+                )
+                padding = torch.zeros(
+                    *prompt_embeds.shape[:-1],
+                    pad_dim,
+                    dtype=prompt_embeds.dtype,
+                    device=prompt_embeds.device,
+                )
+                return torch.cat([prompt_embeds, padding], dim=-1)
+
+        resolved_prompt_embeds = select_video_text_embeds_for_video_mode(
+            prompt_embeds,
+            expected_video_dim=video_dim,
+            expected_audio_dim=audio_dim,
+        )
+        resolved_dim = int(resolved_prompt_embeds.shape[-1])
+        if resolved_dim == expected_dim and resolved_dim != current_dim:
+            logger.warning(
+                "%s are AV (%d) but model expects video-only (%d). Using video portion only.",
+                label,
+                current_dim,
+                expected_dim,
+            )
+            return resolved_prompt_embeds
+
+        logger.warning(
+            "%s dimension mismatch: got %d, expected %d. This may cause errors.",
+            label,
+            current_dim,
+            expected_dim,
+        )
+        return prompt_embeds
+
     def _prepare_prompt_embeds(
         self,
         config: InferenceConfig,
@@ -371,43 +431,7 @@ class LTX2Inferencer:
         if prompt_embeds.dim() == 2:
             prompt_embeds = prompt_embeds.unsqueeze(0)
 
-        # Check embedding dimension matches model expectation
-        expected_dim = self._get_expected_embed_dim()
-        current_dim = prompt_embeds.shape[-1]
-
-        if current_dim != expected_dim:
-            if current_dim * 2 == expected_dim:
-                # Video-only embeddings (1920) but AV model expects (3840)
-                # Pad with zeros for audio portion
-                logger.warning(
-                    "Prompt embeddings are video-only (%d) but model expects AV (%d). "
-                    "Padding with zeros. For best results, re-cache embeddings in AV mode.",
-                    current_dim, expected_dim
-                )
-                padding = torch.zeros(
-                    *prompt_embeds.shape[:-1], current_dim,
-                    dtype=prompt_embeds.dtype, device=prompt_embeds.device
-                )
-                prompt_embeds = torch.cat([prompt_embeds, padding], dim=-1)
-            elif current_dim == expected_dim * 2:
-                # AV embeddings but video-only model - slice to video portion
-                logger.warning(
-                    "Prompt embeddings are AV (%d) but model expects video-only (%d). "
-                    "Using video portion only.",
-                    current_dim, expected_dim
-                )
-                base_model = self.transformer.model if hasattr(self.transformer, "model") else self.transformer
-                prompt_embeds = select_video_text_embeds_for_video_mode(
-                    prompt_embeds,
-                    expected_video_dim=int(getattr(base_model, "cross_attention_dim", 0) or 0),
-                    expected_audio_dim=int(getattr(base_model, "audio_cross_attention_dim", 0) or 0),
-                )
-            else:
-                logger.warning(
-                    "Prompt embedding dimension mismatch: got %d, expected %d. "
-                    "This may cause errors.",
-                    current_dim, expected_dim
-                )
+        prompt_embeds = self._normalize_prompt_embed_dim(prompt_embeds, label="Prompt embeddings")
 
         prompt_embeds = prompt_embeds.to(device=self.device, dtype=self.dit_dtype)
 
@@ -429,6 +453,10 @@ class LTX2Inferencer:
             if neg_embeds is not None:
                 if neg_embeds.dim() == 2:
                     neg_embeds = neg_embeds.unsqueeze(0)
+                neg_embeds = self._normalize_prompt_embed_dim(
+                    neg_embeds,
+                    label="Negative prompt embeddings",
+                )
                 neg_embeds = neg_embeds.to(device=self.device, dtype=self.dit_dtype)
                 prompt_embeds = torch.cat([neg_embeds, prompt_embeds], dim=0)
 
@@ -706,6 +734,21 @@ class LTX2Inferencer:
 
         return upsample_video(latents, _EncoderProxy(per_channel_stats), upsampler)
 
+    def _prepare_for_final_decode(self, offload_transformer: bool) -> None:
+        """Release stage-2 sampling pressure before VAE decode."""
+        if offload_transformer:
+            if hasattr(self.transformer, "move_to_device_except_swap_blocks"):
+                logger.info("Offloading transformer before final decode")
+                self.transformer.move_to_device_except_swap_blocks(torch.device("cpu"))
+            elif hasattr(self.transformer, "to"):
+                logger.info("Offloading transformer before final decode")
+                self.transformer.to("cpu")
+            clean_memory_on_device(self.device)
+            return
+
+        logger.info("Releasing stage-2 allocations before final decode")
+        clean_memory_on_device(self.device)
+
     def generate(
         self,
         config: InferenceConfig,
@@ -833,8 +876,15 @@ class LTX2Inferencer:
                 conditioning_latent=config.conditioning_latent,
                 use_i2v_token_timestep_mask=bool(config.use_i2v_token_timestep_mask),
             )
+        prompt_embeds = None
+        prompt_mask = None
 
         # Stage 2: Upsample and refine (if two-stage)
+        stage2_embeds = None
+        stage2_mask = None
+        stage2_sigmas = None
+        video_noise = None
+        audio_noise = None
         if config.two_stage:
             try:
                 logger.info("Stage 2: Upsampling and refining to %dx%d", config.width, config.height)
@@ -912,21 +962,10 @@ class LTX2Inferencer:
                 stage2_embeds = config.prompt_embeds
                 if stage2_embeds.dim() == 2:
                     stage2_embeds = stage2_embeds.unsqueeze(0)
-
-                # Fix embedding dimensions if needed (same as stage 1)
-                expected_dim = self._get_expected_embed_dim()
-                current_dim = stage2_embeds.shape[-1]
-                if expected_dim is not None and current_dim != expected_dim:
-                    if current_dim * 2 == expected_dim:
-                        # Pad video-only to AV
-                        padding = torch.zeros(
-                            *stage2_embeds.shape[:-1], current_dim,
-                            dtype=stage2_embeds.dtype, device=stage2_embeds.device
-                        )
-                        stage2_embeds = torch.cat([stage2_embeds, padding], dim=-1)
-                    elif current_dim == expected_dim * 2:
-                        # Slice AV to video-only
-                        stage2_embeds = stage2_embeds[..., :expected_dim]
+                stage2_embeds = self._normalize_prompt_embed_dim(
+                    stage2_embeds,
+                    label="Stage 2 prompt embeddings",
+                )
 
                 stage2_embeds = stage2_embeds.to(device=self.device, dtype=self.dit_dtype)
 
@@ -943,6 +982,7 @@ class LTX2Inferencer:
                     latents.shape, dtype=latents.dtype, device=latents.device, generator=generator
                 )
                 latents = (1.0 - sigma) * latents + sigma * video_noise
+                video_noise = None
 
                 # Also add noise to audio latents if present (official pipeline does this)
                 if audio_latents is not None:
@@ -950,6 +990,11 @@ class LTX2Inferencer:
                         audio_latents.shape, dtype=audio_latents.dtype, device=audio_latents.device, generator=generator
                     )
                     audio_latents = (1.0 - sigma) * audio_latents + sigma * audio_noise
+                    audio_noise = None
+
+                # Stage 2 only needs the noised latents from this point onward.
+                # Release the temporary noise tensors before entering refine denoising.
+                clean_memory_on_device(self.device)
 
                 with torch.no_grad():
                     latents, audio_latents = self._denoise_loop(
@@ -966,6 +1011,13 @@ class LTX2Inferencer:
                     self._remove_distilled_lora(float(active_distilled_multiplier or 1.0))
                     distilled_lora_active = False
                     active_distilled_multiplier = None
+
+        stage2_embeds = None
+        stage2_mask = None
+        stage2_sigmas = None
+        video_noise = None
+        audio_noise = None
+        self._prepare_for_final_decode(config.offload_between_stages)
 
         # Decode video
         video = None

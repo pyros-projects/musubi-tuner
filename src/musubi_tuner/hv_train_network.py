@@ -574,6 +574,22 @@ def should_sample_images(args, steps, epoch=None):
     return True
 
 
+def resolve_step_sampling_requests(args, global_step: int, epoch=None, initial_sample_pending: bool = False) -> tuple[bool, bool]:
+    """Resolve sampling requests for an optimizer step.
+
+    Returns `(should_initial_sample, should_regular_sample)`. The initial sample
+    request is delayed until after optimizer step 1 so first-step runtime
+    warmups can settle before preview generation. If the regular step schedule
+    also matches on step 1, the initial sample consumes that slot to avoid a
+    duplicate preview.
+    """
+    should_initial_sample = bool(initial_sample_pending and getattr(args, "sample_at_first", False) and global_step == 1)
+    should_regular_sample = should_sample_images(args, global_step, epoch=epoch)
+    if should_initial_sample:
+        should_regular_sample = False
+    return should_initial_sample, should_regular_sample
+
+
 class NetworkTrainer:
     def __init__(self):
         self.blocks_to_swap = None
@@ -1741,10 +1757,22 @@ class NetworkTrainer:
                 line += "#" * int(w / max_weighting * CONSOLE_WIDTH)
                 print(line)
 
-    def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
+    def sample_images(
+        self,
+        accelerator: Accelerator,
+        args,
+        epoch,
+        steps,
+        vae,
+        transformer,
+        sample_parameters,
+        dit_dtype,
+        force_sample: bool = False,
+    ):
         """architecture independent sample images"""
-        if not should_sample_images(args, steps, epoch):
+        if not force_sample and not should_sample_images(args, steps, epoch):
             return
+        self._refresh_live_sampling_loras(args, sample_parameters)
 
         logger.info("")
         logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
@@ -2130,6 +2158,21 @@ class NetworkTrainer:
             logger.info(f"Restored sampling LoRA {weight_path}: restored_modules={restored}")
         if runtime_cleared:
             logger.info(f"Cleared {runtime_cleared} sampling LoRA runtime overlays.")
+
+    def _refresh_live_sampling_loras(
+        self,
+        args: argparse.Namespace,
+        sample_parameters: Optional[list[dict]],
+    ) -> None:
+        if not bool(getattr(args, "sample_live_reload_loras", False)):
+            return
+
+        if self._sampling_lora_cache:
+            logger.info(
+                "Sampling LoRA live reload: clearing %d cached weight file(s)",
+                len(self._sampling_lora_cache),
+            )
+            self._sampling_lora_cache.clear()
 
     def process_sample_prompts(
         self,
@@ -3574,11 +3617,7 @@ class NetworkTrainer:
             network.train()
             set_trainer_train_mode()
 
-        # For --sample_at_first (skip on resume — samples were already generated)
-        if global_step == 0 and should_sample_images(args, global_step, epoch=0):
-            set_trainer_eval_mode()
-            self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
-            set_trainer_train_mode()
+        initial_sample_pending = bool(global_step == 0 and getattr(args, "sample_at_first", False))
         if len(accelerator.trackers) > 0:
             # log empty object to commit the sample images to wandb
             accelerator.log({}, step=0)
@@ -3974,11 +4013,31 @@ class NetworkTrainer:
                         _log_cuda_memory_stats(f"step_{global_step}", latents_shape=latents_shape)
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
-                    should_sampling = should_sample_images(args, global_step, epoch=None)
+                    should_initial_sampling, should_sampling = resolve_step_sampling_requests(
+                        args,
+                        global_step,
+                        epoch=None,
+                        initial_sample_pending=initial_sample_pending,
+                    )
                     should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
 
-                    if should_sampling or should_saving:
+                    if should_initial_sampling or should_sampling or should_saving:
                         set_trainer_eval_mode()
+                        if should_initial_sampling:
+                            self.sample_images(
+                                accelerator,
+                                args,
+                                None,
+                                global_step,
+                                vae,
+                                transformer,
+                                sample_parameters,
+                                dit_dtype,
+                                force_sample=True,
+                            )
+                            initial_sample_pending = False
+                            if gui_metrics is not None:
+                                gui_metrics.log_event("sample", global_step)
                         if should_sampling:
                             self.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
                             if gui_metrics is not None:
@@ -4415,6 +4474,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
         default=None,
         nargs="*",
         help="Multiplier for LoRA weights merged only during sample image generation / サンプル画像生成時のみ一時的にマージするLoRA重みの倍率",
+    )
+    parser.add_argument(
+        "--sample_live_reload_loras",
+        action="store_true",
+        help="Reload sampling LoRA files and prompt-local LoRA metadata from disk before each sampling run without reloading Gemma embeddings.",
     )
     parser.add_argument(
         "--validate_every_n_steps",

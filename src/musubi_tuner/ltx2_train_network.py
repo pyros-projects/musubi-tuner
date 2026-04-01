@@ -4268,6 +4268,66 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         return sample_params
 
+    def _refresh_live_sampling_loras(
+        self,
+        args: argparse.Namespace,
+        sample_parameters: Optional[List[Dict]],
+    ) -> None:
+        super()._refresh_live_sampling_loras(args, sample_parameters)
+        if not bool(getattr(args, "sample_live_reload_loras", False)):
+            return
+        if not sample_parameters:
+            return
+
+        sample_prompt_path = getattr(args, "sample_prompts", None)
+        if not sample_prompt_path or not str(sample_prompt_path).endswith(".toml"):
+            return
+
+        try:
+            prompts = load_ltx_prompt_file_with_resolved_loras(
+                sample_prompt_path,
+                baseline_loras=build_ltx_prompt_file_baseline_loras(args),
+            )
+            live_params = self._apply_sample_defaults(args, prompts)
+        except Exception as exc:
+            logger.warning("Sampling LoRA live reload: failed to refresh prompt-local LoRAs: %s", exc)
+            return
+
+        if len(live_params) != len(sample_parameters):
+            logger.warning(
+                "Sampling LoRA live reload: prompt count changed (%d -> %d); keeping existing in-memory sampling prompts.",
+                len(sample_parameters),
+                len(live_params),
+            )
+            return
+
+        def _normalize_text(value: Optional[str]) -> str:
+            if value is None:
+                return ""
+            return " ".join(str(value).split())
+
+        refreshed = 0
+        for idx, (sample_parameter, live_param) in enumerate(zip(sample_parameters, live_params)):
+            existing_prompt = _normalize_text(sample_parameter.get("prompt", ""))
+            live_prompt = _normalize_text(live_param.get("prompt", ""))
+            existing_negative = _normalize_text(sample_parameter.get("negative_prompt", ""))
+            live_negative = _normalize_text(live_param.get("negative_prompt", ""))
+            if existing_prompt != live_prompt or existing_negative != live_negative:
+                logger.warning(
+                    "Sampling LoRA live reload: prompt text changed at sample %d; keeping existing embeddings and LoRA config for that sample.",
+                    idx,
+                )
+                continue
+
+            sample_parameter["resolved_loras"] = list(live_param.get("resolved_loras", []) or [])
+            refreshed += 1
+
+        if refreshed:
+            logger.info(
+                "Sampling LoRA live reload: refreshed prompt-local LoRA metadata for %d sample(s)",
+                refreshed,
+            )
+
     def _build_text_encoder(self, args: argparse.Namespace, accelerator: Accelerator) -> torch.dtype:
         logger.info("Loading Gemma text encoder for LTX-2 sampling")
         gemma_safetensors = getattr(args, "gemma_safetensors", None)
@@ -4576,10 +4636,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
         transformer,
         sample_parameters,
         dit_dtype,
+        force_sample: bool = False,
     ):
         """LTX-2 sampling with optional DiT offloading between prompts."""
-        if not should_sample_images(args, steps, epoch):
+        if not force_sample and not should_sample_images(args, steps, epoch):
             return
+        self._refresh_live_sampling_loras(args, sample_parameters)
 
         logger.info("")
         logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
