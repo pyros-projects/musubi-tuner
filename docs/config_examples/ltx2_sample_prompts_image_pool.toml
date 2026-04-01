@@ -1,0 +1,91 @@
+# Example prompt file focused on the new LTX prompt-file image-pool features.
+#
+# Highlights:
+# - root LoRA baseline shared by all subsets
+# - root image pool built from both `input_images` and `input_images_dir`
+# - `image_input_order = "random"` to shuffle the pool once per run
+# - `image_assignment = "unique"` so each eligible subset gets a distinct image
+# - explicit subset `image_path` override
+# - explicit `use_image_pool = false` T2V opt-out
+# - explicit `use_image_pool = true` opt-in for readability
+#
+# Example usage:
+#   source .venv/bin/activate
+#   PYTHONPATH=src python -m musubi_tuner.ltx2_generate_video \
+#     --device cuda \
+#     --mixed_precision bf16 \
+#     --ltx2_checkpoint /abs/path/to/ltx-2.3-22b-dev-nf4.safetensors \
+#     --vae /abs/path/to/ltx-2.3-22b-dev-nf4.safetensors \
+#     --ltx_version 2.3 \
+#     --ltx_version_check_mode error \
+#     --nf4_base \
+#     --gemma_root /abs/path/to/gemma-3-12b-it-qat-q4_0-unquantized \
+#     --gemma_load_in_4bit \
+#     --sample_prompts /abs/path/to/ltx2_sample_prompts_image_pool.toml \
+#     --sample_with_offloading \
+#     --output_dir /abs/path/to/output/ltx23_image_pool \
+#     --output_name ltx23_image_pool
+
+[prompt]
+width = 1280
+height = 832
+frame_count = 49
+frame_rate = 24
+sample_steps = 8
+sample_sigmas = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+guidance_scale = 1.0
+cfg_scale = 1.0
+negative_prompt = ""
+
+# Shared LoRAs behave the same way as before: all subsets inherit these unless they
+# switch to `lora_mode = "replace"`.
+loras = [
+  { path = "/abs/path/to/base_style.safetensors", weight = 0.35, merge = false },
+  { path = "/abs/path/to/camera_motion_helper.safetensors", weight = 0.20, merge = false },
+]
+
+# The root image pool can be composed from explicit files and a directory.
+input_images = [
+  "/abs/path/to/hero_frames/city_rain.png",
+  "/abs/path/to/hero_frames/forest_drone.png",
+]
+input_images_dir = "/abs/path/to/input_stills"
+
+# `random` shuffles the combined pool once per prompt-file resolution pass.
+image_input_order = "random"
+
+# v1 supports only unique assignment. If there are not enough images for the number
+# of eligible subsets, prompt loading fails with an actionable error.
+image_assignment = "unique"
+
+[[prompt.subset]]
+prompt = "cinematic close-up of a woman walking through neon rain at night, shallow depth of field, realistic lighting"
+seed = 1234
+use_image_pool = true
+# This subset gets one random image from the root pool.
+lora_mode = "extend"
+loras = [
+  { path = "/abs/path/to/concept_a.safetensors", weight = 0.85, merge = false },
+]
+
+[[prompt.subset]]
+prompt = "two tennis players rallying on an outdoor clay court, long lens sports footage, natural motion, realistic sunlight"
+seed = 2345
+# Explicit subset image overrides the root pool for this one prompt only.
+image_path = "/abs/path/to/hero_frames/tennis_start.png"
+lora_mode = "replace"
+loras = [
+  { path = "/abs/path/to/concept_c.safetensors", weight = 0.90, merge = false },
+]
+
+[[prompt.subset]]
+prompt = "slow drone shot over a pine forest valley at sunrise, mist between trees, realistic aerial cinematography"
+seed = 3456
+frame_count = 81
+use_image_pool = false
+# This subset stays plain T2V even though the root prompt defines an image pool.
+
+[[prompt.subset]]
+prompt = "macro shot of wet leaves moving in wind, shallow depth of field, natural color"
+# No explicit `use_image_pool` needed here; because a root pool exists, this subset
+# is eligible by default and gets one of the remaining unique images.
