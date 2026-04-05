@@ -33,7 +33,7 @@ from musubi_tuner.hv_train_network import (
 import logging
 
 from musubi_tuner.zimage_train_network import ZImageNetworkTrainer
-from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
+from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils, tracker_utils
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
 
 logger = logging.getLogger(__name__)
@@ -383,17 +383,12 @@ class ZImageTrainer(ZImageNetworkTrainer):
             if key in metadata:
                 minimum_metadata[key] = metadata[key]
 
-        if accelerator.is_main_process:
-            init_kwargs = {}
-            if args.wandb_run_name:
-                init_kwargs["wandb"] = {"name": args.wandb_run_name}
-            if args.log_tracker_config is not None:
-                init_kwargs = toml.load(args.log_tracker_config)
-            accelerator.init_trackers(
-                "fine-tuning" if args.log_tracker_name is None else args.log_tracker_name,
-                config=train_utils.get_sanitized_config_or_none(args),
-                init_kwargs=init_kwargs,
-            )
+        tracker_utils.init_experiment_trackers(
+            accelerator,
+            args,
+            default_tracker_name="fine-tuning",
+            config=train_utils.get_sanitized_config_or_none(args),
+        )
 
         # TODO skip until initial step
         progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
@@ -472,7 +467,10 @@ class ZImageTrainer(ZImageNetworkTrainer):
             else:
                 save_file(state_dict, ckpt_file, metadata_to_save)
 
-            if args.huggingface_repo_id is not None:
+            self.post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
+
+            upload_original = (not getattr(args, "convert_to_comfy", True)) or getattr(args, "save_original_lora", True)
+            if args.huggingface_repo_id is not None and upload_original:
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
         def remove_model(old_ckpt_name):
@@ -480,6 +478,11 @@ class ZImageTrainer(ZImageNetworkTrainer):
             if os.path.exists(old_ckpt_file):
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
+            if getattr(args, "convert_to_comfy", True):
+                comfy_old_ckpt_file = old_ckpt_file.replace(".safetensors", ".comfy.safetensors")
+                if os.path.exists(comfy_old_ckpt_file):
+                    accelerator.print(f"removing old Comfy checkpoint: {comfy_old_ckpt_file}")
+                    os.remove(comfy_old_ckpt_file)
 
         # For --sample_at_first
         if should_sample_images(args, global_step, epoch=0):

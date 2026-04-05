@@ -42,7 +42,7 @@ from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO
 
 import logging
 
-from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
+from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec, tracker_utils
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -91,34 +91,7 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
     """
     DeepSpeed is not supported in this script currently.
     """
-    if args.logging_dir is None:
-        logging_dir = None
-    else:
-        log_prefix = "" if args.log_prefix is None else args.log_prefix
-        logging_dir = args.logging_dir + "/" + log_prefix + time.strftime("%Y%m%d%H%M%S", time.localtime())
-
-    if args.log_with is None:
-        if logging_dir is not None:
-            log_with = "tensorboard"
-        else:
-            log_with = None
-    else:
-        log_with = args.log_with
-        if log_with in ["tensorboard", "all"]:
-            if logging_dir is None:
-                raise ValueError(
-                    "logging_dir is required when log_with is tensorboard / Tensorboardを使う場合、logging_dirを指定してください"
-                )
-        if log_with in ["wandb", "all"]:
-            try:
-                import wandb
-            except ImportError:
-                raise ImportError("No wandb / wandb がインストールされていないようです")
-            if logging_dir is not None:
-                os.makedirs(logging_dir, exist_ok=True)
-                os.environ["WANDB_DIR"] = logging_dir
-            if args.wandb_api_key is not None:
-                wandb.login(key=args.wandb_api_key)
+    logging_dir, log_with = tracker_utils.prepare_logging(args)
 
     kwargs_handlers = [
         (
@@ -946,17 +919,12 @@ class FineTuningTrainer:
         accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
         accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
-        if accelerator.is_main_process:
-            init_kwargs = {}
-            if args.wandb_run_name:
-                init_kwargs["wandb"] = {"name": args.wandb_run_name}
-            if args.log_tracker_config is not None:
-                init_kwargs = toml.load(args.log_tracker_config)
-            accelerator.init_trackers(
-                "hunyuan_video_ft" if args.log_tracker_name is None else args.log_tracker_name,
-                config=train_utils.get_sanitized_config_or_none(args),
-                init_kwargs=init_kwargs,
-            )
+        tracker_utils.init_experiment_trackers(
+            accelerator,
+            args,
+            default_tracker_name="hunyuan_video_ft",
+            config=train_utils.get_sanitized_config_or_none(args),
+        )
 
         # TODO skip until initial step
         progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
@@ -1310,8 +1278,8 @@ def setup_parser() -> argparse.ArgumentParser:
         "--log_with",
         type=str,
         default=None,
-        choices=["tensorboard", "wandb", "all"],
-        help="what logging tool(s) to use (if 'all', TensorBoard and WandB are both used) / ログ出力に使用するツール (allを指定するとTensorBoardとWandBの両方が使用される)",
+        choices=["tensorboard", "wandb", "trackio", "all"],
+        help="what logging tool(s) to use (trackio uses Hugging Face Trackio; if 'all', TensorBoard and WandB are both used) / ログ出力に使用するツール (trackioはHugging Face Trackio、allを指定するとTensorBoardとWandBの両方が使用される)",
     )
     parser.add_argument(
         "--log_prefix", type=str, default=None, help="add prefix for each log directory / ログディレクトリ名の先頭に追加する文字列"

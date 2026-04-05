@@ -31,6 +31,7 @@ from musubi_tuner.hv_train_network import (
     setup_parser_common,
     should_sample_images,
 )
+from musubi_tuner.utils import tracker_utils
 from musubi_tuner.audio_supervision import (
     AudioSupervisionState,
     format_audio_supervision_alert,
@@ -5644,28 +5645,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 except Exception as e:
                     logger.warning(f"Failed to prepend reference to output: {e}")
 
-        wandb_tracker = None
-        try:
-            wandb_tracker = accelerator.get_tracker("wandb")
-            try:
-                import wandb
-            except ImportError:
-                raise ImportError("No wandb / wandb がインストールされていないようです")
-        except:
-            wandb = None
-
         video_path = None
         if video is not None:
             if video.shape[2] == 1:
                 image_paths = save_images_grid(video, save_dir, save_path, create_subdir=False)
-                if wandb_tracker is not None and wandb is not None:
-                    for image_path in image_paths:
-                        wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(image_path)}, step=steps)
+                for image_path in image_paths:
+                    tracker_utils.log_named_artifact(accelerator, f"sample_{prompt_idx}", image_path, "image", step=steps)
             else:
                 video_path = os.path.join(save_dir, save_path) + ".mp4"
                 save_videos_grid(video, video_path)
-                if wandb_tracker is not None and wandb is not None:
-                    wandb_tracker.log({f"sample_{prompt_idx}": wandb.Video(video_path)}, step=steps)
+                tracker_utils.log_named_artifact(accelerator, f"sample_{prompt_idx}", video_path, "video", step=steps)
         if audio_waveform is not None:
             wav_path = os.path.join(save_dir, save_path) + ".wav"
             sample_rate = int(getattr(vocoder, "output_sample_rate", 24000)) if vocoder is not None else 24000
@@ -7436,28 +7425,6 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Number of blocks to checkpoint. -1 = all (default), 0 = none, N = last N blocks. "
              "Use with --blockwise_checkpointing to trade VRAM for speed on 12-16GB cards.",
     )
-    parser.add_argument(
-        "--no_convert_to_comfy",
-        action="store_false",
-        dest="convert_to_comfy",
-        default=True,
-        help="Disable automatic conversion of saved LoRA to ComfyUI format. "
-             "By default, both original and ComfyUI checkpoints are saved.",
-    )
-    parser.add_argument(
-        "--save_original_lora",
-        action="store_true",
-        default=True,
-        help="(Default: True) Keep the original non-Comfy LoRA alongside the ComfyUI-converted checkpoint. "
-             "Use --no_save_original_lora to disable.",
-    )
-    parser.add_argument(
-        "--no_save_original_lora",
-        action="store_false",
-        dest="save_original_lora",
-        help="Delete the original LoRA after ComfyUI conversion, keeping only *.comfy.safetensors.",
-    )
-
     # -- Preservation / regularization flags --
     parser.add_argument(
         "--blank_preservation",

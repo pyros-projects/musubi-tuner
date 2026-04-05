@@ -177,7 +177,17 @@ Z-Imageの学習は専用のスクリプト`zimage_train_network.py`を使用し
 
 ### Converting LoRA weights to Diffusers format for ComfyUI / LoRA重みをComfyUIで使用可能なDiffusers形式に変換する
 
-A script is provided to convert Z-Image LoRA weights to Diffusers format for ComfyUI. LoHa and LoKr formats are supported.
+During training, Z-Image LoRA checkpoints are automatically converted to a ComfyUI-compatible Diffusers-format sibling file by default:
+
+- `name.safetensors` (Musubi/original format)
+- `name.comfy.safetensors` (ComfyUI-compatible Diffusers format)
+
+The same flags as LTX-2 are available:
+
+- `--no_convert_to_comfy`: disable automatic ComfyUI conversion
+- `--no_save_original_lora`: keep only the `*.comfy.safetensors` output after conversion
+
+A manual conversion script is still provided for already-saved checkpoints. LoHa and LoKr formats are supported.
 
 ```bash
 python src/musubi_tuner/networks/convert_lora.py \
@@ -196,7 +206,17 @@ python src/musubi_tuner/networks/convert_lora.py \
 <details>
 <summary>日本語</summary>
 
-Z-ImageのLoRA重みをComfyUIで使用できるDiffusers形式に変換するスクリプトが提供されています。
+Z-ImageのLoRA重みは、学習時にデフォルトでComfyUI互換のDiffusers形式へ自動変換され、以下の2つが保存されます。
+
+- `name.safetensors`（Musubi / オリジナル形式）
+- `name.comfy.safetensors`（ComfyUI互換のDiffusers形式）
+
+LTX-2と同じフラグが利用できます。
+
+- `--no_convert_to_comfy` : ComfyUI形式への自動変換を無効化
+- `--no_save_original_lora` : 変換後に `*.comfy.safetensors` のみを残す
+
+既存のチェックポイントを手動変換するためのスクリプトも引き続き利用できます。
 
 - スクリプトは`convert_lora.py`です。
 - `--input`引数は入力のZ-Image LoRA重みファイルです。

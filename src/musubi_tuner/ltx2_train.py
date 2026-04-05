@@ -34,7 +34,7 @@ from musubi_tuner.hv_train_network import (
     should_sample_images,
 )
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
-from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
+from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils, tracker_utils
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, mem_eff_save_file
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser
 
@@ -3225,15 +3225,11 @@ def main() -> None:
             minimum_metadata[key] = metadata[key]
 
     if accelerator.is_main_process:
-        init_kwargs = {}
-        if args.wandb_run_name:
-            init_kwargs["wandb"] = {"name": args.wandb_run_name}
-        if args.log_tracker_config is not None:
-            init_kwargs = toml.load(args.log_tracker_config)
-        accelerator.init_trackers(
-            "fine-tuning" if args.log_tracker_name is None else args.log_tracker_name,
+        tracker_utils.init_experiment_trackers(
+            accelerator,
+            args,
+            default_tracker_name="fine-tuning",
             config=train_utils.get_sanitized_config_or_none(args),
-            init_kwargs=init_kwargs,
         )
         # Log full-FT block-level LR setup once so TensorBoard has explicit
         # traces of configured scales/groups even before the first optimizer step.

@@ -1,10 +1,13 @@
 import argparse
 from typing import Optional
 import math
+import os
 
 import torch
 from tqdm import tqdm
 from accelerate import Accelerator
+from safetensors.torch import load_file, save_file
+from safetensors import safe_open
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_Z_IMAGE, ARCHITECTURE_Z_IMAGE_FULL
 from musubi_tuner.zimage import zimage_model, zimage_utils, zimage_autoencoder, zimage_config
@@ -16,6 +19,7 @@ from musubi_tuner.hv_train_network import (
     read_config_from_file,
 )
 from musubi_tuner.utils import model_utils
+from musubi_tuner import convert_lora
 
 import logging
 
@@ -102,6 +106,38 @@ class ZImageNetworkTrainer(NetworkTrainer):
             )
 
         return weights_sd
+
+    def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
+        """Convert saved Z-Image LoRA to ComfyUI-compatible diffusers format."""
+        if not getattr(args, "convert_to_comfy", True):
+            return
+
+        try:
+            weights_sd = load_file(ckpt_file)
+            converted_sd = convert_lora.convert_to_diffusers("lora_unet_", None, weights_sd)
+            comfy_ckpt_name = ckpt_name.replace(".safetensors", ".comfy.safetensors")
+            comfy_ckpt_file = os.path.join(args.output_dir, comfy_ckpt_name)
+
+            metadata = None
+            with safe_open(ckpt_file, framework="pt") as f:
+                metadata = f.metadata()
+
+            save_file(converted_sd, comfy_ckpt_file, metadata=metadata)
+            accelerator.print(f"Saved ComfyUI-compatible LoRA: {comfy_ckpt_file}")
+
+            if args.huggingface_repo_id is not None:
+                from musubi_tuner.utils import huggingface_utils
+
+                huggingface_utils.upload(args, comfy_ckpt_file, "/" + comfy_ckpt_name, force_sync_upload=force_sync_upload)
+
+            if not getattr(args, "save_original_lora", True) and os.path.exists(ckpt_file):
+                try:
+                    os.remove(ckpt_file)
+                    accelerator.print(f"Removed original LoRA checkpoint (--no_save_original_lora): {ckpt_file}")
+                except Exception as e:
+                    accelerator.print(f"Warning: Failed to remove original checkpoint '{ckpt_file}': {e}")
+        except Exception as e:
+            accelerator.print(f"Warning: Failed to convert LoRA to ComfyUI format: {e}")
 
     def process_sample_prompts(
         self,

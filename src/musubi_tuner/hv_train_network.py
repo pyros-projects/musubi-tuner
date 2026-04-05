@@ -63,7 +63,7 @@ from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid, r
 
 import logging
 
-from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
+from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec, tracker_utils
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -109,6 +109,40 @@ def enable_gradient_checkpointing_compat(
     if pass_cpu_offload_positionally:
         return fn(cpu_offload, **kwargs)
     return fn(**kwargs)
+
+
+def enable_block_swap_compat(
+    module,
+    blocks_to_swap: int,
+    device,
+    supports_backward: bool,
+    *,
+    use_pinned_memory: bool = False,
+    swap_norms: bool = False,
+):
+    """Call module.enable_block_swap with only supported kwargs.
+
+    Shared trainer paths may pass LTX-specific block-swap options, but most
+    model families still expose the older signature. This helper preserves the
+    richer call shape for LTX while keeping WAN and other legacy model APIs
+    compatible.
+    """
+
+    fn = module.enable_block_swap
+    try:
+        signature = inspect.signature(fn)
+        parameters = [p for p in signature.parameters.values() if p.name != "self"]
+    except (TypeError, ValueError):
+        parameters = None
+
+    kwargs = {"use_pinned_memory": use_pinned_memory}
+    if parameters is not None:
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters)
+        names = {p.name for p in parameters}
+        if accepts_kwargs or "swap_norms" in names:
+            kwargs["swap_norms"] = swap_norms
+
+    return fn(blocks_to_swap, device, supports_backward, **kwargs)
 
 
 def _update_global_peak() -> tuple[float, float]:
@@ -277,34 +311,7 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
     """
     DeepSpeed is not supported in this script currently.
     """
-    if args.logging_dir is None:
-        logging_dir = None
-    else:
-        log_prefix = "" if args.log_prefix is None else args.log_prefix
-        logging_dir = args.logging_dir + "/" + log_prefix + time.strftime("%Y%m%d%H%M%S", time.localtime())
-
-    if args.log_with is None:
-        if logging_dir is not None:
-            log_with = "tensorboard"
-        else:
-            log_with = None
-    else:
-        log_with = args.log_with
-        if log_with in ["tensorboard", "all"]:
-            if logging_dir is None:
-                raise ValueError(
-                    "logging_dir is required when log_with is tensorboard / Tensorboardを使う場合、logging_dirを指定してください"
-                )
-        if log_with in ["wandb", "all"]:
-            try:
-                import wandb
-            except ImportError:
-                raise ImportError("No wandb / wandb がインストールされていないようです")
-            if logging_dir is not None:
-                os.makedirs(logging_dir, exist_ok=True)
-                os.environ["WANDB_DIR"] = logging_dir
-            if args.wandb_api_key is not None:
-                wandb.login(key=args.wandb_api_key)
+    logging_dir, log_with = tracker_utils.prepare_logging(args)
 
     kwargs_handlers = [
         (
@@ -1787,6 +1794,22 @@ class NetworkTrainer:
         transformer.switch_block_swap_for_inference()
         applied_sampling_lora = []
         eager_sampling_swaps: list[tuple[torch.nn.Module, str, torch.nn.Module]] = []
+        original_device = next(transformer.parameters()).device
+        offload = bool(getattr(args, "sample_with_offloading", False))
+        transformer_offloaded = offload and accelerator.device.type == "cuda"
+        if transformer_offloaded:
+            transformer.to("cpu")
+            logger.info("Sampling offload: moved transformer to CPU before prompt loop")
+            clean_memory_on_device(accelerator.device)
+        if getattr(transformer, "blocks_to_swap", 0) and original_device.type == "cpu" and not transformer_offloaded:
+            if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                transformer.move_to_device_except_swap_blocks(accelerator.device)
+            else:
+                transformer.to(accelerator.device)
+            if hasattr(transformer, "prepare_block_swap_before_forward"):
+                transformer.prepare_block_swap_before_forward()
+            clean_memory_on_device(accelerator.device)
+            original_device = accelerator.device
 
         # Create a directory to save the samples
         save_dir = os.path.join(args.output_dir, "sample")
@@ -1801,6 +1824,23 @@ class NetworkTrainer:
             pass
 
         try:
+            def ensure_transformer_on_device() -> None:
+                if transformer_offloaded:
+                    logger.info("Sampling offload: moving transformer to GPU for denoise")
+                    if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                        transformer.move_to_device_except_swap_blocks(accelerator.device)
+                    else:
+                        transformer.to(accelerator.device)
+                    if hasattr(transformer, "prepare_block_swap_before_forward"):
+                        transformer.prepare_block_swap_before_forward()
+                    clean_memory_on_device(accelerator.device)
+
+            def offload_transformer_if_needed() -> None:
+                if transformer_offloaded:
+                    logger.info("Sampling offload: moving transformer back to CPU")
+                    transformer.to("cpu")
+                    clean_memory_on_device(accelerator.device)
+
             if args.compile and self._get_sampling_lora_specs(args) and self._sampling_lora_requires_eager_fallback(transformer):
                 eager_sampling_swaps = model_utils.swap_compiled_modules_with_eager(transformer)
                 logger.info(
@@ -1813,10 +1853,14 @@ class NetworkTrainer:
                 # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
                 with torch.no_grad(), accelerator.autocast():
                     for sample_parameter in sample_parameters:
-                        self.sample_image_inference(
-                            accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
-                        )
-                        clean_memory_on_device(accelerator.device)
+                        ensure_transformer_on_device()
+                        try:
+                            self.sample_image_inference(
+                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                            )
+                        finally:
+                            offload_transformer_if_needed()
+                            clean_memory_on_device(accelerator.device)
             else:
                 # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
                 # prompt_dicts are assigned to lists based on order of processes, to attempt to time the image creation time to match enum order. Probably only works when steps and sampler are identical.
@@ -1827,10 +1871,14 @@ class NetworkTrainer:
                 with torch.no_grad():
                     with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
                         for sample_parameter in sample_parameter_lists[0]:
-                            self.sample_image_inference(
-                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
-                            )
-                            clean_memory_on_device(accelerator.device)
+                            ensure_transformer_on_device()
+                            try:
+                                self.sample_image_inference(
+                                    accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                                )
+                            finally:
+                                offload_transformer_if_needed()
+                                clean_memory_on_device(accelerator.device)
         finally:
             self._restore_sampling_lora(args, transformer, accelerator.device, applied_sampling_lora)
             if eager_sampling_swaps:
@@ -1840,6 +1888,14 @@ class NetworkTrainer:
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state(cuda_rng_state)
 
+            if transformer_offloaded:
+                if original_device.type != "cpu" and hasattr(transformer, "move_to_device_except_swap_blocks"):
+                    transformer.move_to_device_except_swap_blocks(original_device)
+                    if hasattr(transformer, "prepare_block_swap_before_forward"):
+                        transformer.prepare_block_swap_before_forward()
+                else:
+                    transformer.to(original_device)
+                logger.info("Sampling offload: restored transformer to training device")
             transformer.switch_block_swap_for_training()
             clean_memory_on_device(accelerator.device)
 
@@ -1957,27 +2013,15 @@ class NetworkTrainer:
             f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{prompt_idx:02d}_{ts_str}{seed_suffix}"
         )
 
-        wandb_tracker = None
-        try:
-            wandb_tracker = accelerator.get_tracker("wandb")  # raises ValueError if wandb is not initialized
-            try:
-                import wandb
-            except ImportError:
-                raise ImportError("No wandb / wandb がインストールされていないようです")
-        except:  # wandb 無効時
-            wandb = None
-
         if video.shape[2] == 1:
             # In Qwen-Image-Layered, video is (N, C, 1, H, W) where N=Layers, otherwise (1, C, 1, H, W)
             image_paths = save_images_grid(video, save_dir, save_path, n_rows=video.shape[0], create_subdir=False)
-            if wandb_tracker is not None and wandb is not None:
-                for image_path in image_paths:
-                    wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(image_path)}, step=steps)
+            for image_path in image_paths:
+                tracker_utils.log_named_artifact(accelerator, f"sample_{prompt_idx}", image_path, "image", step=steps)
         else:
             video_path = os.path.join(save_dir, save_path) + ".mp4"
             save_videos_grid(video, video_path)
-            if wandb_tracker is not None and wandb is not None:
-                wandb_tracker.log({f"sample_{prompt_idx}": wandb.Video(video_path)}, step=steps)
+            tracker_utils.log_named_artifact(accelerator, f"sample_{prompt_idx}", video_path, "video", step=steps)
 
         # Move models back to initial state
         vae.to("cpu")
@@ -2743,9 +2787,13 @@ class NetworkTrainer:
             logger.info(
                 f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}, use pinned memory: {args.use_pinned_memory_for_block_swap}"
             )
-            transformer.enable_block_swap(
-                blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap,
-                swap_norms=getattr(args, 'swap_norms', False)
+            enable_block_swap_compat(
+                transformer,
+                blocks_to_swap,
+                accelerator.device,
+                supports_backward=True,
+                use_pinned_memory=args.use_pinned_memory_for_block_swap,
+                swap_norms=getattr(args, "swap_norms", False),
             )
             _log_vram("AFTER enable_block_swap (offloader created)", logger)
             transformer.move_to_device_except_swap_blocks(accelerator.device)
@@ -3279,17 +3327,12 @@ class NetworkTrainer:
             if key in metadata:
                 minimum_metadata[key] = metadata[key]
 
-        if accelerator.is_main_process:
-            init_kwargs = {}
-            if args.wandb_run_name:
-                init_kwargs["wandb"] = {"name": args.wandb_run_name}
-            if args.log_tracker_config is not None:
-                init_kwargs = toml.load(args.log_tracker_config)
-            accelerator.init_trackers(
-                "network_train" if args.log_tracker_name is None else args.log_tracker_name,
-                config=train_utils.get_sanitized_config_or_none(args),
-                init_kwargs=init_kwargs,
-            )
+        tracker_utils.init_experiment_trackers(
+            accelerator,
+            args,
+            default_tracker_name="network_train",
+            config=train_utils.get_sanitized_config_or_none(args),
+        )
 
         progress_bar = tqdm(
             range(args.max_train_steps), initial=initial_global_step, smoothing=0,
@@ -4097,12 +4140,7 @@ class NetworkTrainer:
                     if args.optimizer_type.lower() == "automagic" and optimizer is not None:
                         lr_tensor = optimizer.get_lr_tensor()
                         if lr_tensor is not None and lr_tensor.mean() > 0:
-                            for tracker in accelerator.trackers:
-                                if tracker.name == "tensorboard":
-                                    tracker.writer.add_histogram("lr/automagic_lrs", lr_tensor, global_step)
-                                elif tracker.name == "wandb":
-                                    import wandb
-                                    tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
+                            tracker_utils.log_histogram(accelerator, "lr/automagic_lrs", lr_tensor, step=global_step)
 
                 # GUI dashboard per-step metrics
                 if gui_metrics is not None:
@@ -4379,8 +4417,8 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--log_with",
         type=str,
         default=None,
-        choices=["tensorboard", "wandb", "all"],
-        help="what logging tool(s) to use (if 'all', TensorBoard and WandB are both used) / ログ出力に使用するツール (allを指定するとTensorBoardとWandBの両方が使用される)",
+        choices=["tensorboard", "wandb", "trackio", "all"],
+        help="what logging tool(s) to use (trackio uses Hugging Face Trackio; if 'all', TensorBoard and WandB are both used) / ログ出力に使用するツール (trackioはHugging Face Trackio、allを指定するとTensorBoardとWandBの両方が使用される)",
     )
     parser.add_argument(
         "--log_prefix", type=str, default=None, help="add prefix for each log directory / ログディレクトリ名の先頭に追加する文字列"
@@ -4479,6 +4517,30 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--sample_live_reload_loras",
         action="store_true",
         help="Reload sampling LoRA files and prompt-local LoRA metadata from disk before each sampling run without reloading Gemma embeddings.",
+    )
+    parser.add_argument(
+        "--no_convert_to_comfy",
+        action="store_false",
+        dest="convert_to_comfy",
+        default=True,
+        help="Disable automatic conversion of saved LoRA to ComfyUI format. By default, both original and ComfyUI checkpoints are saved.",
+    )
+    parser.add_argument(
+        "--save_original_lora",
+        action="store_true",
+        default=True,
+        help="(Default: True) Keep the original non-Comfy LoRA alongside the ComfyUI-converted checkpoint. Use --no_save_original_lora to disable.",
+    )
+    parser.add_argument(
+        "--no_save_original_lora",
+        action="store_false",
+        dest="save_original_lora",
+        help="Delete the original LoRA after ComfyUI conversion, keeping only *.comfy.safetensors.",
+    )
+    parser.add_argument(
+        "--sample_with_offloading",
+        action="store_true",
+        help="Offload the transformer to CPU between sampling prompts to save VRAM when the architecture supports it.",
     )
     parser.add_argument(
         "--validate_every_n_steps",

@@ -278,7 +278,7 @@
 						</div>
 						<PathInput label="Resume From" value={t.resume || ''} oninput={(e) => update('resume', e.target.value)} showFiles tooltip="Resume training from saved state" />
 						<div class="grid grid-cols-2 gap-2">
-							<FormSelect label="Logger" value={t.log_with || ''} options={[{value:'',label:'None'},{value:'tensorboard',label:'TensorBoard'},{value:'wandb',label:'W&B'}]} onchange={(e) => update('log_with', e.target.value || null)} tooltip="Logging integration" />
+							<FormSelect label="Logger" value={t.log_with || ''} options={[{value:'',label:'None'},{value:'tensorboard',label:'TensorBoard'},{value:'wandb',label:'W&B'},{value:'trackio',label:'Trackio'}]} onchange={(e) => update('log_with', e.target.value || null)} tooltip="Logging integration" />
 							<PathInput label="Log Dir" value={t.logging_dir || ''} oninput={(e) => update('logging_dir', e.target.value)} disabled={!t.log_with} tooltip="Log directory" />
 						</div>
 						<FormField label="W&B Run Name" value={t.wandb_run_name || ''} oninput={(e) => update('wandb_run_name', e.target.value)} disabled={t.log_with !== 'wandb'} placeholder="Auto" tooltip="Weights & Biases run name" />

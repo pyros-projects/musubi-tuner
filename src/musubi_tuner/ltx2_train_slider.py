@@ -45,7 +45,7 @@ from musubi_tuner.ltx2_train_network import (
     ltx2_setup_parser,
 )
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
-from musubi_tuner.utils import model_utils, train_utils
+from musubi_tuner.utils import model_utils, train_utils, tracker_utils
 
 
 # ---------------------------------------------------------------------------
@@ -787,18 +787,12 @@ class LTX2SliderTrainer:
                 minimum_metadata[key] = metadata[key]
 
         # Init trackers
-        if accelerator.is_main_process:
-            init_kwargs = {}
-            if getattr(args, "wandb_run_name", None):
-                init_kwargs["wandb"] = {"name": args.wandb_run_name}
-            if getattr(args, "log_tracker_config", None) is not None:
-                init_kwargs = toml.load(args.log_tracker_config)
-            tracker_name = getattr(args, "log_tracker_name", None) or "slider_train"
-            accelerator.init_trackers(
-                tracker_name,
-                config=train_utils.get_sanitized_config_or_none(args),
-                init_kwargs=init_kwargs,
-            )
+        tracker_utils.init_experiment_trackers(
+            accelerator,
+            args,
+            default_tracker_name="slider_train",
+            config=train_utils.get_sanitized_config_or_none(args),
+        )
 
         # -- Save / remove helpers ---------------------------------------------
         save_dtype = dit_dtype
