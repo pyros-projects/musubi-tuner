@@ -31,6 +31,7 @@ Each video is extracted frame by frame without additional processing and used fo
 [general]
 resolution = [960, 544]
 caption_extension = ".txt"
+caption_prefix = "mytrigger " # optional. Prepended exactly as written to every caption.
 batch_size = 1
 enable_bucket = true
 bucket_no_upscale = false
@@ -45,6 +46,8 @@ num_repeats = 1 # optional, default is 1. Number of times to repeat the dataset.
 ```
 
 `image_directory` is the directory containing images. The captions are stored in text files with the same filename as the image, but with the extension specified by `caption_extension` (for example, `image1.jpg` and `image1.txt`).
+
+`caption_prefix` is optional and can be set under `[general]` or per `[[datasets]]`. It is prepended exactly as configured, so include any desired trailing space or comma yourself. For directory-backed datasets, if `caption_prefix` is non-empty and an item's caption sidecar is missing, the prefix itself is used as the caption. With `multiple_target = true`, caption files are still used to identify base images, so missing-sidecar fallback is disabled for image discovery.
 
 `cache_directory` is optional, default is None to use the same directory as the image directory. However, we recommend to set the cache directory to avoid accidental sharing of the cache files between different datasets.
 
@@ -70,6 +73,8 @@ The next combination would be stored as `/path/to/layer_images/image2.txt` for c
 `num_repeats` はオプションで、デフォルトは 1 です（繰り返しなし）。画像（や動画）を、その回数だけ単純に繰り返してデータセットを拡張します。たとえば`num_repeats = 2`としたとき、画像20枚のデータセットなら、各画像が2枚ずつ（同一のキャプションで）計40枚存在した場合と同じになります。異なるデータ数のデータセット間でバランスを取るために使用可能です。
 
 resolution, caption_extension, batch_size, num_repeats, enable_bucket, bucket_no_upscale は general または datasets のどちらかに設定してください。省略時は各項目のデフォルト値が使用されます。
+
+`caption_prefix` は `[general]` または `[[datasets]]` に設定できます。指定した文字列がそのままキャプションの先頭に追加されるため、必要なスペースやカンマはユーザーが含めてください。ディレクトリ形式のデータセットで `caption_prefix` が空でない場合、キャプションファイルが存在しないアイテムでは prefix 自体がキャプションとして使われます。`multiple_target = true` の画像データセットでは、ベース画像の判定にキャプションファイルを使うため、このフォールバックは無効です。
 
 `[[datasets]]`以下を追加することで、他のデータセットを追加できます。各データセットには異なる設定を持てます。
 
@@ -654,6 +659,7 @@ FLUX.2のデータセット設定は、制御画像を持つ画像データセ�
 [general]
 resolution = [960, 544] # optional, [W, H], default is [960, 544]. This is the default resolution for all datasets
 caption_extension = ".txt" # optional, default is None. This is the default caption extension for all datasets
+caption_prefix = "" # optional, default is "". Prepended exactly as written; no whitespace is inserted automatically
 batch_size = 1 # optional, default is 1. This is the default batch size for all datasets
 num_repeats = 1 # optional, default is 1. Number of times to repeat the dataset. Useful to balance the multiple datasets with different sizes.
 enable_bucket = true # optional, default is false. Enable bucketing for datasets
@@ -665,6 +671,7 @@ bucket_no_upscale = false # optional, default is false. Disable upscaling for bu
 [[datasets]]
 image_directory = "/path/to/image_dir"
 caption_extension = ".txt" # required for caption text files, if general caption extension is not set
+caption_prefix = "dataset-trigger " # optional, overrides the general caption_prefix for this dataset
 resolution = [960, 544] # required if general resolution is not set
 batch_size = 4 # optional, overwrite the default batch size
 num_repeats = 1 # optional, overwrite the default num_repeats
@@ -676,6 +683,7 @@ control_directory = "/path/to/control_dir" # optional, required for dataset with
 # sample image dataset with metadata **jsonl** file
 [[datasets]]
 image_jsonl_file = "/path/to/metadata.jsonl" # includes pairs of image files and captions
+caption_prefix = "dataset-trigger " # optional, prepended to each JSONL caption
 resolution = [960, 544] # required if general resolution is not set
 cache_directory = "/path/to/cache_directory" # required for metadata jsonl file
 # caption_extension is not required for metadata jsonl file

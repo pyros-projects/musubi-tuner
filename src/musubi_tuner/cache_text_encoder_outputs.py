@@ -17,6 +17,7 @@ from musubi_tuner.dataset.image_video_dataset import (
 )
 from musubi_tuner.hunyuan_model import text_encoder as text_encoder_module
 from musubi_tuner.hunyuan_model.text_encoder import TextEncoder
+from musubi_tuner.utils import safetensors_utils
 
 import logging
 
@@ -70,6 +71,27 @@ def prepare_cache_files_and_paths(datasets: list[BaseDataset]):
     return all_cache_files_for_dataset, all_cache_paths_for_dataset
 
 
+def text_encoder_cache_matches_caption(item: ItemInfo) -> bool:
+    try:
+        with safetensors_utils.MemoryEfficientSafeOpen(item.text_encoder_output_cache_path) as f:
+            metadata = f.metadata()
+    except Exception as e:
+        logger.warning(f"Failed to read existing text encoder cache metadata: {item.text_encoder_output_cache_path}: {e}")
+        return False
+
+    cached_caption = metadata.get("caption1")
+    if cached_caption != item.caption:
+        if cached_caption is None:
+            logger.info(f"Re-encoding text encoder cache without caption metadata: {item.text_encoder_output_cache_path}")
+        else:
+            logger.info(
+                "Re-encoding text encoder cache with mismatched caption metadata: "
+                f"{item.text_encoder_output_cache_path}"
+            )
+        return False
+    return True
+
+
 def process_text_encoder_batches(
     num_workers: Optional[int],
     skip_existing: bool,
@@ -103,9 +125,11 @@ def process_text_encoder_batches(
 
             # skip existing cache files
             if skip_existing:
-                filtered_batch = [
-                    item for item in batch if os.path.normpath(item.text_encoder_output_cache_path) not in all_cache_files
-                ]
+                filtered_batch = []
+                for item in batch:
+                    cache_path = os.path.normpath(item.text_encoder_output_cache_path)
+                    if cache_path not in all_cache_files or not text_encoder_cache_matches_caption(item):
+                        filtered_batch.append(item)
                 # print(f"Filtered {len(batch) - len(filtered_batch)} existing cache files")
                 if len(filtered_batch) == 0:
                     continue

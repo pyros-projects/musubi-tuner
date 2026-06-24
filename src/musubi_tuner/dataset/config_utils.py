@@ -37,6 +37,7 @@ class BaseDatasetParams:
     enable_bucket: bool = False
     bucket_no_upscale: bool = False
     caption_extension: Optional[str] = None
+    caption_prefix: str = ""
     batch_size: int = 1
     num_repeats: int = 1
     video_loss_weight: Optional[float] = None
@@ -130,6 +131,7 @@ class ConfigSanitizer:
     # datasets schema
     DATASET_ASCENDABLE_SCHEMA = {
         "caption_extension": str,
+        "caption_prefix": str,
         "batch_size": int,
         "num_repeats": int,
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
@@ -354,6 +356,7 @@ def generate_dataset_group_by_blueprint(
         video_loss_weight: {getattr(dataset, "video_loss_weight", None)}
         audio_loss_weight: {getattr(dataset, "audio_loss_weight", None)}
         caption_extension: "{dataset.caption_extension}"
+        caption_prefix: "{dataset.caption_prefix}"
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}
         separate_audio_buckets: {getattr(dataset, "separate_audio_buckets", False)}

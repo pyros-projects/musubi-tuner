@@ -106,4 +106,4 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
     --fp8_base --fp8_scaled \
     "${BLOCK_SWAP_ARGS[@]}" \
     "${SAMPLE_BLOCK_SWAP_ARGS[@]}" \
-    --sample_every_n_steps "$SAMPLE_EVERY" --log_with trackio
+    --sample_at_first --sample_every_n_steps "$SAMPLE_EVERY" --log_with trackio

@@ -82,6 +82,7 @@ def _dataset_entry_to_dict(entry) -> dict:
     d["batch_size"] = entry.batch_size
     d["num_repeats"] = entry.num_repeats
     d["caption_extension"] = entry.caption_extension
+    d["caption_prefix"] = entry.caption_prefix
 
     if entry.type == "video":
         d["target_frames"] = [entry.target_frames]
@@ -108,6 +109,7 @@ def _write_dataset_toml(config: ProjectConfig, output_path: Path) -> Path:
     doc["general"] = {
         "enable_bucket": config.dataset.general.enable_bucket,
         "bucket_no_upscale": config.dataset.general.bucket_no_upscale,
+        "caption_prefix": config.dataset.general.caption_prefix,
     }
 
     # Datasets

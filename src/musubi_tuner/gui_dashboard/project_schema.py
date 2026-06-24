@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class GeneralConfig(BaseModel):
     enable_bucket: bool = True
     bucket_no_upscale: bool = True
+    caption_prefix: str = ""
 
 
 class DatasetEntry(BaseModel):
@@ -25,6 +26,7 @@ class DatasetEntry(BaseModel):
     batch_size: int = 1
     num_repeats: int = 1
     caption_extension: str = ".txt"
+    caption_prefix: str = ""
     # video-specific
     target_frames: int = 33
     frame_extraction: Literal["head", "chunk", "slide", "uniform", "full"] = "head"

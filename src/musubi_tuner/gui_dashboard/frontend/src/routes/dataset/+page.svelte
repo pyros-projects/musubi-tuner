@@ -1,4 +1,5 @@
 <script>
+	import FormField from '$lib/components/FormField.svelte';
 	import FormToggle from '$lib/components/FormToggle.svelte';
 	import DatasetEntry from '$lib/components/DatasetEntry.svelte';
 	import { projectConfig, projectLoaded, saveProjectDebounced, saveProjectNow } from '$lib/stores/project.js';
@@ -22,6 +23,7 @@
 				batch_size: 1,
 				num_repeats: 1,
 				caption_extension: '.txt',
+				caption_prefix: '',
 				target_frames: 33,
 				frame_extraction: 'head',
 				frame_sample: null,
@@ -114,6 +116,9 @@
 				<p class="text-[12px]" style="color: var(--text-muted);">Configure training and validation datasets.</p>
 			</div>
 			<div class="flex items-center gap-5">
+				<div class="w-56">
+					<FormField label="Caption Prefix" value={general.caption_prefix ?? ''} oninput={(e) => updateGeneral('caption_prefix', e.target.value)} placeholder="Optional" tooltip="Raw prompt prefix prepended to captions" />
+				</div>
 				<FormToggle label="Enable Bucket" checked={general.enable_bucket ?? true} onchange={(e) => updateGeneral('enable_bucket', e.target.checked)} tooltip="Enable resolution bucketing for varied aspect ratios" />
 				<FormToggle label="No Upscale" checked={general.bucket_no_upscale ?? true} onchange={(e) => updateGeneral('bucket_no_upscale', e.target.checked)} tooltip="Prevent upscaling images smaller than bucket resolution" />
 			</div>

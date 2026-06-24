@@ -44,9 +44,10 @@
 
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="p-4 space-y-3" oninput={() => { entry = entry; if (onchange) onchange(); }} onchange={() => { entry = entry; if (onchange) onchange(); }}>
-		<div class="grid grid-cols-2 gap-3">
+		<div class="grid grid-cols-3 gap-3">
 			<FormSelect label="Type" bind:value={entry.type} options={typeOptions} tooltip="Type of media in this dataset" />
 			<FormField label="Caption Ext" bind:value={entry.caption_extension} placeholder=".txt" tooltip="File extension for caption files" />
+			<FormField label="Caption Prefix" bind:value={entry.caption_prefix} placeholder="Optional" tooltip="Raw prompt prefix prepended to captions" />
 		</div>
 
 		<PathInput label="{isAudio ? 'Audio' : isVideo ? 'Video' : 'Image'} Directory" bind:value={entry.directory} onselect={(p) => setField('directory', p)} tooltip="Directory containing media files" />
