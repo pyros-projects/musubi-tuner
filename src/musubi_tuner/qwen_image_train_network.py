@@ -77,6 +77,43 @@ class QwenImageNetworkTrainer(NetworkTrainer):
             "--remove_first_image_from_target can only be used with layered model."
         )
 
+    def normalize_sampling_lora_weights(
+        self, args: argparse.Namespace, weights_sd: dict[str, torch.Tensor], weight_path: str
+    ) -> dict[str, torch.Tensor]:
+        weights_sd = super().normalize_sampling_lora_weights(args, weights_sd, weight_path)
+
+        native_prefixes = sorted(
+            {
+                key[: -len(".lora_down.weight")]
+                for key in weights_sd
+                if key.startswith("transformer_blocks.") and key.endswith(".lora_down.weight")
+            }
+        )
+        if not native_prefixes:
+            return weights_sd
+
+        logger.info(
+            f"Sampling LoRA {weight_path} uses native Qwen module paths; converting to lora_unet_* sampling format."
+        )
+
+        converted: dict[str, torch.Tensor] = {}
+        native_prefix_set = set(native_prefixes)
+        for key, value in weights_sd.items():
+            if any(key == prefix or key.startswith(f"{prefix}.") for prefix in native_prefix_set):
+                continue
+            converted[key] = value
+
+        for prefix in native_prefixes:
+            normalized_prefix = f"lora_unet_{prefix.replace('.', '_')}"
+            for suffix in ("lora_down.weight", "lora_up.weight", "alpha"):
+                source_key = f"{prefix}.{suffix}"
+                if source_key not in weights_sd:
+                    continue
+                value = weights_sd[source_key]
+                converted[f"{normalized_prefix}.{suffix}"] = value.clone() if torch.is_tensor(value) else value
+
+        return converted
+
     def process_sample_prompts(
         self,
         args: argparse.Namespace,

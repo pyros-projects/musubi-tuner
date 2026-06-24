@@ -5,7 +5,7 @@ from multiprocessing import Value
 import torch
 import torch.nn as nn
 
-from musubi_tuner.dataset.image_video_dataset import BucketBatchManager
+from musubi_tuner.dataset.image_video_dataset import BucketBatchManager, DatasetGroup
 from musubi_tuner.hv_train_network import NetworkTrainer, collator_class, move_batch_tensors_to_device, normalize_compile_args
 
 
@@ -95,6 +95,39 @@ class _FakeDatasetGroup:
         return indices[:max_buckets]
 
 
+class _FakeRepresentativeDataset:
+    def __init__(self, bucket_sizes, representative_indices):
+        self.items = list(range(sum(bucket_sizes)))
+        self.num_train_items = len(self.items)
+        self.batch_manager = types.SimpleNamespace(
+            buckets={bucket_index: [None] * bucket_size for bucket_index, bucket_size in enumerate(bucket_sizes)},
+            bucket_batch_indices=[
+                (bucket_index, item_index)
+                for bucket_index, bucket_size in enumerate(bucket_sizes)
+                for item_index in range(bucket_size)
+            ],
+        )
+        self._representative_indices = representative_indices
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+    def set_current_epoch(self, epoch):
+        self.current_epoch = epoch
+
+    def set_max_train_steps(self, max_train_steps):
+        self.max_train_steps = max_train_steps
+
+    def get_representative_batch_indices(self, max_buckets=None):
+        indices = list(self._representative_indices)
+        if max_buckets is None:
+            return indices
+        return indices[:max_buckets]
+
+
 class CompilePrewarmTest(unittest.TestCase):
     def test_compile_prewarm_implies_compile(self):
         args = types.SimpleNamespace(compile=False, compile_prewarm=True)
@@ -136,6 +169,17 @@ class CompilePrewarmTest(unittest.TestCase):
 
         limited = manager.get_representative_batch_indices(max_buckets=2)
         self.assertEqual(limited, [0, 2])
+
+    def test_dataset_group_collects_representative_batch_indices_across_datasets(self):
+        first_dataset = _FakeRepresentativeDataset(bucket_sizes=[4, 1], representative_indices=[0, 4])
+        second_dataset = _FakeRepresentativeDataset(bucket_sizes=[3, 2], representative_indices=[0, 3])
+        dataset_group = DatasetGroup([first_dataset, second_dataset])
+
+        representatives = dataset_group.get_representative_batch_indices()
+        limited = dataset_group.get_representative_batch_indices(max_buckets=3)
+
+        self.assertEqual(representatives, [0, 5, 8, 4])
+        self.assertEqual(limited, [0, 5, 8])
 
     def test_compile_prewarm_dataloader_uses_dataset_bound_collator(self):
         trainer = _ToyPrewarmTrainer()

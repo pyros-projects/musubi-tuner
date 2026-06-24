@@ -31,7 +31,7 @@ from musubi_tuner.ltx2_inference import (
 )
 from musubi_tuner.ltx2_lora_utils import normalize_ltx_comfy_lora_weights
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser
-from musubi_tuner.hv_train_network import resolve_step_sampling_requests
+from musubi_tuner.hv_train_network import resolve_step_sampling_requests, setup_parser_common
 from musubi_tuner.ltx_2.model.video_vae.video_vae import VideoDecoder, resolve_slice_bounds
 from musubi_tuner.ltx_2.model.video_vae.tiling import Tile
 
@@ -949,6 +949,19 @@ class LTX2SamplingLoraTests(unittest.TestCase):
 
         self.assertEqual(args.sample_stage1_distilled_lora_multiplier, 0.75)
         self.assertEqual(args.sample_stage2_distilled_lora_multiplier, 0.25)
+
+    def test_training_main_parser_accepts_sample_with_offloading_once(self):
+        parser = ltx2_setup_parser(setup_parser_common())
+
+        args = parser.parse_args(
+            [
+                "--ltx2_checkpoint",
+                "/tmp/ltx.safetensors",
+                "--sample_with_offloading",
+            ]
+        )
+
+        self.assertTrue(args.sample_with_offloading)
 
     def test_apply_official_distilled_pipeline_args_sets_expected_overrides(self):
         args = Namespace(

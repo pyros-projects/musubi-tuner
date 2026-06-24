@@ -38,7 +38,7 @@
 
 ## はじめに
 
-このリポジトリは、HunyuanVideo、Wan2.1/2.2、FramePack、FLUX.1 Kontext、FLUX.2 dev/klein、Qwen-Image、Z-Image、および [LTX-2](./docs/ltx_2.md)のLoRA学習用のコマンドラインツールです。このリポジトリは非公式であり、それらの公式リポジトリとは関係ありません。
+このリポジトリは、HunyuanVideo、Wan2.1/2.2、FramePack、FLUX.1 Kontext、FLUX.2 dev/klein、Qwen-Image、Z-Image、[Krea 2](./docs/krea2.md)、および [LTX-2](./docs/ltx_2.md)のLoRA学習用のコマンドラインツールです。このリポジトリは非公式であり、それらの公式リポジトリとは関係ありません。
 
 *リポジトリは開発中です。*
 
@@ -57,6 +57,11 @@
 ### 最近の更新
 
 GitHub Discussionsを有効にしました。コミュニティのQ&A、知識共有、技術情報の交換などにご利用ください。バグ報告や機能リクエストにはIssuesを、質問や経験の共有にはDiscussionsをご利用ください。[Discussionはこちら](https://github.com/kohya-ss/musubi-tuner/discussions)
+
+- 2026/06/24
+    - Krea 2のLoRA学習と推論に実験的に対応しました。
+        - このLTX forkでは、RAW/base学習中のTurbo LoRAプレビューに、upstreamのDiT全体を差し替える`--turbo_dit`ではなく`--sampling_lora_weight`を使用します。
+        - 詳細は[ドキュメント](./docs/krea2.md)を参照してください。
 
 - 2026/02/15
     - LoHa/LoKrの学習に対応しました。[PR #900](https://github.com/kohya-ss/musubi-tuner/pull/900)
@@ -155,6 +160,7 @@ Musubi Tunerの解説記事執筆や、関連ツールの開発に取り組ん�
 - [Z-Image](./docs/zimage.md)
 - [HunyuanVideo 1.5](./docs/hunyuan_video_1_5.md)
 - [Kandinsky 5](./docs/kandinsky5.md)
+- [Krea 2](./docs/krea2.md)
 - [LTX-2](./docs/ltx_2.md)
 - [FLUX.2](./docs/flux_2.md)
 

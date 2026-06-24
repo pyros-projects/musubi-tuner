@@ -114,6 +114,11 @@ def attention(
     if attn_params is None:
         attn_params = AttentionParams.create_attention_params("torch", False)
 
+    # Krea 2 uses grouped-query attention: query heads can outnumber key/value
+    # heads. Repeating k/v keeps SDPA/xformers on their fused kernels and is
+    # numerically equivalent to PyTorch's native enable_gqa path for these shapes.
+    enable_gqa = q.shape[-2] != k.shape[-2]
+
     # If split attn is False, attention mask is provided and all sequence lengths are same, we can trim the sequence
     seqlen_trimmed = False
     # Trim if all seqlens are the same, for attention modes other than flash or sageattn (which can handle masks efficiently)
@@ -164,7 +169,12 @@ def attention(
         if attn_params.split_attn:
             x = []
             for i in range(len(q)):
-                x_i = torch.nn.functional.scaled_dot_product_attention(q[i], k[i], v[i], dropout_p=drop_rate)
+                qi, ki, vi = q[i], k[i], v[i]
+                if enable_gqa:
+                    g = qi.shape[1] // ki.shape[1]
+                    ki = ki.repeat_interleave(g, dim=1)
+                    vi = vi.repeat_interleave(g, dim=1)
+                x_i = torch.nn.functional.scaled_dot_product_attention(qi, ki, vi, dropout_p=drop_rate)
                 q[i] = None
                 k[i] = None
                 v[i] = None
@@ -173,6 +183,10 @@ def attention(
             q, k, v = None, None, None
 
         else:
+            if enable_gqa:
+                g = q.shape[1] // k.shape[1]
+                k = k.repeat_interleave(g, dim=1)
+                v = v.repeat_interleave(g, dim=1)
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate)
             q, k, v = None, None, None
 
@@ -180,7 +194,12 @@ def attention(
         if attn_params.split_attn:
             x = []
             for i in range(len(q)):
-                x_i = xops.memory_efficient_attention(q[i], k[i], v[i], p=drop_rate)
+                qi, ki, vi = q[i], k[i], v[i]
+                if enable_gqa:
+                    g = qi.shape[2] // ki.shape[2]
+                    ki = ki.repeat_interleave(g, dim=2)
+                    vi = vi.repeat_interleave(g, dim=2)
+                x_i = xops.memory_efficient_attention(qi, ki, vi, p=drop_rate)
                 q[i] = None
                 k[i] = None
                 v[i] = None
@@ -189,6 +208,10 @@ def attention(
             q, k, v = None, None, None
 
         else:
+            if enable_gqa:
+                g = q.shape[2] // k.shape[2]
+                k = k.repeat_interleave(g, dim=2)
+                v = v.repeat_interleave(g, dim=2)
             x = xops.memory_efficient_attention(q, k, v, attn_bias=attn_params.attention_mask, p=drop_rate)
             q, k, v = None, None, None
 
@@ -210,9 +233,9 @@ def attention(
         else:
             # Reshape to [(bxs), a, d]
             batch_size, seqlen = q.shape[0], q.shape[1]
-            q = q.view(q.shape[0] * q.shape[1], *q.shape[2:])  # [B*L, H, D]
-            k = k.view(k.shape[0] * k.shape[1], *k.shape[2:])  # [B*L, H, D]
-            v = v.view(v.shape[0] * v.shape[1], *v.shape[2:])  # [B*L, H, D]
+            q = q.reshape(q.shape[0] * q.shape[1], *q.shape[2:])  # [B*L, H, D]
+            k = k.reshape(k.shape[0] * k.shape[1], *k.shape[2:])  # [B*L, H, D]
+            v = v.reshape(v.shape[0] * v.shape[1], *v.shape[2:])  # [B*L, H, D]
 
             # Assume cu_seqlens_q == cu_seqlens_kv and max_seqlen_q == max_seqlen_kv. No dropout support
             x = sageattn_varlen(
@@ -241,9 +264,9 @@ def attention(
         else:
             # Reshape to [(bxs), a, d]
             batch_size, seqlen = q.shape[0], q.shape[1]
-            q = q.view(q.shape[0] * q.shape[1], *q.shape[2:])  # [B*L, H, D]
-            k = k.view(k.shape[0] * k.shape[1], *k.shape[2:])  # [B*L, H, D]
-            v = v.view(v.shape[0] * v.shape[1], *v.shape[2:])  # [B*L, H, D]
+            q = q.reshape(q.shape[0] * q.shape[1], *q.shape[2:])  # [B*L, H, D]
+            k = k.reshape(k.shape[0] * k.shape[1], *k.shape[2:])  # [B*L, H, D]
+            v = v.reshape(v.shape[0] * v.shape[1], *v.shape[2:])  # [B*L, H, D]
 
             # Assume cu_seqlens_q == cu_seqlens_kv and max_seqlen_q == max_seqlen_kv
             x = flash_attn_varlen_func(

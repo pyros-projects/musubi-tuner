@@ -41,7 +41,7 @@
 
 ## Introduction
 
-This repository provides scripts for training LoRA (Low-Rank Adaptation) models with HunyuanVideo, Wan2.1/2.2, FramePack, FLUX.1 Kontext, FLUX.2 dev/klein, Qwen-Image, Z-Image, and [LTX-2](./docs/ltx_2.md) architectures. 
+This repository provides scripts for training LoRA (Low-Rank Adaptation) models with HunyuanVideo, Wan2.1/2.2, FramePack, FLUX.1 Kontext, FLUX.2 dev/klein, Qwen-Image, Z-Image, [Krea 2](./docs/krea2.md), and [LTX-2](./docs/ltx_2.md) architectures. 
 
 This repository is unofficial and not affiliated with the official repositories of these architectures.
 
@@ -62,6 +62,11 @@ If you find this project helpful, please consider supporting its development via
 ### Recent Updates
 
 GitHub Discussions Enabled: We've enabled GitHub Discussions for community Q&A, knowledge sharing, and technical information exchange. Please use Issues for bug reports and feature requests, and Discussions for questions and sharing experiences. [Join the conversation →](https://github.com/kohya-ss/musubi-tuner/discussions)
+
+- June 24, 2026
+    - Added experimental support for Krea 2 LoRA training and inference.
+        - This LTX fork uses `--sampling_lora_weight` for Turbo LoRA previews during RAW/base training, rather than upstream's whole-DiT `--turbo_dit` swap path.
+        - Please refer to the [documentation](./docs/krea2.md) for details.
 
 - February 15, 2026
     - Added support for LoHa/LoKr training. See [PR #900](https://github.com/kohya-ss/musubi-tuner/pull/900)
@@ -160,6 +165,7 @@ For detailed information on specific architectures, configurations, and advanced
 - [Z-Image](./docs/zimage.md)
 - [HunyuanVideo 1.5](./docs/hunyuan_video_1_5.md)
 - [Kandinsky 5](./docs/kandinsky5.md)
+- [Krea 2](./docs/krea2.md)
 - [LTX-2](./docs/ltx_2.md)
 - [FLUX.2](./docs/flux_2.md)
 

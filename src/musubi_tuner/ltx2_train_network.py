@@ -7245,11 +7245,6 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Default frame count for LTX-2 preview generation.",
     )
     parser.add_argument(
-        "--sample_with_offloading",
-        action="store_true",
-        help="Offload LTX-2 DiT to CPU between sampling prompts to save VRAM.",
-    )
-    parser.add_argument(
         "--precache_sample_prompts",
         action="store_true",
         help="Use precached Gemma embeddings for sample prompts (no Gemma load during training).",

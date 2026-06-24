@@ -91,6 +91,8 @@ ARCHITECTURE_QWEN_IMAGE_EDIT = "qie"
 ARCHITECTURE_QWEN_IMAGE_EDIT_FULL = "qwen_image_edit"
 ARCHITECTURE_QWEN_IMAGE_LAYERED = "qil"
 ARCHITECTURE_QWEN_IMAGE_LAYERED_FULL = "qwen_image_layered"
+ARCHITECTURE_KREA2 = "kr2"
+ARCHITECTURE_KREA2_FULL = "krea2"
 ARCHITECTURE_KANDINSKY5 = "k5"
 ARCHITECTURE_KANDINSKY5_FULL = "kandinsky5"
 ARCHITECTURE_HUNYUAN_VIDEO_1_5 = "hv15"
@@ -395,6 +397,17 @@ def save_latent_cache_qwen_image(item_info: ItemInfo, latent: torch.Tensor, cont
     save_latent_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_FULL)
 
 
+def save_latent_cache_krea2(item_info: ItemInfo, latent: torch.Tensor):
+    """Krea 2 architecture. Single image, Qwen-Image VAE latents."""
+    assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
+
+    _, F, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
+
+
 def save_latent_cache_kandinsky5(
     item_info: ItemInfo,
     latent: torch.Tensor,
@@ -609,6 +622,21 @@ def save_text_encoder_output_cache_qwen_image(item_info: ItemInfo, embed: torch.
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_FULL)
 
 
+def save_text_encoder_output_cache_krea2(item_info: ItemInfo, embed: torch.Tensor):
+    """Krea 2 architecture.
+
+    embed is the valid-token selected-layer stack from Qwen3-VL:
+    (valid_len, num_select_layers, hidden).
+    """
+    assert embed.dim() == 3, "embed should be 3D tensor (valid_len, num_select_layers, hidden)"
+
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    sd[f"varlen_krea2_vl_embed_{dtype_str}"] = embed.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
+
+
 def save_text_encoder_output_cache_kandinsky5(
     item_info: ItemInfo, text_embeds: torch.Tensor, pooled_embed: torch.Tensor, attention_mask: torch.Tensor
 ):
@@ -687,6 +715,7 @@ class BucketSelector:
     RESOLUTION_STEPS_FLUX_2 = 16
     RESOLUTION_STEPS_QWEN_IMAGE = 16
     RESOLUTION_STEPS_QWEN_IMAGE_EDIT = 16
+    RESOLUTION_STEPS_KREA2 = 16
     RESOLUTION_STEPS_KANDINSKY5 = 16
     RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5 = 16
     RESOLUTION_STEPS_Z_IMAGE = 16
@@ -703,6 +732,7 @@ class BucketSelector:
         ARCHITECTURE_QWEN_IMAGE: RESOLUTION_STEPS_QWEN_IMAGE,
         ARCHITECTURE_QWEN_IMAGE_EDIT: RESOLUTION_STEPS_QWEN_IMAGE_EDIT,
         ARCHITECTURE_QWEN_IMAGE_LAYERED: RESOLUTION_STEPS_QWEN_IMAGE,  # use same steps as Qwen-Image
+        ARCHITECTURE_KREA2: RESOLUTION_STEPS_KREA2,
         ARCHITECTURE_KANDINSKY5: RESOLUTION_STEPS_KANDINSKY5,
         ARCHITECTURE_HUNYUAN_VIDEO_1_5: RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5,
         ARCHITECTURE_Z_IMAGE: RESOLUTION_STEPS_Z_IMAGE,
@@ -3543,3 +3573,21 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def set_max_train_steps(self, max_train_steps):
         for dataset in self.datasets:
             dataset.set_max_train_steps(max_train_steps)
+
+    def get_representative_batch_indices(self, max_buckets: Optional[int] = None) -> list[int]:
+        representatives = []
+        dataset_offset = 0
+        for dataset in self.datasets:
+            if hasattr(dataset, "get_representative_batch_indices"):
+                local_indices = dataset.get_representative_batch_indices()
+                batch_manager = getattr(dataset, "batch_manager", None)
+                if batch_manager is not None:
+                    for local_idx in local_indices:
+                        bucket_reso, _batch_idx = batch_manager.bucket_batch_indices[local_idx]
+                        representatives.append((len(batch_manager.buckets[bucket_reso]), bucket_reso, dataset_offset + local_idx))
+            dataset_offset += len(dataset)
+
+        representatives.sort(key=lambda item: (-item[0], item[1]))
+        if max_buckets is not None and max_buckets > 0:
+            representatives = representatives[:max_buckets]
+        return [idx for _count, _bucket_reso, idx in representatives]

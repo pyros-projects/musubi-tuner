@@ -53,6 +53,7 @@ from musubi_tuner.audio_loss_balance import (
     update_loss_ema,
     update_audio_presence_ema,
 )
+from musubi_tuner.prompt_lora_utils import load_prompt_file_with_resolved_loras
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import musubi_tuner.networks.lora as lora_module
@@ -412,6 +413,11 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["discrete_flow_shift"] = float(m.group(1))
                 continue
 
+            m = re.match(r"mu ([\d\.]+)", parg, re.IGNORECASE)
+            if m:
+                prompt_dict["mu"] = float(m.group(1))
+                continue
+
             m = re.match(r"l ([\d\.]+)", parg, re.IGNORECASE)
             if m:  # scale
                 prompt_dict["cfg_scale"] = float(m.group(1))
@@ -475,9 +481,7 @@ def load_prompts(prompt_file: str) -> list[Dict]:
             lines = f.readlines()
         prompts = [line.strip() for line in lines if len(line.strip()) > 0 and line[0] != "#"]
     elif prompt_file.endswith(".toml"):
-        with open(prompt_file, "r", encoding="utf-8") as f:
-            data = toml.load(f)
-        prompts = [dict(**data["prompt"], **subset) for subset in data["prompt"]["subset"]]
+        prompts = load_prompt_file_with_resolved_loras(prompt_file)
     elif prompt_file.endswith(".json"):
         with open(prompt_file, "r", encoding="utf-8") as f:
             prompts = json.load(f)
@@ -1514,6 +1518,7 @@ class NetworkTrainer:
             or args.timestep_sampling == "qinglong_flux"
             or args.timestep_sampling == "qinglong_qwen"
             or args.timestep_sampling == "flux2_shift"
+            or args.timestep_sampling == "krea2_shift"
         ):
 
             def compute_sampling_timesteps(org_timesteps: Optional[torch.Tensor]) -> torch.Tensor:
@@ -1553,6 +1558,8 @@ class NetworkTrainer:
                             mu = train_utils.get_lin_function(y1=0.5, y2=1.15)(h * w)
                         elif args.timestep_sampling == "qwen_shift":
                             mu = train_utils.get_lin_function(x1=256, y1=0.5, x2=8192, y2=0.9)((h // 2) * (w // 2))
+                        elif args.timestep_sampling == "krea2_shift":
+                            mu = train_utils.get_lin_function(x1=256, y1=0.5, x2=6400, y2=1.15)((h // 2) * (w // 2))
                         # def time_shift(mu: float, sigma: float, t: torch.Tensor):
                         #     return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma) # sigma=1.0
                         shift = math.exp(mu)
@@ -1823,6 +1830,8 @@ class NetworkTrainer:
         except Exception:
             pass
 
+        sample_block_swap_context = None
+        sample_block_swap_context_entered = False
         try:
             def ensure_transformer_on_device() -> None:
                 if transformer_offloaded:
@@ -1841,24 +1850,70 @@ class NetworkTrainer:
                     transformer.to("cpu")
                     clean_memory_on_device(accelerator.device)
 
-            if args.compile and self._get_sampling_lora_specs(args) and self._sampling_lora_requires_eager_fallback(transformer):
+            sample_blocks_to_swap = getattr(args, "sample_blocks_to_swap", None)
+            if sample_blocks_to_swap is not None:
+                if hasattr(transformer, "override_block_swap_for_sampling"):
+                    training_blocks_to_swap = getattr(transformer, "blocks_to_swap", 0)
+                    sample_block_swap_context = transformer.override_block_swap_for_sampling(
+                        sample_blocks_to_swap, accelerator.device
+                    )
+                    effective_sample_blocks_to_swap = sample_block_swap_context.__enter__()
+                    sample_block_swap_context_entered = True
+                    logger.info(
+                        "Sampling block swap override active: training=%s sampling=%s",
+                        training_blocks_to_swap,
+                        effective_sample_blocks_to_swap,
+                    )
+                else:
+                    logger.warning(
+                        "sample_blocks_to_swap=%s was requested, but this transformer does not support sampling block-swap override; using existing block-swap state.",
+                        sample_blocks_to_swap,
+                    )
+
+            has_prompt_local_loras = any(bool(sample_parameter.get("resolved_loras")) for sample_parameter in sample_parameters)
+            global_sampling_lora_specs = [] if has_prompt_local_loras else self._get_sampling_lora_specs(args)
+            if has_prompt_local_loras and self._get_sampling_lora_specs(args):
+                logger.warning(
+                    "Prompt-local resolved_loras are active; skipping global sampling_lora_weight application for this sampling run."
+                )
+
+            def _get_prompt_local_lora_specs(sample_parameter: Dict) -> list[tuple[str, float]]:
+                specs = []
+                for entry in sample_parameter.get("resolved_loras", []) or []:
+                    path = entry.get("path")
+                    if not path:
+                        continue
+                    specs.append((str(path), float(entry.get("weight", 1.0))))
+                return specs
+
+            if args.compile and global_sampling_lora_specs and self._sampling_lora_requires_eager_fallback(transformer):
                 eager_sampling_swaps = model_utils.swap_compiled_modules_with_eager(transformer)
                 logger.info(
                     f"Sampling LoRA requested on a compiled FP8 transformer; switched {len(eager_sampling_swaps)} compiled modules to eager for sampling only."
                 )
 
-            applied_sampling_lora = self._apply_sampling_lora(args, transformer, accelerator.device)
+            applied_sampling_lora = self._apply_sampling_lora(args, transformer, accelerator.device) if global_sampling_lora_specs else []
 
             if distributed_state.num_processes <= 1:
                 # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
                 with torch.no_grad(), accelerator.autocast():
                     for sample_parameter in sample_parameters:
+                        prompt_local_applied = []
                         ensure_transformer_on_device()
                         try:
+                            prompt_local_specs = _get_prompt_local_lora_specs(sample_parameter)
+                            if prompt_local_specs:
+                                prompt_local_applied = self._apply_sampling_lora_specs(
+                                    args, transformer, accelerator.device, prompt_local_specs
+                                )
                             self.sample_image_inference(
                                 accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
                             )
                         finally:
+                            if prompt_local_applied:
+                                self._restore_sampling_lora_specs(
+                                    args, transformer, accelerator.device, prompt_local_applied
+                                )
                             offload_transformer_if_needed()
                             clean_memory_on_device(accelerator.device)
             else:
@@ -1871,15 +1926,30 @@ class NetworkTrainer:
                 with torch.no_grad():
                     with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
                         for sample_parameter in sample_parameter_lists[0]:
+                            prompt_local_applied = []
                             ensure_transformer_on_device()
                             try:
+                                prompt_local_specs = _get_prompt_local_lora_specs(sample_parameter)
+                                if prompt_local_specs:
+                                    prompt_local_applied = self._apply_sampling_lora_specs(
+                                        args, transformer, accelerator.device, prompt_local_specs
+                                    )
                                 self.sample_image_inference(
                                     accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
                                 )
                             finally:
+                                if prompt_local_applied:
+                                    self._restore_sampling_lora_specs(
+                                        args, transformer, accelerator.device, prompt_local_applied
+                                    )
                                 offload_transformer_if_needed()
                                 clean_memory_on_device(accelerator.device)
         finally:
+            if sample_block_swap_context_entered:
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                sample_block_swap_context.__exit__(exc_type, exc_value, exc_traceback)
+                sample_block_swap_context_entered = False
+
             self._restore_sampling_lora(args, transformer, accelerator.device, applied_sampling_lora)
             if eager_sampling_swaps:
                 model_utils.restore_compiled_modules(eager_sampling_swaps)
@@ -4543,6 +4613,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="Offload the transformer to CPU between sampling prompts to save VRAM when the architecture supports it.",
     )
     parser.add_argument(
+        "--sample_blocks_to_swap",
+        type=int,
+        default=None,
+        help="Override block swap only during sample generation. Unset inherits --blocks_to_swap; 0 disables block swap for sampling; positive values use that many swapped blocks.",
+    )
+    parser.add_argument(
         "--validate_every_n_steps",
         type=int,
         default=None,
@@ -4695,9 +4771,22 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "flux2_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen", "shifted_logit_normal"],
+        choices=[
+            "sigma",
+            "uniform",
+            "sigmoid",
+            "shift",
+            "flux_shift",
+            "flux2_shift",
+            "qwen_shift",
+            "krea2_shift",
+            "logsnr",
+            "qinglong_flux",
+            "qinglong_qwen",
+            "shifted_logit_normal",
+        ],
         default="sigma",
-        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, flux shift, "
+        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, flux/qwen/krea2 shift, "
         "or shifted_logit_normal (sequence-length-adaptive, official LTX-2 method)."
         " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
     )

@@ -17,9 +17,11 @@ from musubi_tuner.hv_train_network import (
     NetworkTrainer,
     enable_block_swap_compat,
     enable_gradient_checkpointing_compat,
+    load_prompts,
 )
 from musubi_tuner.hv_train import FineTuningTrainer
 from musubi_tuner.networks import lora_flux_2
+from musubi_tuner.qwen_image_train_network import QwenImageNetworkTrainer
 from musubi_tuner.zimage_train_network import ZImageNetworkTrainer
 
 
@@ -193,6 +195,35 @@ class _SamplingCompatTrainer(NetworkTrainer):
         self.events.append(("sample", sample_parameter["prompt"]))
 
 
+class _PromptLocalSamplingCompatTrainer(NetworkTrainer):
+    def __init__(self):
+        super().__init__()
+        self.events = []
+
+    def _get_sampling_lora_specs(self, args):
+        return [("global.safetensors", 0.8)]
+
+    def _sampling_lora_requires_eager_fallback(self, transformer):
+        return False
+
+    def _apply_sampling_lora(self, args, transformer, device):
+        self.events.append(("apply_global", device.type))
+        return [("global.safetensors", {})]
+
+    def _restore_sampling_lora(self, args, transformer, device, applied):
+        self.events.append(("restore_global", len(applied), device.type))
+
+    def _apply_sampling_lora_specs(self, args, transformer, device, specs):
+        self.events.append(("apply_specs", tuple(specs), device.type))
+        return [("prompt-local", {"backups": len(specs)})]
+
+    def _restore_sampling_lora_specs(self, args, transformer, device, applied):
+        self.events.append(("restore_specs", tuple(applied), device.type))
+
+    def sample_image_inference(self, accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
+        self.events.append(("sample", sample_parameter["prompt"]))
+
+
 class _FakePrintAccelerator:
     def __init__(self):
         self.messages = []
@@ -239,6 +270,99 @@ class RemainingMigrationPortsTest(unittest.TestCase):
         self.assertEqual(
             trainer.events,
             [("apply", "cpu"), ("sample", "hello"), ("restore", 1, "cpu")],
+        )
+
+    def test_load_prompts_resolves_prompt_local_loras_for_toml(self) -> None:
+        toml_text = """
+[prompt]
+width = 1280
+height = 832
+loras = [
+  { path = "/root_base.safetensors", weight = 0.3, merge = false }
+]
+
+[[prompt.subset]]
+prompt = "Prompt A"
+loras = [
+  { path = "/subset_a.safetensors", weight = 0.8, merge = false }
+]
+
+[[prompt.subset]]
+prompt = "Prompt B"
+lora_mode = "replace"
+loras = [
+  { path = "/subset_b.safetensors", weight = 0.9, merge = false }
+]
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prompt_file = Path(tmpdir) / "prompts.toml"
+            prompt_file.write_text(toml_text, encoding="utf-8")
+
+            prompts = load_prompts(str(prompt_file))
+
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(prompts[0]["width"], 1280)
+        self.assertEqual(prompts[0]["height"], 832)
+        self.assertEqual(prompts[0]["enum"], 0)
+        self.assertEqual(
+            prompts[0]["resolved_loras"],
+            [
+                {"path": "/root_base.safetensors", "weight": 0.3, "merge": False},
+                {"path": "/subset_a.safetensors", "weight": 0.8, "merge": False},
+            ],
+        )
+        self.assertEqual(
+            prompts[1]["resolved_loras"],
+            [{"path": "/subset_b.safetensors", "weight": 0.9, "merge": False}],
+        )
+
+    def test_shared_sample_images_applies_prompt_local_loras_per_sample_without_leakage(self) -> None:
+        trainer = _PromptLocalSamplingCompatTrainer()
+        accelerator = _FakeAccelerator()
+        transformer = _FakeSamplingTransformer()
+        args = types.SimpleNamespace(
+            sample_every_n_steps=1,
+            sample_every_n_epochs=None,
+            sample_at_first=False,
+            output_dir=tempfile.mkdtemp(),
+            sample_prompts="dummy.toml",
+            compile=False,
+            sampling_lora_weight=["global.safetensors"],
+            sampling_lora_multiplier=[0.8],
+        )
+
+        trainer.sample_images(
+            accelerator,
+            args,
+            epoch=None,
+            steps=1,
+            vae=None,
+            transformer=transformer,
+            sample_parameters=[
+                {
+                    "prompt": "Prompt A",
+                    "resolved_loras": [
+                        {"path": "/a.safetensors", "weight": 0.5, "merge": False},
+                        {"path": "/b.safetensors", "weight": 0.8, "merge": False},
+                    ],
+                },
+                {
+                    "prompt": "Prompt B",
+                    "resolved_loras": [],
+                },
+            ],
+            dit_dtype=torch.float32,
+        )
+
+        self.assertEqual(
+            trainer.events,
+            [
+                ("apply_specs", (("/a.safetensors", 0.5), ("/b.safetensors", 0.8)), "cpu"),
+                ("sample", "Prompt A"),
+                ("restore_specs", (("prompt-local", {"backups": 2}),), "cpu"),
+                ("sample", "Prompt B"),
+                ("restore_global", 0, "cpu"),
+            ],
         )
 
     def test_enable_block_swap_compat_skips_swap_norms_for_legacy_models(self) -> None:
@@ -444,6 +568,23 @@ class RemainingMigrationPortsTest(unittest.TestCase):
             self.assertEqual(normalized[f"{prefix}.alpha"].item(), 2.0)
 
         self.assertNotIn("lora_unet_transformer_blocks_0_attention_qkv.lora_up.weight", normalized)
+
+    def test_qwen_sampling_lora_normalization_converts_native_module_paths(self) -> None:
+        trainer = QwenImageNetworkTrainer()
+        args = types.SimpleNamespace(network_module="networks.lora_qwen_image")
+        weights_sd = {
+            "transformer_blocks.0.attn.to_q.lora_down.weight": torch.ones(2, 4),
+            "transformer_blocks.0.attn.to_q.lora_up.weight": torch.ones(4, 2),
+            "transformer_blocks.0.attn.to_q.alpha": torch.tensor(2.0),
+        }
+
+        normalized = trainer.normalize_sampling_lora_weights(args, weights_sd, "dummy.safetensors")
+
+        prefix = "lora_unet_transformer_blocks_0_attn_to_q"
+        self.assertIn(f"{prefix}.lora_down.weight", normalized)
+        self.assertIn(f"{prefix}.lora_up.weight", normalized)
+        self.assertIn(f"{prefix}.alpha", normalized)
+        self.assertNotIn("transformer_blocks.0.attn.to_q.lora_down.weight", normalized)
 
     def test_zimage_post_save_checkpoint_hook_writes_comfy_checkpoint(self) -> None:
         trainer = ZImageNetworkTrainer()
