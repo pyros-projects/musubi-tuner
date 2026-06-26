@@ -11,6 +11,8 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
+from musubi_tuner.krea2.projector_bypass import load_projector_bypass_diff
+
 logger = logging.getLogger(__name__)
 
 
@@ -109,13 +111,54 @@ def convert_state_dict_to_comfy(weights_sd: dict[str, torch.Tensor]) -> dict[str
     return converted
 
 
-def convert_lora_to_comfy(input_path: str | os.PathLike, output_path: str | os.PathLike | None = None, verbose: bool = False) -> Path:
+def format_bypass_weight_token(weight: float) -> str:
+    """Return a compact filesystem-safe token for a bypass weight."""
+    value = f"{float(weight):g}"
+    value = value.replace("-", "m").replace("+", "").replace(".", "p")
+    return f"w{value}"
+
+
+def default_bypass_merged_comfy_path(comfy_output_path: str | os.PathLike, bypass_weight: float) -> Path:
+    output_path = Path(comfy_output_path)
+    return output_path.with_name(f"{output_path.stem}.bypassed.{format_bypass_weight_token(bypass_weight)}{output_path.suffix}")
+
+
+def _metadata_with_bypass_merge(
+    metadata: dict[str, str] | None,
+    *,
+    bypass_path: str | os.PathLike,
+    bypass_weight: float,
+) -> dict[str, str]:
+    merged_metadata = dict(metadata or {})
+    merged_metadata.update(
+        {
+            "ss_krea2_bypass_merged": "true",
+            "ss_krea2_bypass_merge_path": str(bypass_path),
+            "ss_krea2_bypass_merge_weight": f"{float(bypass_weight):g}",
+        }
+    )
+    return merged_metadata
+
+
+def convert_lora_to_comfy(
+    input_path: str | os.PathLike,
+    output_path: str | os.PathLike | None = None,
+    verbose: bool = False,
+    *,
+    bypass_merge_path: str | os.PathLike | None = None,
+    bypass_path: str | os.PathLike | None = None,
+    bypass_weight: float = 1.0,
+) -> Path:
     """Convert a saved Krea2 LoRA file to native ComfyUI format."""
     input_path = Path(input_path)
     if output_path is None:
         output_path = input_path.parent / f"{input_path.stem}.comfy{input_path.suffix}"
     else:
         output_path = Path(output_path)
+    if bypass_path is not None and bypass_merge_path is None:
+        bypass_merge_path = default_bypass_merged_comfy_path(output_path, bypass_weight)
+    if bypass_merge_path is not None and bypass_path is None:
+        raise ValueError("Krea2 bypass-merged Comfy export requires a bypass_path.")
 
     if verbose:
         logger.info("Loading Krea2 LoRA from %s", input_path)
@@ -129,6 +172,17 @@ def convert_lora_to_comfy(input_path: str | os.PathLike, output_path: str | os.P
     if verbose:
         logger.info("Saving Krea2 ComfyUI LoRA to %s (%d keys)", output_path, len(converted))
     save_file(converted, str(output_path), metadata=metadata)
+
+    if bypass_merge_path is not None and bypass_path is not None:
+        bypass_merge_path = Path(bypass_merge_path)
+        bypass_diff = load_projector_bypass_diff(bypass_path) * float(bypass_weight)
+        bypass_merged = dict(converted)
+        bypass_merged["diffusion_model.txtfusion.projector.diff"] = bypass_diff
+        bypass_metadata = _metadata_with_bypass_merge(metadata, bypass_path=bypass_path, bypass_weight=bypass_weight)
+        if verbose:
+            logger.info("Saving Krea2 bypass-merged ComfyUI LoRA to %s (%d keys)", bypass_merge_path, len(bypass_merged))
+        save_file(bypass_merged, str(bypass_merge_path), metadata=bypass_metadata)
+
     return output_path
 
 
@@ -143,9 +197,33 @@ def main() -> int:
         help="Path to save the converted LoRA (default: <input>.comfy.safetensors)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Print conversion details")
+    parser.add_argument("--bypass", type=str, default=None, help="Optional Krea2 projector bypass diff to merge into a second ComfyUI output")
+    parser.add_argument(
+        "--bypass-weight",
+        "--bypass_weight",
+        dest="bypass_weight",
+        type=float,
+        default=1.0,
+        help="Multiplier for --bypass when writing the bypass-merged ComfyUI output.",
+    )
+    parser.add_argument(
+        "--bypass-merge-output",
+        "--bypass_merge_output",
+        dest="bypass_merge_output",
+        type=str,
+        default=None,
+        help="Path for the bypass-merged ComfyUI output (default: <output>.bypassed.<weight>.safetensors).",
+    )
     args = parser.parse_args()
 
-    convert_lora_to_comfy(args.input, args.output, verbose=args.verbose)
+    convert_lora_to_comfy(
+        args.input,
+        args.output,
+        verbose=args.verbose,
+        bypass_merge_path=args.bypass_merge_output,
+        bypass_path=args.bypass,
+        bypass_weight=args.bypass_weight,
+    )
     return 0
 
 

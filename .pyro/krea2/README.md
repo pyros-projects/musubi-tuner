@@ -133,6 +133,40 @@ python src/musubi_tuner/krea2_generate_image.py \
   --bypass-weight 5
 ```
 
+To also write a single ComfyUI companion file that embeds the scaled bypass diff
+next to every saved LoRA checkpoint, enable `BYPASS_MERGE`:
+
+```bash
+NAME=msplits \
+BYPASS=/home/pyro/models/comfy/loras/krea/krea2filterbypass3.safetensors \
+BYPASS_WEIGHT=5 \
+BYPASS_MERGE=1 \
+.pyro/krea2/train.sh
+```
+
+For a checkpoint named:
+
+```text
+msplits-default-adamw8bit-step00000100.safetensors
+```
+
+the regular Comfy export remains:
+
+```text
+msplits-default-adamw8bit-step00000100.comfy.safetensors
+```
+
+and the merged export is:
+
+```text
+msplits-default-adamw8bit-step00000100.comfy.bypassed.w5.safetensors
+```
+
+Load the `.comfy.bypassed.w5.safetensors` file at strength `1.0` to reproduce
+the training-time bypass weight. In loaders that treat every tensor in the file
+as one adapter, lowering or raising the global LoRA strength can also scale the
+embedded bypass diff.
+
 ## Training Knobs
 
 Common overrides:

@@ -11,12 +11,14 @@ cd "$ROOT"
 #   NAME=msplits CACHE_DATASET=1 .pyro/krea2/train.sh
 #   NAME=msplits SAMPLE_WITH_OFFLOADING=0 .pyro/krea2/train.sh
 #   NAME=msplits BYPASS=/home/pyro/models/comfy/loras/krea/krea2filterbypass3.safetensors .pyro/krea2/train.sh
+#   NAME=msplits BYPASS=/home/pyro/models/comfy/loras/krea/krea2filterbypass3.safetensors BYPASS_MERGE=1 .pyro/krea2/train.sh
 DIT="${DIT:-/home/pyro/models/comfy/diffusion_models/krea2_raw_bf16.safetensors}"
 TENC="${TENC:-/home/pyro/models/comfy/text_encoders/qwen3vl_4b_bf16.safetensors}"
 VAE="${VAE:-/home/pyro/models/comfy/vae/qwen_image_vae.safetensors}"
 TURBO_LORA="${TURBO_LORA:-/home/pyro/models/comfy/loras/krea/krea2_turbo_lora_rank_64_bf16.safetensors}"
 BYPASS="${BYPASS:-}"
 BYPASS_WEIGHT="${BYPASS_WEIGHT:-5}"
+BYPASS_MERGE="${BYPASS_MERGE:-0}"
 
 NAME="${NAME:-cobra}"
 LORA_CONFIG="${LORA_CONFIG:-default}"   # default | preset-1 | preset-2 | preset-3 | custom
@@ -57,6 +59,19 @@ case "$SAMPLE_WITH_OFFLOADING" in
         ;;
     *)
         echo "SAMPLE_WITH_OFFLOADING must be 0/1, true/false, yes/no, or on/off: $SAMPLE_WITH_OFFLOADING" >&2
+        exit 1
+        ;;
+esac
+
+case "$BYPASS_MERGE" in
+    1|true|TRUE|yes|YES|on|ON)
+        BYPASS_MERGE_ENABLED=1
+        ;;
+    0|false|FALSE|no|NO|off|OFF)
+        BYPASS_MERGE_ENABLED=0
+        ;;
+    *)
+        echo "BYPASS_MERGE must be 0/1, true/false, yes/no, or on/off: $BYPASS_MERGE" >&2
         exit 1
         ;;
 esac
@@ -151,6 +166,10 @@ if [[ -n "$BYPASS" && ! -f "$BYPASS" ]]; then
     echo "Missing Krea2 bypass file: $BYPASS" >&2
     exit 1
 fi
+if (( BYPASS_MERGE_ENABLED )) && [[ -z "$BYPASS" ]]; then
+    echo "BYPASS_MERGE requires BYPASS to be set." >&2
+    exit 1
+fi
 
 BLOCK_SWAP_ARGS=()
 if (( BLOCKS_TO_SWAP > 0 )); then
@@ -170,6 +189,9 @@ fi
 BYPASS_ARGS=()
 if [[ -n "$BYPASS" ]]; then
     BYPASS_ARGS=(--bypass "$BYPASS" --bypass-weight "$BYPASS_WEIGHT")
+    if (( BYPASS_MERGE_ENABLED )); then
+        BYPASS_ARGS+=(--bypass-merge)
+    fi
 fi
 
 source .venv/bin/activate
@@ -178,7 +200,7 @@ echo "Krea2 training run: dataset=$NAME output=$RUN_NAME lora_config=$LORA_CONFI
 echo "Krea2 cache step: CACHE_DATASET=$CACHE_DATASET"
 echo "Krea2 sample decode offload: SAMPLE_WITH_OFFLOADING=$SAMPLE_WITH_OFFLOADING"
 if [[ -n "$BYPASS" ]]; then
-    echo "Krea2 projector bypass: BYPASS=$BYPASS BYPASS_WEIGHT=$BYPASS_WEIGHT"
+    echo "Krea2 projector bypass: BYPASS=$BYPASS BYPASS_WEIGHT=$BYPASS_WEIGHT BYPASS_MERGE=$BYPASS_MERGE"
 fi
 if ((${#NETWORK_ARGS_VALUES[@]} > 0)); then
     printf 'Krea2 LoRA network args:'

@@ -66,6 +66,11 @@ class Krea2NetworkTrainer(NetworkTrainer):
         # whole DiT (incl. norms) to fp8, which breaks. Require --fp8_scaled with --fp8_base.
         if args.fp8_base and not args.fp8_scaled:
             raise ValueError("Krea 2 fp8 supports only scaled fp8: pass --fp8_scaled together with --fp8_base.")
+        if getattr(args, "bypass_merge", False):
+            if not getattr(args, "bypass", None):
+                raise ValueError("Krea2 bypass-merged Comfy export requires --bypass.")
+            if not getattr(args, "convert_to_comfy", True):
+                raise ValueError("Krea2 bypass-merged Comfy export requires Comfy conversion; remove --no_convert_to_comfy.")
 
     def _default_sampling_lora_network_module_name(self) -> Optional[str]:
         return "musubi_tuner.networks.lora_krea2"
@@ -84,17 +89,36 @@ class Krea2NetworkTrainer(NetworkTrainer):
             return
 
         try:
-            from musubi_tuner.krea2.convert_lora_to_comfy import convert_lora_to_comfy
+            from musubi_tuner.krea2.convert_lora_to_comfy import convert_lora_to_comfy, default_bypass_merged_comfy_path
 
             comfy_ckpt_name = ckpt_name.replace(".safetensors", ".comfy.safetensors")
             comfy_ckpt_file = os.path.join(args.output_dir, comfy_ckpt_name)
-            convert_lora_to_comfy(ckpt_file, comfy_ckpt_file, verbose=False)
+            bypassed_ckpt_file = None
+            if getattr(args, "bypass_merge", False):
+                bypassed_ckpt_file = default_bypass_merged_comfy_path(comfy_ckpt_file, getattr(args, "bypass_weight", 1.0))
+            convert_lora_to_comfy(
+                ckpt_file,
+                comfy_ckpt_file,
+                verbose=False,
+                bypass_merge_path=bypassed_ckpt_file,
+                bypass_path=getattr(args, "bypass", None) if getattr(args, "bypass_merge", False) else None,
+                bypass_weight=getattr(args, "bypass_weight", 1.0),
+            )
             accelerator.print(f"Saved ComfyUI-compatible LoRA: {comfy_ckpt_file}")
+            if bypassed_ckpt_file is not None:
+                accelerator.print(f"Saved bypass-merged ComfyUI-compatible LoRA: {bypassed_ckpt_file}")
 
             if args.huggingface_repo_id is not None:
                 from musubi_tuner.utils import huggingface_utils
 
                 huggingface_utils.upload(args, comfy_ckpt_file, "/" + comfy_ckpt_name, force_sync_upload=force_sync_upload)
+                if bypassed_ckpt_file is not None:
+                    huggingface_utils.upload(
+                        args,
+                        str(bypassed_ckpt_file),
+                        "/" + os.path.basename(str(bypassed_ckpt_file)),
+                        force_sync_upload=force_sync_upload,
+                    )
 
             if not getattr(args, "save_original_lora", True) and os.path.exists(ckpt_file):
                 try:
@@ -448,6 +472,14 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         type=float,
         default=1.0,
         help="Multiplier for --bypass projector diff.",
+    )
+    parser.add_argument(
+        "--bypass-merge",
+        "--bypass_merge",
+        dest="bypass_merge",
+        action="store_true",
+        default=False,
+        help="Also export a ComfyUI checkpoint with the scaled Krea2 bypass diff merged into the file.",
     )
     return parser
 
