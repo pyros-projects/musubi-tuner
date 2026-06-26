@@ -1,6 +1,6 @@
 ## Context
 
-`ltx-musubi` already has local support for Krea2, Qwen Image, Z-Image, LTX2, sampling LoRA overlays, block-swap sampling overrides, Comfy LoRA export hooks, and dataset `caption_prefix`. The worktree is currently dirty from recent caption-prefix/gui changes, so this change must remain narrowly scoped and avoid unrelated cleanup.
+`ltx-musubi` already has local support for Krea2, Qwen Image, Z-Image, LTX2, sampling LoRA overlays, block-swap sampling overrides, Comfy LoRA export hooks, and dataset `caption_prefix`. The worktree was clean on branch `ltx-2` before this reference refresh on 2026-06-26, so this change should remain narrowly scoped and avoid unrelated cleanup.
 
 Boogu-Image 0.1 is a 10B Lumina2-style flow-matching image model family. The initial target is Boogu Image Base text-to-image LoRA training. The model uses:
 
@@ -10,7 +10,34 @@ Boogu-Image 0.1 is a 10B Lumina2-style flow-matching image model family. The ini
 - native flow time where `t=0` is pure noise, `t=1` is clean, and the transformer predicts `clean - noise`;
 - a Boogu time-shift schedule for sampling.
 
-ai-toolkit added Boogu Image and Boogu Image Edit in commit `60c1ac6` under `extensions_built_in/diffusion_models/boogu_image/`. That implementation is a useful reference because it trims the upstream Boogu repo into training-relevant transformer, attention, RoPE, pipeline, and scheduler helpers. It also documents an important constraint: ai-toolkit trains from the clean bf16 Boogu repo and applies its own quantization; the HF `-fp8` sibling ships torchao float8 `.bin` weights and is not directly used for training there.
+ai-toolkit added Boogu Image and Boogu Image Edit in commit `60c1ac6` under `extensions_built_in/diffusion_models/boogu_image/`. On 2026-06-26, `https://github.com/ostris/ai-toolkit` was cloned into a temp directory; current `main` resolved to commit `4a99ddabadbb27e5471d7023c9b429b5e0b39cb6` (`Fix breaking change with diffusers qwen image`). The Boogu directory had no diffs between `60c1ac6` and `4a99ddabadbb27e5471d7023c9b429b5e0b39cb6`, but the current commit is still the pinned reference so adjacent toolkit, network, quantization, and training fixes remain visible during the port.
+
+The relevant ai-toolkit files at that pinned commit are:
+
+- `extensions_built_in/diffusion_models/boogu_image/__init__.py`
+- `extensions_built_in/diffusion_models/boogu_image/boogu_image.py`
+- `extensions_built_in/diffusion_models/boogu_image/boogu_image_edit.py`
+- `extensions_built_in/diffusion_models/boogu_image/src/attention_processor.py`
+- `extensions_built_in/diffusion_models/boogu_image/src/block_lumina2.py`
+- `extensions_built_in/diffusion_models/boogu_image/src/embeddings.py`
+- `extensions_built_in/diffusion_models/boogu_image/src/pipeline.py`
+- `extensions_built_in/diffusion_models/boogu_image/src/rope.py`
+- `extensions_built_in/diffusion_models/boogu_image/src/transformer.py`
+
+That implementation is a useful reference because it trims the upstream Boogu repo into training-relevant transformer, attention, RoPE, pipeline, and scheduler helpers. It also documents an important constraint: ai-toolkit trains from the clean bf16 Boogu repo and applies its own quantization; the HF `-fp8` sibling ships torchao float8 `.bin` weights and is not directly used for training there.
+
+Official source inspection on 2026-06-26:
+
+- Official repository: `https://github.com/boogu-project/Boogu-Image`, cloned at commit `13853b77b6ba8dd393685231b662acf9f90730e9` (`misc: update inference scripts default res`).
+- Official Base model card/repo: `https://huggingface.co/Boogu/Boogu-Image-0.1-Base`, HF model SHA `e10ed9d3691f25416d439aeb4de33b22bf9039c1`.
+- The Base HF repo is a Diffusers `BooguImagePipeline` with subfolders `mllm`, `processor`, `scheduler`, `transformer`, and `vae`.
+- Text encoder classes are `Qwen3VLForConditionalGeneration` / `Qwen3VLProcessor`; the HF `mllm/config.json` reports `model_type = qwen3_vl`, text hidden size `4096`, and 36 text layers.
+- VAE class is Diffusers `AutoencoderKL`; the HF VAE config uses `latent_channels = 16`, `scaling_factor = 0.3611`, `shift_factor = 0.1159`, `sample_size = 1024`, and is described upstream as FLUX.1 VAE based.
+- Scheduler class is `FlowMatchEulerDiscreteScheduler`; the HF scheduler config uses `do_shift = true`, `dynamic_time_shift = false`, `time_shift_version = v1`, `seq_len = 4096`, and `num_train_timesteps = 1000`.
+- Transformer config uses `hidden_size = 3360`, `num_layers = 40`, `num_double_stream_layers = 8`, `num_refiner_layers = 2`, `num_attention_heads = 28`, `num_kv_heads = 7`, `patch_size = 2`, `in_channels = 16`, `instruction_feat_dim = 4096`, and `timestep_scale = 1000.0`.
+- Supported first-change scope remains Base text-to-image LoRA training. Official Base supports T2I at 1K/1.5K/2K with 25-50 steps and guidance around 2.0-5.0; Edit/TI2I and Turbo/DMD remain out of scope for this change.
+- Local model metadata check found `/home/pyro/models/comfy/diffusion_models/boogu_image_base_bf16.safetensors`, `/home/pyro/models/comfy/diffusion_models/boogu_image_edit_bf16.safetensors`, `/home/pyro/models/comfy/diffusion_models/boogu_image_edit_fp8_scaled.safetensors`, `/home/pyro/models/comfy/loras/boogu/boogu_image_turbo_lora_rank_128_bf16.safetensors`, `/home/pyro/models/comfy/vae/ae.safetensors`, `/home/pyro/models/comfy/vae/flux1_vae_bf16.safetensors`, `/home/pyro/models/comfy/text_encoders/qwen3vl_8b_fp8_scaled.safetensors`, and `/home/pyro/models/qwen3-vl-4b` for processor/tokenizer assets.
+- GPU/model-load smoke was later validated by the local `lucy-adamw8bit` run on 2026-06-26. That run used the Comfy Boogu Base transformer, FLUX/Boogu VAE, Comfy `qwen3vl_8b_fp8_scaled.safetensors` text encoder with `/home/pyro/models/qwen3-vl-4b` processor assets, and the Boogu turbo LoRA for snapshot sampling. It completed training, snapshot sampling, checkpoint save, state save, and Comfy-format LoRA export under `/home/pyro/models/_out/boogu/lucy-adamw8bit`.
 
 ## Goals / Non-Goals
 
@@ -46,7 +73,7 @@ Alternatives considered:
 
 ### Decision: Use ai-toolkit's Boogu port as the main implementation reference
 
-Port the training-relevant files from ai-toolkit's `boogu_image/src` and adapt them to Musubi's script/trainer layout. Use the official Boogu repository to cross-check model architecture, scheduler semantics, and VAE/text encoder expectations.
+Port the training-relevant files from ai-toolkit's `boogu_image/src` at pinned commit `4a99ddabadbb27e5471d7023c9b429b5e0b39cb6` and adapt them to Musubi's script/trainer layout. Use ai-toolkit's current adjacent trainer/network/quantization code at the same commit for implementation clues, and use the official Boogu repository to cross-check model architecture, scheduler semantics, and VAE/text encoder expectations.
 
 Alternatives considered:
 
@@ -146,9 +173,9 @@ Alternatives considered:
 
 Rollback is file-level: remove the Boogu package/wrappers/tests/docs/examples and revert the small shared architecture/trainer registrations. The change should not rewrite existing Krea2/Qwen/LTX paths.
 
-## Open Questions
+## Resolved Questions And Follow-ups
 
-- Which local Boogu model files should the `.pyro/boogu` config prefer once Pyro downloads/converts them: HF repo paths, `/home/pyro/models/comfy`, or a dedicated `/home/pyro/models/boogu` layout?
-- Should the first fp8 path use Musubi's scaled fp8 storage pattern or a narrower "selected Linear only" cast list derived from ai-toolkit/Boogu module names?
-- Do current Comfy Boogu LoRA loaders expect `diffusion_model.*` keys exactly, or a slightly different prefix for this model?
-- Should `boogu_image_edit` be a separate follow-up OpenSpec change or a second phase inside this one after Base passes smoke tests?
+- Local Boogu examples prefer the existing `/home/pyro/models/comfy` layout plus `/home/pyro/models/qwen3-vl-4b` processor assets, because the successful `lucy-adamw8bit` smoke used those paths directly.
+- The first fp8 path uses Musubi's scaled fp8 loading/monkey-patch pattern with Boogu-specific target/exclude lists. The `lucy-adamw8bit` smoke validated fp8 base loading together with trainable LoRA overlays and sampling LoRA runtime overlays.
+- Converted LoRA checkpoints use native Boogu `diffusion_model.*` keys. The smoke produced `.comfy.safetensors` exports with the expected metadata and tensor layout; a live ComfyUI import/render can be a follow-up validation if needed, but is not required for this OpenSpec change.
+- Boogu Image Edit/TI2I and Turbo/DMD training remain separate follow-up work outside this Base T2I LoRA change.

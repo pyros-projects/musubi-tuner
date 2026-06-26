@@ -23,6 +23,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_KREA2,
     ARCHITECTURE_LTX2,
     ARCHITECTURE_Z_IMAGE,
+    ARCHITECTURE_BOOGU_IMAGE,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,7 @@ ARCH_LTX2 = "LTX2"
 
 ARCH_HUNYUAN_VIDEO_1_5 = "hunyuan-video-1.5"
 ARCH_Z_IMAGE = "Z-Image"
+ARCH_BOOGU_IMAGE = "Boogu-Image"
 
 ADAPTER_LORA = "lora"
 
@@ -110,6 +112,7 @@ IMPL_LTX2 = "https://github.com/Lightricks/LTX-Video"
 
 IMPL_HUNYUAN_VIDEO_1_5 = "https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5"
 IMPL_Z_IMAGE = "https://github.com/Tongyi-MAI/Z-Image"
+IMPL_BOOGU_IMAGE = "https://github.com/ostris/ai-toolkit"
 
 PRED_TYPE_EPSILON = "epsilon"
 # PRED_TYPE_V = "v"
@@ -227,6 +230,9 @@ def build_metadata(
     elif architecture == ARCHITECTURE_Z_IMAGE:
         arch = ARCH_Z_IMAGE
         impl = IMPL_Z_IMAGE
+    elif architecture == ARCHITECTURE_BOOGU_IMAGE:
+        arch = ARCH_BOOGU_IMAGE
+        impl = IMPL_BOOGU_IMAGE
     else:
         raise ValueError(f"Unknown architecture: {architecture}")
 

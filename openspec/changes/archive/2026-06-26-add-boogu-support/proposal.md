@@ -32,4 +32,4 @@ Boogu-Image is a new Apache-2.0 open-weight image model with strong claims aroun
 - Updates shared dataset/cache glue in `src/musubi_tuner/dataset/image_video_dataset.py`.
 - Updates shared trainer/parser glue in `src/musubi_tuner/hv_train_network.py` only where Boogu needs architecture registration, timestep sampling, or save hooks.
 - May require dependency validation for Qwen3-VL, Diffusers AutoencoderKL, and attention helpers already used by Krea2/Qwen paths.
-- Uses ai-toolkit commit `60c1ac6` and the Boogu official repository/model card as implementation references, but ports only the training-relevant pieces needed for LTX Musubi.
+- Uses `https://github.com/ostris/ai-toolkit` commit `4a99ddabadbb27e5471d7023c9b429b5e0b39cb6` as the pinned ai-toolkit reference, plus the Boogu official repository/model card for cross-checking. Boogu originally landed in ai-toolkit commit `60c1ac6`; the Boogu files were unchanged between `60c1ac6` and `4a99ddabadbb27e5471d7023c9b429b5e0b39cb6` when inspected on 2026-06-26.

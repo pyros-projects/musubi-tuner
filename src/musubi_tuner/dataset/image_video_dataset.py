@@ -99,6 +99,8 @@ ARCHITECTURE_HUNYUAN_VIDEO_1_5 = "hv15"
 ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL = "hunyuan_video_1_5"
 ARCHITECTURE_Z_IMAGE = "zi"
 ARCHITECTURE_Z_IMAGE_FULL = "z_image"
+ARCHITECTURE_BOOGU_IMAGE = "bog"
+ARCHITECTURE_BOOGU_IMAGE_FULL = "boogu_image"
 
 
 def glob_images(directory, base="*", caption_extension=None):
@@ -427,6 +429,17 @@ def save_latent_cache_krea2(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
 
 
+def save_latent_cache_boogu_image(item_info: ItemInfo, latent: torch.Tensor):
+    """Boogu Image Base architecture. Single image FLUX-compatible VAE latents."""
+    assert latent.dim() == 3, "latent should be 3D tensor (channel, height, width)"
+
+    _, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_BOOGU_IMAGE_FULL)
+
+
 def save_latent_cache_kandinsky5(
     item_info: ItemInfo,
     latent: torch.Tensor,
@@ -656,6 +669,21 @@ def save_text_encoder_output_cache_krea2(item_info: ItemInfo, embed: torch.Tenso
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
 
 
+def save_text_encoder_output_cache_boogu_image(item_info: ItemInfo, embed: torch.Tensor):
+    """Boogu Image instruction feature cache.
+
+    embed is the natural-length Qwen3-VL instruction feature tensor:
+    (valid_len, hidden).
+    """
+    assert embed.dim() == 2, "embed should be 2D tensor (valid_len, hidden)"
+
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    sd[f"varlen_boogu_instruction_embed_{dtype_str}"] = embed.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_BOOGU_IMAGE_FULL)
+
+
 def save_text_encoder_output_cache_kandinsky5(
     item_info: ItemInfo, text_embeds: torch.Tensor, pooled_embed: torch.Tensor, attention_mask: torch.Tensor
 ):
@@ -739,6 +767,7 @@ class BucketSelector:
     RESOLUTION_STEPS_KANDINSKY5 = 16
     RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5 = 16
     RESOLUTION_STEPS_Z_IMAGE = 16
+    RESOLUTION_STEPS_BOOGU_IMAGE = 16
 
     ARCHITECTURE_STEPS_MAP = {
         ARCHITECTURE_HUNYUAN_VIDEO: RESOLUTION_STEPS_HUNYUAN,
@@ -756,6 +785,7 @@ class BucketSelector:
         ARCHITECTURE_KANDINSKY5: RESOLUTION_STEPS_KANDINSKY5,
         ARCHITECTURE_HUNYUAN_VIDEO_1_5: RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5,
         ARCHITECTURE_Z_IMAGE: RESOLUTION_STEPS_Z_IMAGE,
+        ARCHITECTURE_BOOGU_IMAGE: RESOLUTION_STEPS_BOOGU_IMAGE,
     }
 
     def __init__(
