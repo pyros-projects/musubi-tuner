@@ -9,12 +9,12 @@ Memory-efficient inference is supported for the DiT: dynamic scaled fp8
 SingleStreamBlocks). Trained LoRA(s) are merged into the base weights at load time
 (the only correct route under fp8).
 
-Memory model: the DiT stays resident on the GPU (with block swap as needed), while the
-Text Encoder and VAE shuttle between CPU and GPU. The encoder is kept on CPU and moved
-to the GPU only to encode each prompt (use ``--text_encoder_cpu`` to encode on CPU when
-even that does not fit); the VAE is kept on CPU and moved to the GPU only to decode. So
-on a 24GB card the headroom for encoding/decoding comes from running the DiT under fp8
-and/or block swap, rather than from evacuating the ~24GB DiT to host RAM.
+Memory model: by default the DiT stays resident on the GPU (with block swap as needed),
+while the Text Encoder and VAE shuttle between CPU and GPU. The encoder is kept on CPU
+and moved to the GPU only to encode each prompt (use ``--text_encoder_cpu`` to encode on
+CPU when even that does not fit); the VAE is kept on CPU and moved to the GPU only to
+decode. ``--sample_with_offloading`` also moves the DiT to CPU before VAE decode, trading
+latency for lower decode-time VRAM.
 
 Three input modes (mirroring zimage_generate_image.py):
   * single prompt — positional ``prompt`` argument
@@ -154,7 +154,8 @@ def generate(args: argparse.Namespace, dit, ae, encoder, device: str, dtype: tor
 
     The DiT (``dit``) and VAE (``ae``) are reused across calls. Per call the encoder is shuttled
     to ``te_device`` for the encode and the VAE is shuttled to the GPU for the decode (both inside
-    the helpers), while the DiT stays resident.
+    the helpers). With ``--sample_with_offloading``, the DiT is offloaded before decode and restored
+    afterward so the next prompt can denoise.
 
     The base seed is resolved here: if ``args.seed`` is None a random one is drawn (and written
     back to ``args.seed`` so the caller can use it for file names); image *i* uses ``base + i``.
@@ -190,6 +191,8 @@ def generate(args: argparse.Namespace, dit, ae, encoder, device: str, dtype: tor
         y1=args.y1,
         y2=args.y2,
         mu=args.mu,
+        offload_transformer_for_decode=bool(getattr(args, "sample_with_offloading", False)),
+        restore_transformer_after_decode=bool(getattr(args, "sample_with_offloading", False)),
     )
     return images
 
@@ -306,6 +309,12 @@ def parse_args() -> argparse.Namespace:
         "--use_pinned_memory_for_block_swap",
         action="store_true",
         help="use pinned CPU memory for block swap (faster H2D copies, more host RAM)",
+    )
+    parser.add_argument(
+        "--sample_with_offloading",
+        action="store_true",
+        help="move the DiT to CPU before VAE decode, then restore it before the next prompt. "
+        "This lowers decode-time VRAM at the cost of extra transfer latency.",
     )
     parser.add_argument(
         "--save_path",

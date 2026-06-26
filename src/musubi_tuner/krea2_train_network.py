@@ -280,11 +280,20 @@ class Krea2NetworkTrainer(NetworkTrainer):
         latent = rearrange(img, "b (h w) (c ph pw) -> b c (h ph) (w pw)", ph=patch, pw=patch, h=lat_h // patch, w=lat_w // patch)
         latent = latent.unsqueeze(2)  # (1, C, 1, H, W)
 
-        vae.to(device)
-        vae.eval()
-        with torch.no_grad():
-            pixels = vae.decode_to_pixels(latent.to(vae.dtype))  # (1, C, H, W) in [0, 1]
-        vae.to("cpu")
+        with krea2_sampling.transformer_decode_offload(
+            model,
+            device,
+            enabled=bool(getattr(args, "sample_with_offloading", False)),
+            restore_after=False,
+            clean_fn=clean_memory_on_device,
+        ):
+            vae.to(device)
+            vae.eval()
+            try:
+                with torch.no_grad():
+                    pixels = vae.decode_to_pixels(latent.to(vae.dtype))  # (1, C, H, W) in [0, 1]
+            finally:
+                vae.to("cpu")
         clean_memory_on_device(device)
 
         pixels = pixels.unsqueeze(2).to(torch.float32).cpu()  # (1, C, 1, H, W) for the grid saver

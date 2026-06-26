@@ -5,6 +5,8 @@ Ported verbatim from references/Krea2/sampling.py.
 
 import gc
 import math
+from contextlib import contextmanager
+from collections.abc import Callable
 
 import torch
 from einops import rearrange, repeat
@@ -80,6 +82,71 @@ def timesteps(seq_len, steps, x1, x2, y1=0.5, y2=1.15, sigma=1.0, mu=None):
     return ts.tolist()
 
 
+def _clean_decode_device(device, clean_fn: Callable | None = None):
+    if clean_fn is not None:
+        clean_fn(torch.device(device))
+        return
+
+    gc.collect()
+    device = torch.device(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif device.type == "xpu" and hasattr(torch, "xpu"):
+        torch.xpu.empty_cache()
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.empty_cache()
+
+
+def _move_transformer_for_decode(transformer, device):
+    device = torch.device(device)
+    if device.type == "cpu":
+        transformer.to(device)
+    elif hasattr(transformer, "move_to_device_except_swap_blocks"):
+        transformer.move_to_device_except_swap_blocks(device)
+    else:
+        transformer.to(device)
+
+
+@contextmanager
+def transformer_decode_offload(
+    transformer,
+    device,
+    *,
+    enabled: bool,
+    restore_after: bool,
+    clean_fn: Callable | None = None,
+):
+    """Temporarily move the Krea2 transformer away before VAE decode.
+
+    Training snapshots use ``restore_after=False`` because the shared sampling loop already
+    reloads the transformer before the next prompt and restores the training device afterward.
+    Standalone generation uses ``restore_after=True`` so the next prompt can denoise without
+    relying on an outer trainer loop.
+    """
+    if not enabled:
+        yield False
+        return
+
+    compute_device = torch.device(device)
+    if hasattr(transformer, "_wait_for_pending_block_swaps"):
+        transformer._wait_for_pending_block_swaps()
+    _move_transformer_for_decode(transformer, torch.device("cpu"))
+    _clean_decode_device(compute_device, clean_fn)
+
+    try:
+        yield True
+    finally:
+        if restore_after:
+            _move_transformer_for_decode(transformer, compute_device)
+            if (
+                compute_device.type != "cpu"
+                and getattr(transformer, "blocks_to_swap", 0)
+                and hasattr(transformer, "prepare_block_swap_before_forward")
+            ):
+                transformer.prepare_block_swap_before_forward()
+            _clean_decode_device(compute_device, clean_fn)
+
+
 @torch.no_grad()
 def encode_prompts(encoder, prompts, negative_prompts=None, *, cfg=True):
     """Encode prompts (and optional negatives) into gathered varlen text embeddings.
@@ -124,6 +191,9 @@ def sample(
     y1=0.5,
     y2=1.15,
     mu=None,
+    offload_transformer_for_decode=False,
+    restore_transformer_after_decode=False,
+    clean_fn: Callable | None = None,
 ):
     """Denoise pre-encoded text embeddings to images: euler+CFG denoise -> decode.
 
@@ -131,13 +201,12 @@ def sample(
     encoder can be freed before this runs. CFG is enabled when ``cfg_scale > 1`` and an
     unconditional embedding (``untxt``) was provided.
 
-    The DiT (``model``) stays resident on its device for the whole call — it is never moved
-    to CPU. The VAE is kept on CPU and moved to the latent's device only for the final decode,
-    then moved back to CPU before returning. So the only VRAM the decode adds on top of the
-    resident DiT is the VAE plus its transient activations; that headroom is expected to come
-    from running the DiT under fp8 and/or block swap (moving the ~24GB DiT to CPU instead would
-    only shift the pressure onto host RAM). Keeping the DiT in place lets the caller reuse it
-    for the next prompt without reloading.
+    By default the DiT (``model``) stays resident on its device for the whole call. When
+    ``offload_transformer_for_decode`` is enabled, it is moved to CPU after denoising and
+    before the VAE moves to the latent device, reducing decode-time VRAM at the cost of extra
+    transfer latency. ``restore_transformer_after_decode`` controls whether this function moves
+    the DiT back for the next prompt, which standalone generation needs and the training sampler
+    usually delegates to its outer offload loop.
     """
     patch = model.config.patch
 
@@ -214,11 +283,19 @@ def sample(
     )
     # decode_to_pixels denormalizes (*std + mean), decodes, drops the frame axis, returns [0, 1].
     # Move the VAE to the latent's device for decode (it is kept on CPU otherwise to save VRAM),
-    # then move it back to CPU so the next generation starts with the decode VRAM freed. The DiT
-    # stays put on its device; the decode is expected to fit alongside it via fp8 / block swap.
-    ae = ae.to(img.device)
-    pixels = ae.decode_to_pixels(img.to(torch.bfloat16))
-    ae = ae.to("cpu")
+    # then move it back to CPU so the next generation starts with the decode VRAM freed.
+    with transformer_decode_offload(
+        model,
+        img.device,
+        enabled=offload_transformer_for_decode,
+        restore_after=restore_transformer_after_decode,
+        clean_fn=clean_fn,
+    ):
+        ae = ae.to(img.device)
+        try:
+            pixels = ae.decode_to_pixels(img.to(torch.bfloat16))
+        finally:
+            ae = ae.to("cpu")
     pixels = rearrange(pixels * 255.0, "b c h w -> b h w c").cpu().byte().numpy()
     gc.collect()
     if torch.cuda.is_available():
