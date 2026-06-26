@@ -97,6 +97,35 @@ def test_decode_offload_context_moves_transformer_before_vae_decode():
     ]
 
 
+def test_decode_offload_context_synchronizes_cuda_before_custom_cleanup(monkeypatch):
+    events: list[str] = []
+    transformer = _FakeTransformer(events, blocks_to_swap=2)
+
+    monkeypatch.setattr(krea2_sampling.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        krea2_sampling.torch.cuda,
+        "synchronize",
+        lambda device=None: events.append(f"sync:{torch.device(device).type}"),
+    )
+
+    with krea2_sampling.transformer_decode_offload(
+        transformer,
+        torch.device("cuda"),
+        enabled=True,
+        restore_after=False,
+        clean_fn=_record_clean(events),
+    ):
+        events.append("decode")
+
+    assert events == [
+        "transformer:wait",
+        "transformer:to:cpu",
+        "sync:cuda",
+        "clean:cuda",
+        "decode",
+    ]
+
+
 def test_decode_offload_context_can_restore_transformer_after_success():
     events: list[str] = []
     transformer = _FakeTransformer(events, blocks_to_swap=2)

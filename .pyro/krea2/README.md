@@ -105,6 +105,34 @@ You can also append extra network args to a preset:
 NAME=msplits LORA_CONFIG=preset-1 NETWORK_ARGS="verbose=True" .pyro/krea2/train.sh
 ```
 
+## Krea2 Projector Bypass
+
+Some Krea2 filter-bypass files are direct `txtfusion.projector` diffs, not
+normal LoRA rank-pair checkpoints. Use `BYPASS` for those files instead of
+`--base_weights`, `--network_weights`, or sampling LoRA args.
+
+```bash
+NAME=msplits \
+BYPASS=/home/pyro/models/comfy/loras/krea/krea2filterbypass3.safetensors \
+BYPASS_WEIGHT=5 \
+.pyro/krea2/train.sh
+```
+
+`BYPASS` is disabled by default. When enabled, training and in-training
+snapshots use the same patched Krea2 transformer. LoRAs trained with a bypass
+should normally be sampled and inferred with the same bypass file and weight:
+
+```bash
+python src/musubi_tuner/krea2_generate_image.py \
+  "a woman doing a cheststand pose" \
+  --dit "$DIT" \
+  --vae "$VAE" \
+  --text_encoder "$TENC" \
+  --save_path /tmp/krea2 \
+  --bypass /home/pyro/models/comfy/loras/krea/krea2filterbypass3.safetensors \
+  --bypass-weight 5
+```
+
 ## Training Knobs
 
 Common overrides:

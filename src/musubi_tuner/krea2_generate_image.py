@@ -46,6 +46,7 @@ from safetensors.torch import load_file
 
 from musubi_tuner.krea2 import krea2_utils
 from musubi_tuner.krea2.krea2_sampling import encode_prompts, sample
+from musubi_tuner.krea2.projector_bypass import apply_projector_bypass_from_file
 from musubi_tuner.krea2.krea2_utils import single_mmdit_large_wide
 from musubi_tuner.qwen_image import qwen_image_utils
 
@@ -95,6 +96,8 @@ def build_pipeline(
     fp8_scaled: bool = False,
     blocks_to_swap: int = 0,
     use_pinned_memory_for_block_swap: bool = False,
+    bypass: str | None = None,
+    bypass_weight: float = 1.0,
 ):
     """Build the autoencoder and MMDiT and load weights (the text encoder is loaded separately).
 
@@ -128,6 +131,8 @@ def build_pipeline(
         lora_weights=lora_sds,
         lora_multipliers=lora_multipliers,
     )
+    if bypass:
+        apply_projector_bypass_from_file(mmdit, bypass, bypass_weight)
 
     # Freeze BEFORE enabling block swap: the H2D-only offloader (LoRAStreamOffloader) asserts the
     # streamed base weights are frozen (requires_grad=False) at construction time.
@@ -317,6 +322,20 @@ def parse_args() -> argparse.Namespace:
         "This lowers decode-time VRAM at the cost of extra transfer latency.",
     )
     parser.add_argument(
+        "--bypass",
+        type=str,
+        default=None,
+        help="Krea2 txtfusion projector bypass safetensors path. Applies a direct projector diff before denoising.",
+    )
+    parser.add_argument(
+        "--bypass-weight",
+        "--bypass_weight",
+        dest="bypass_weight",
+        type=float,
+        default=1.0,
+        help="Multiplier for --bypass projector diff.",
+    )
+    parser.add_argument(
         "--save_path",
         type=str,
         required=True,
@@ -390,6 +409,8 @@ def main():
         fp8_scaled=args.fp8_scaled,
         blocks_to_swap=args.blocks_to_swap,
         use_pinned_memory_for_block_swap=args.use_pinned_memory_for_block_swap,
+        bypass=args.bypass,
+        bypass_weight=args.bypass_weight,
     )
 
     if args.from_file:

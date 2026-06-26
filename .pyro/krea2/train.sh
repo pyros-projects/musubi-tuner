@@ -10,10 +10,13 @@ cd "$ROOT"
 #   NAME=msplits LORA_CONFIG=preset-1 .pyro/krea2/train.sh
 #   NAME=msplits CACHE_DATASET=1 .pyro/krea2/train.sh
 #   NAME=msplits SAMPLE_WITH_OFFLOADING=0 .pyro/krea2/train.sh
+#   NAME=msplits BYPASS=/home/pyro/models/comfy/loras/krea/krea2filterbypass3.safetensors .pyro/krea2/train.sh
 DIT="${DIT:-/home/pyro/models/comfy/diffusion_models/krea2_raw_bf16.safetensors}"
 TENC="${TENC:-/home/pyro/models/comfy/text_encoders/qwen3vl_4b_bf16.safetensors}"
 VAE="${VAE:-/home/pyro/models/comfy/vae/qwen_image_vae.safetensors}"
 TURBO_LORA="${TURBO_LORA:-/home/pyro/models/comfy/loras/krea/krea2_turbo_lora_rank_64_bf16.safetensors}"
+BYPASS="${BYPASS:-}"
+BYPASS_WEIGHT="${BYPASS_WEIGHT:-5}"
 
 NAME="${NAME:-cobra}"
 LORA_CONFIG="${LORA_CONFIG:-default}"   # default | preset-1 | preset-2 | preset-3 | custom
@@ -144,6 +147,11 @@ for path in "$DIT" "$TENC" "$VAE" "$TURBO_LORA" "$DATASET_TOML" "$PROMPT_TOML"; 
     fi
 done
 
+if [[ -n "$BYPASS" && ! -f "$BYPASS" ]]; then
+    echo "Missing Krea2 bypass file: $BYPASS" >&2
+    exit 1
+fi
+
 BLOCK_SWAP_ARGS=()
 if (( BLOCKS_TO_SWAP > 0 )); then
     BLOCK_SWAP_ARGS=(--blocks_to_swap "$BLOCKS_TO_SWAP" --use_pinned_memory_for_block_swap)
@@ -159,11 +167,19 @@ if (( SAMPLE_WITH_OFFLOADING_ENABLED )); then
     SAMPLE_OFFLOAD_ARGS=(--sample_with_offloading)
 fi
 
+BYPASS_ARGS=()
+if [[ -n "$BYPASS" ]]; then
+    BYPASS_ARGS=(--bypass "$BYPASS" --bypass-weight "$BYPASS_WEIGHT")
+fi
+
 source .venv/bin/activate
 
 echo "Krea2 training run: dataset=$NAME output=$RUN_NAME lora_config=$LORA_CONFIG"
 echo "Krea2 cache step: CACHE_DATASET=$CACHE_DATASET"
 echo "Krea2 sample decode offload: SAMPLE_WITH_OFFLOADING=$SAMPLE_WITH_OFFLOADING"
+if [[ -n "$BYPASS" ]]; then
+    echo "Krea2 projector bypass: BYPASS=$BYPASS BYPASS_WEIGHT=$BYPASS_WEIGHT"
+fi
 if ((${#NETWORK_ARGS_VALUES[@]} > 0)); then
     printf 'Krea2 LoRA network args:'
     printf ' %q' "${NETWORK_ARGS_VALUES[@]}"
@@ -196,6 +212,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
     --max_data_loader_n_workers 2 --persistent_data_loader_workers \
     --network_module networks.lora_krea2 --network_dim "$NETWORK_DIM" --network_alpha "$NETWORK_ALPHA" \
     "${NETWORK_ARGS_CLI[@]}" \
+    "${BYPASS_ARGS[@]}" \
     --seed 42 \
     --save_every_n_steps "$SAVE_EVERY" --max_train_steps "$MAX_STEPS" \
     --save_state --save_last_n_steps_state 2 --autoresume \

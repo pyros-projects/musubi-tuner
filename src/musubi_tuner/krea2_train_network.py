@@ -31,6 +31,7 @@ from musubi_tuner.hv_train_network import (
 )
 from musubi_tuner.krea2 import krea2_utils
 from musubi_tuner.krea2 import krea2_sampling
+from musubi_tuner.krea2.projector_bypass import apply_projector_bypass_from_file
 from musubi_tuner.qwen_image import qwen_image_utils
 from musubi_tuner.utils import model_utils
 
@@ -68,6 +69,14 @@ class Krea2NetworkTrainer(NetworkTrainer):
 
     def _default_sampling_lora_network_module_name(self) -> Optional[str]:
         return "musubi_tuner.networks.lora_krea2"
+
+    def get_checkpoint_metadata(self, args: argparse.Namespace) -> dict[str, str]:
+        if not getattr(args, "bypass", None):
+            return {}
+        return {
+            "ss_krea2_bypass_path": str(args.bypass),
+            "ss_krea2_bypass_weight": f"{float(getattr(args, 'bypass_weight', 1.0)):g}",
+        }
 
     def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
         """Convert saved Krea2 LoRA checkpoints to native ComfyUI format."""
@@ -327,6 +336,8 @@ class Krea2NetworkTrainer(NetworkTrainer):
             attn_mode=attn_mode,
             split_attn=split_attn,
         )
+        if getattr(args, "bypass", None):
+            apply_projector_bypass_from_file(model, args.bypass, getattr(args, "bypass_weight", 1.0))
         return model
 
     def compile_transformer(self, args, transformer):
@@ -423,6 +434,20 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         type=str,
         default=None,
         help="Qwen3-VL-4B text encoder safetensors path (only needed for sample generation during training)",
+    )
+    parser.add_argument(
+        "--bypass",
+        type=str,
+        default=None,
+        help="Krea2 txtfusion projector bypass safetensors path. Applies a direct projector diff before training/sampling.",
+    )
+    parser.add_argument(
+        "--bypass-weight",
+        "--bypass_weight",
+        dest="bypass_weight",
+        type=float,
+        default=1.0,
+        help="Multiplier for --bypass projector diff.",
     )
     return parser
 

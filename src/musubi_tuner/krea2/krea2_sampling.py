@@ -83,12 +83,19 @@ def timesteps(seq_len, steps, x1, x2, y1=0.5, y2=1.15, sigma=1.0, mu=None):
 
 
 def _clean_decode_device(device, clean_fn: Callable | None = None):
+    device = torch.device(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    elif device.type == "xpu" and hasattr(torch, "xpu"):
+        torch.xpu.synchronize()
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.synchronize()
+
     if clean_fn is not None:
-        clean_fn(torch.device(device))
+        clean_fn(device)
         return
 
     gc.collect()
-    device = torch.device(device)
     if device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.empty_cache()
     elif device.type == "xpu" and hasattr(torch, "xpu"):
