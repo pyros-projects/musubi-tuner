@@ -26,6 +26,11 @@ SYSTEM_PROMPT_T2I = (
     "You are a helpful assistant that generates high-quality images based on user "
     "instructions. The instructions are as follows."
 )
+SYSTEM_PROMPT_DROP = (
+    "Describe the key features of the input image (color, shape, size, texture, objects, background), "
+    "then explain how the user's text instruction should alter or modify the image. Generate a new image "
+    "that meets the user's requirements while maintaining consistency with the original input where appropriate."
+)
 QWEN3_VL_8B_INSTRUCT_REPO_ID = "Qwen/Qwen3-VL-8B-Instruct"
 
 
@@ -41,6 +46,20 @@ class BooguTextEncoderLoadPlan:
 def build_boogu_t2i_messages(prompt: str) -> list[dict]:
     return [
         {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_T2I}]},
+        {"role": "user", "content": [{"type": "text", "text": prompt}]},
+    ]
+
+
+def build_boogu_edit_messages(prompt: str, image) -> list[dict]:
+    return [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DROP}]},
+        {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]},
+    ]
+
+
+def build_boogu_drop_messages(prompt: str = "") -> list[dict]:
+    return [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT_DROP}]},
         {"role": "user", "content": [{"type": "text", "text": prompt}]},
     ]
 

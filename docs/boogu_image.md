@@ -14,6 +14,7 @@ Supported now:
 - Cached FLUX-compatible AutoencoderKL latents.
 - Cached natural-length Qwen3-VL instruction features.
 - In-training preview sampling from cached prompt embeddings.
+- Edit-style preview sampling with pre-cached sample input images.
 - ComfyUI companion LoRA export as `*.comfy.safetensors`.
 - Scaled fp8 transformer loading from a bf16 `.safetensors` checkpoint.
 - Turbo LoRA preview attachment for the local smoke helper.
@@ -85,6 +86,52 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 ```
 
 `--fp8_base --fp8_scaled` must be used together. Plain fp8 is rejected because norms and output-sensitive modules must stay in a safe dtype.
+
+### Sample Prompt Input Images
+
+Boogu sample prompt TOML can attach one optional edit input image for preview sampling. Use `input_image` under `[prompt]` to apply it to every subset, or under an individual `[[prompt.subset]]` to override it for that prompt. Relative paths resolve from the prompt TOML directory.
+
+```toml
+[prompt]
+width = 1024
+height = 1024
+sample_steps = 4
+cfg_scale = 1.0
+guidance_scale = 1.0
+boogu_sampler = "dmd"
+input_image = "source.png"
+
+[[prompt.subset]]
+prompt = "make the person do a straight chest stand"
+
+[[prompt.subset]]
+prompt = "make the person do a side plank"
+input_image = "alternate-source.png"
+```
+
+For Flux/Klein-style prompt files, a string or single-item `control_image_path` is accepted as a compatibility alias when `input_image` is not present. Multiple input images are rejected; Boogu preview sampling currently supports one source image per prompt.
+
+Input images are pre-cached before transformer loading: Qwen3-VL receives the resized image for positive instruction features, and the VAE reference latent is reused during snapshot denoising. Dataset training batches remain output-only.
+
+Use `boogu_sampler = "dmd"` for turbo edit preview sampling. It follows Boogu's few-step DMD path and requires the no-CFG shape `cfg_scale = 1.0` with `guidance_scale = 1.0`. Omit `boogu_sampler` for the default flow sampler used by the base/edit checkpoints.
+
+### Standalone Prompt File Inference
+
+Use `boogu_image_generate_image.py` to run a sample prompt file without starting a training job. This uses the same prompt/image cache and preview sampler as training.
+
+```bash
+python src/musubi_tuner/boogu_image_generate_image.py \
+  --dit /home/pyro/models/comfy/diffusion_models/boogu_image_edit_turbo_bf16.safetensors \
+  --vae /home/pyro/models/comfy/vae/ae.safetensors \
+  --text_encoder /home/pyro/models/comfy/text_encoders/qwen3vl_8b_fp8_scaled.safetensors \
+  --processor /home/pyro/models/qwen3-vl-4b \
+  --sample_prompts .pyro/boogu/cfg/p_test.toml \
+  --output_dir /home/pyro/models/_out/boogu/yuna_test \
+  --output_name yuna_test \
+  --mixed_precision bf16 --sdpa --fp8_base --fp8_scaled
+```
+
+Outputs are written under `<output_dir>/sample/`.
 
 ## LoRA Export
 

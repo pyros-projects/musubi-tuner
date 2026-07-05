@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -42,6 +44,87 @@ BOOGU_FP8_OPTIMIZATION_EXCLUDE_KEYS = [
     "image_index_embedding",
     "norm_out",
 ]
+BOOGU_SAMPLE_QWEN_IMAGE_AREA = 384 * 384
+BOOGU_SAMPLE_REF_IMAGE_AREA = 1024 * 1024
+BOOGU_SAMPLE_REF_IMAGE_ALIGN = 16
+BOOGU_DMD_DEFAULT_CONDITIONING_SIGMA = 0.001
+BOOGU_FLOW_SAMPLER_NAMES = {"", "default", "flow"}
+BOOGU_DMD_SAMPLER_NAMES = {"dmd", "dmd_turbo", "turbo"}
+
+
+def _normalize_boogu_sampler(value) -> str:
+    sampler = str(value or "flow").strip().lower().replace("-", "_")
+    if sampler in BOOGU_FLOW_SAMPLER_NAMES:
+        return "flow"
+    if sampler in BOOGU_DMD_SAMPLER_NAMES:
+        return "dmd"
+    raise ValueError(f"Unsupported Boogu sample sampler {value!r}; expected 'flow' or 'dmd'.")
+
+
+def _resize_pil_image_to_area(image, target_area: int, align_to: int | None = None):
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        raise ValueError("Boogu sample input image has invalid dimensions.")
+    scale = math.sqrt(float(target_area) / float(width * height))
+    resized_width = max(1, round(width * scale))
+    resized_height = max(1, round(height * scale))
+    if align_to is not None:
+        resized_width = max(align_to, round(resized_width / align_to) * align_to)
+        resized_height = max(align_to, round(resized_height / align_to) * align_to)
+    if (resized_width, resized_height) == image.size:
+        return image
+    from PIL import Image
+
+    return image.resize((resized_width, resized_height), Image.Resampling.BICUBIC)
+
+
+def load_boogu_sample_pil_image(image_path: str, target_area: int, align_to: int | None = None):
+    from PIL import Image
+
+    image = Image.open(image_path).convert("RGB")
+    return _resize_pil_image_to_area(image, target_area=target_area, align_to=align_to)
+
+
+def load_boogu_sample_ref_image_tensor(image_path: str) -> torch.Tensor:
+    import numpy as np
+
+    image = load_boogu_sample_pil_image(
+        image_path,
+        target_area=BOOGU_SAMPLE_REF_IMAGE_AREA,
+        align_to=BOOGU_SAMPLE_REF_IMAGE_ALIGN,
+    )
+    array = np.asarray(image, dtype=np.uint8)
+    tensor = torch.from_numpy(array[..., :3].copy()).permute(2, 0, 1).to(dtype=torch.float32)
+    return tensor / 127.5 - 1.0
+
+
+def resolve_boogu_sample_input_image_path(prompt_dict: dict, prompt_file: str | os.PathLike | None = None) -> str | None:
+    control_value = prompt_dict.get("control_image_path")
+    image_value = prompt_dict.get("input_image")
+    has_input_image = image_value is not None and image_value != ""
+    has_control_image = control_value is not None and control_value != "" and control_value != []
+    if has_input_image and has_control_image:
+        raise ValueError("Boogu sample prompts support only one edit input image.")
+    if image_value is None or image_value == "":
+        image_value = control_value
+    if image_value is None or image_value == "":
+        return None
+    if isinstance(image_value, list):
+        if len(image_value) == 0:
+            return None
+        if len(image_value) != 1:
+            raise ValueError("Boogu sample prompts support only one edit input image.")
+        image_value = image_value[0]
+    if not isinstance(image_value, str):
+        raise ValueError("Boogu sample prompt input image must be a single image path string.")
+
+    image_path = Path(os.path.expanduser(image_value))
+    if not image_path.is_absolute() and prompt_file is not None:
+        image_path = Path(prompt_file).expanduser().resolve().parent / image_path
+    image_path = image_path.resolve()
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Boogu sample input image does not exist: {image_path}")
+    return str(image_path)
 
 
 class BooguImageNetworkTrainer(NetworkTrainer):
@@ -109,13 +192,32 @@ class BooguImageNetworkTrainer(NetworkTrainer):
             return "native"
         raise ValueError(f"Boogu Image supports --sdpa or --flash-attn attention, got mode {attn_mode!r}.")
 
+    def _encode_sample_ref_latent(self, vae, image_path: str, device: torch.device) -> torch.Tensor:
+        image_tensor = load_boogu_sample_ref_image_tensor(image_path).unsqueeze(0)
+        vae_device = getattr(vae, "device", device)
+        vae_dtype = getattr(vae, "dtype", torch.float32)
+        with torch.no_grad():
+            encoded = vae.encode(image_tensor.to(device=vae_device, dtype=vae_dtype)).latent_dist.sample()
+            scale = float(self._vae_config_value(vae, "scaling_factor", BOOGU_VAE_SCALING_FACTOR))
+            shift = float(self._vae_config_value(vae, "shift_factor", BOOGU_VAE_SHIFT_FACTOR))
+            latents = (encoded - shift) * scale
+        return latents[0].detach().cpu()
+
     def process_sample_prompts(self, args: argparse.Namespace, accelerator: Accelerator, sample_prompts: str):
         assert args.text_encoder is not None, "--text_encoder is required for Boogu sample generation during training"
 
-        from musubi_tuner.boogu_image_cache_text_encoder_outputs import build_boogu_t2i_messages, load_boogu_text_encoder
+        from musubi_tuner.boogu_image_cache_text_encoder_outputs import (
+            build_boogu_drop_messages,
+            build_boogu_edit_messages,
+            build_boogu_t2i_messages,
+            load_boogu_text_encoder,
+        )
 
         device = accelerator.device
         prompts = load_prompts(sample_prompts)
+        for prompt_dict in prompts:
+            prompt_dict["boogu_sample_input_image_path"] = resolve_boogu_sample_input_image_path(prompt_dict, sample_prompts)
+
         dtype = torch.float8_e4m3fn if getattr(args, "fp8_llm", False) else torch.bfloat16
         processor, text_encoder = load_boogu_text_encoder(
             args.text_encoder,
@@ -127,38 +229,90 @@ class BooguImageNetworkTrainer(NetworkTrainer):
         text_encoder.eval()
 
         max_length = int(getattr(args, "max_text_length", 1024) or 1024)
-        text_features: dict[str, torch.Tensor] = {}
+        text_features: dict[tuple[str, str, str | None], torch.Tensor] = {}
+        qwen_image_cache = {}
         logger.info(f"Encoding Boogu sample prompts with Qwen3-VL: {sample_prompts}")
+
+        def encode_feature(text_encoder_model, cache_key: tuple[str, str, str | None], messages: list[dict]) -> None:
+            if cache_key in text_features:
+                return
+            inputs = processor.apply_chat_template(
+                [messages],
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                add_generation_prompt=False,
+                truncation=True,
+                max_length=max_length,
+            )
+            inputs = {key: value.to(device) if torch.is_tensor(value) else value for key, value in inputs.items()}
+            output = text_encoder_model(**inputs)
+            valid_len = int(inputs["attention_mask"][0].to(dtype=torch.bool).sum().item())
+            text_features[cache_key] = output.last_hidden_state[0, :valid_len].to(torch.bfloat16).cpu()
+
         with torch.no_grad():
             for prompt_dict in prompts:
                 if "negative_prompt" not in prompt_dict:
                     prompt_dict["negative_prompt"] = ""
-                for prompt in [prompt_dict.get("prompt", ""), prompt_dict.get("negative_prompt", "")]:
-                    if prompt is None or prompt in text_features:
-                        continue
-                    inputs = processor.apply_chat_template(
-                        [build_boogu_t2i_messages(prompt)],
-                        tokenize=True,
-                        return_dict=True,
-                        return_tensors="pt",
-                        add_generation_prompt=False,
-                        truncation=True,
-                        max_length=max_length,
-                    )
-                    inputs = {key: value.to(device) for key, value in inputs.items()}
-                    output = text_encoder(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
-                    valid_len = int(inputs["attention_mask"][0].to(dtype=torch.bool).sum().item())
-                    text_features[prompt] = output.last_hidden_state[0, :valid_len].to(torch.bfloat16).cpu()
+                prompt = prompt_dict.get("prompt", "") or ""
+                input_image_path = prompt_dict.get("boogu_sample_input_image_path")
+                if input_image_path is not None:
+                    if input_image_path not in qwen_image_cache:
+                        qwen_image_cache[input_image_path] = load_boogu_sample_pil_image(
+                            input_image_path,
+                            target_area=BOOGU_SAMPLE_QWEN_IMAGE_AREA,
+                        )
+                    prompt_key = ("edit", prompt, input_image_path)
+                    encode_feature(text_encoder, prompt_key, build_boogu_edit_messages(prompt, qwen_image_cache[input_image_path]))
+                else:
+                    prompt_key = ("t2i", prompt, None)
+                    encode_feature(text_encoder, prompt_key, build_boogu_t2i_messages(prompt))
+                prompt_dict["_boogu_instruction_feature_key"] = prompt_key
+
+                negative_prompt = prompt_dict.get("negative_prompt", "") or ""
+                if input_image_path is not None and not negative_prompt.strip():
+                    negative_key = ("drop", "", None)
+                    encode_feature(text_encoder, negative_key, build_boogu_drop_messages(""))
+                else:
+                    negative_key = ("t2i", negative_prompt, None)
+                    encode_feature(text_encoder, negative_key, build_boogu_t2i_messages(negative_prompt))
+                prompt_dict["_negative_boogu_instruction_feature_key"] = negative_key
 
         del text_encoder
         clean_memory_on_device(device)
 
+        ref_latent_cache: dict[str, torch.Tensor] = {}
+        sample_input_paths = [
+            prompt_dict["boogu_sample_input_image_path"]
+            for prompt_dict in prompts
+            if prompt_dict.get("boogu_sample_input_image_path") is not None
+        ]
+        unique_sample_input_paths = list(dict.fromkeys(sample_input_paths))
+        if unique_sample_input_paths:
+            if not getattr(args, "vae", None):
+                raise ValueError("Boogu sample input images require --vae so reference latents can be pre-cached.")
+            vae_dtype = torch.bfloat16 if getattr(args, "vae_dtype", None) is None else model_utils.str_to_dtype(args.vae_dtype)
+            vae = self.load_vae(args, vae_dtype=vae_dtype, vae_path=args.vae)
+            vae.to(device=device, dtype=vae_dtype)
+            vae.eval()
+            try:
+                for input_image_path in unique_sample_input_paths:
+                    ref_latent_cache[input_image_path] = self._encode_sample_ref_latent(vae, input_image_path, device)
+            finally:
+                vae.to("cpu")
+                del vae
+                clean_memory_on_device(device)
+
         sample_parameters = []
         for prompt_dict in prompts:
             prompt_dict_copy = prompt_dict.copy()
-            prompt_dict_copy["boogu_instruction_embed"] = text_features[prompt_dict.get("prompt", "")]
-            negative_prompt = prompt_dict.get("negative_prompt", "")
-            prompt_dict_copy["negative_boogu_instruction_embed"] = text_features[negative_prompt]
+            prompt_dict_copy["boogu_instruction_embed"] = text_features[prompt_dict["_boogu_instruction_feature_key"]]
+            prompt_dict_copy["negative_boogu_instruction_embed"] = text_features[prompt_dict["_negative_boogu_instruction_feature_key"]]
+            input_image_path = prompt_dict.get("boogu_sample_input_image_path")
+            if input_image_path is not None:
+                prompt_dict_copy["boogu_ref_image_hidden_states"] = [ref_latent_cache[input_image_path]]
+            prompt_dict_copy.pop("_boogu_instruction_feature_key", None)
+            prompt_dict_copy.pop("_negative_boogu_instruction_feature_key", None)
             sample_parameters.append(prompt_dict_copy)
         return sample_parameters
 
@@ -214,36 +368,108 @@ class BooguImageNetworkTrainer(NetworkTrainer):
                 device=device,
                 dtype=dit_dtype,
             )
+        cached_ref_image_hidden_states = sample_parameter.get("boogu_ref_image_hidden_states")
+        ref_image_hidden_states = None
+        if cached_ref_image_hidden_states:
+            ref_image_hidden_states = [
+                [ref_latent.to(device=device, dtype=dit_dtype) for ref_latent in cached_ref_image_hidden_states]
+            ]
 
         freqs_cis = self._get_freqs_cis(model)
-        times = boogu_time_schedule(sample_steps, num_patch_tokens, device=device)
-        for t, t_next in zip(times[:-1], times[1:]):
-            boogu_t = t.expand(latents.shape[0]).to(device=device, dtype=torch.float32)
-            latent_model_input = latents.to(device=device, dtype=dit_dtype)
-            with torch.no_grad(), accelerator.autocast():
-                v_cond = model(
-                    hidden_states=latent_model_input,
-                    timestep=boogu_t,
-                    instruction_hidden_states=cond_feats,
-                    freqs_cis=freqs_cis,
-                    instruction_attention_mask=cond_mask,
-                    ref_image_hidden_states=None,
-                    return_dict=False,
+        sampler = _normalize_boogu_sampler(sample_parameter.get("boogu_sampler"))
+        if sampler == "dmd":
+            if cfg != 1.0:
+                raise ValueError(
+                    "Boogu DMD/turbo preview sampling requires cfg_scale=1.0 "
+                    "(or guidance_scale=1.0 when cfg_scale is omitted)."
                 )
-                if do_cfg:
-                    v_uncond = model(
+            if sample_steps < 1:
+                raise ValueError("Boogu DMD/turbo preview sampling requires sample_steps >= 1.")
+            conditioning_sigma = float(
+                sample_parameter.get(
+                    "boogu_dmd_conditioning_sigma",
+                    sample_parameter.get("dmd_conditioning_sigma", BOOGU_DMD_DEFAULT_CONDITIONING_SIGMA),
+                )
+            )
+            if not 0.0 <= conditioning_sigma <= 1.0:
+                raise ValueError("Boogu DMD conditioning sigma must be between 0.0 and 1.0.")
+            logger.info(
+                "Boogu sample sampler: DMD/turbo (steps=%s, conditioning_sigma=%s)",
+                sample_steps,
+                conditioning_sigma,
+            )
+            sigmas = torch.linspace(
+                conditioning_sigma,
+                1.0,
+                int(sample_steps) + 1,
+                device=device,
+                dtype=torch.float32,
+            )[:-1]
+            for i, sigma in enumerate(sigmas):
+                sigma_value = float(sigma.item())
+                boogu_t = torch.full((latents.shape[0],), sigma_value, device=device, dtype=torch.float32)
+                latent_model_input = latents.to(device=device, dtype=dit_dtype)
+                with torch.no_grad(), accelerator.autocast():
+                    model_pred = model(
                         hidden_states=latent_model_input,
                         timestep=boogu_t,
-                        instruction_hidden_states=uncond_feats,
+                        instruction_hidden_states=cond_feats,
                         freqs_cis=freqs_cis,
-                        instruction_attention_mask=uncond_mask,
-                        ref_image_hidden_states=None,
+                        instruction_attention_mask=cond_mask,
+                        ref_image_hidden_states=ref_image_hidden_states,
                         return_dict=False,
                     )
-                    velocity = v_uncond + cfg * (v_cond - v_uncond)
-                else:
-                    velocity = v_cond
-            latents = latents + velocity.to(torch.float32) * (t_next - t)
+                sigma_expanded = torch.full(
+                    (latents.shape[0], 1, 1, 1),
+                    sigma_value,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                latents = latents + (1.0 - sigma_expanded) * model_pred.to(torch.float32)
+                if i < len(sigmas) - 1:
+                    next_sigma = float(sigmas[i + 1].item())
+                    noise = randn_tensor(
+                        latents.shape,
+                        generator=generator,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    next_sigma_expanded = torch.full(
+                        (latents.shape[0], 1, 1, 1),
+                        next_sigma,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    latents = (1.0 - next_sigma_expanded) * noise + next_sigma_expanded * latents
+        else:
+            times = boogu_time_schedule(sample_steps, num_patch_tokens, device=device)
+            for t, t_next in zip(times[:-1], times[1:]):
+                boogu_t = t.expand(latents.shape[0]).to(device=device, dtype=torch.float32)
+                latent_model_input = latents.to(device=device, dtype=dit_dtype)
+                with torch.no_grad(), accelerator.autocast():
+                    v_cond = model(
+                        hidden_states=latent_model_input,
+                        timestep=boogu_t,
+                        instruction_hidden_states=cond_feats,
+                        freqs_cis=freqs_cis,
+                        instruction_attention_mask=cond_mask,
+                        ref_image_hidden_states=ref_image_hidden_states,
+                        return_dict=False,
+                    )
+                    if do_cfg:
+                        v_uncond = model(
+                            hidden_states=latent_model_input,
+                            timestep=boogu_t,
+                            instruction_hidden_states=uncond_feats,
+                            freqs_cis=freqs_cis,
+                            instruction_attention_mask=uncond_mask,
+                            ref_image_hidden_states=ref_image_hidden_states,
+                            return_dict=False,
+                        )
+                        velocity = v_uncond + cfg * (v_cond - v_uncond)
+                    else:
+                        velocity = v_cond
+                latents = latents + velocity.to(torch.float32) * (t_next - t)
 
         vae.to(device)
         vae.eval()

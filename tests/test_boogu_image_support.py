@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import logging
 import sys
 import types
 from pathlib import Path
@@ -90,6 +91,79 @@ def test_boogu_parser_import_registration_and_architecture_constants():
                 dit="/models/Boogu-Image-0.1-Base-fp8/model.bin",
                 mixed_precision="bf16",
             )
+        )
+
+
+def test_boogu_sample_input_image_path_resolves_inherited_and_overridden_input_image(tmp_path):
+    from musubi_tuner.boogu_image_train_network import resolve_boogu_sample_input_image_path
+    from musubi_tuner.hv_train_network import load_prompts
+
+    global_image = tmp_path / "global.png"
+    override_image = tmp_path / "override.png"
+    global_image.write_bytes(b"global")
+    override_image.write_bytes(b"override")
+    prompt_file = tmp_path / "prompts.toml"
+    prompt_file.write_text(
+        f"""
+[prompt]
+width = 1024
+height = 1024
+input_image = "{global_image.name}"
+
+[[prompt.subset]]
+prompt = "pose one"
+
+[[prompt.subset]]
+prompt = "pose two"
+input_image = "{override_image.name}"
+""",
+        encoding="utf-8",
+    )
+
+    prompts = load_prompts(str(prompt_file))
+
+    assert resolve_boogu_sample_input_image_path(prompts[0], prompt_file) == str(global_image.resolve())
+    assert resolve_boogu_sample_input_image_path(prompts[1], prompt_file) == str(override_image.resolve())
+
+
+def test_boogu_sample_input_image_path_accepts_single_control_image_alias_and_no_image(tmp_path):
+    from musubi_tuner.boogu_image_train_network import resolve_boogu_sample_input_image_path
+
+    control_image = tmp_path / "control.png"
+    control_image.write_bytes(b"control")
+
+    assert (
+        resolve_boogu_sample_input_image_path({"prompt": "pose", "control_image_path": control_image.name}, tmp_path / "prompts.toml")
+        == str(control_image.resolve())
+    )
+    assert (
+        resolve_boogu_sample_input_image_path({"prompt": "pose", "control_image_path": [str(control_image)]}, tmp_path / "prompts.toml")
+        == str(control_image.resolve())
+    )
+    assert resolve_boogu_sample_input_image_path({"prompt": "pose"}, tmp_path / "prompts.toml") is None
+
+
+def test_boogu_sample_input_image_path_fails_for_missing_or_ambiguous_images(tmp_path):
+    from musubi_tuner.boogu_image_train_network import resolve_boogu_sample_input_image_path
+
+    first_image = tmp_path / "first.png"
+    second_image = tmp_path / "second.png"
+    first_image.write_bytes(b"first")
+    second_image.write_bytes(b"second")
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        resolve_boogu_sample_input_image_path({"prompt": "pose", "input_image": "missing.png"}, tmp_path / "prompts.toml")
+
+    with pytest.raises(ValueError, match="only one edit input image"):
+        resolve_boogu_sample_input_image_path(
+            {"prompt": "pose", "control_image_path": [str(first_image), str(second_image)]},
+            tmp_path / "prompts.toml",
+        )
+
+    with pytest.raises(ValueError, match="only one edit input image"):
+        resolve_boogu_sample_input_image_path(
+            {"prompt": "pose", "input_image": str(first_image), "control_image_path": str(second_image)},
+            tmp_path / "prompts.toml",
         )
 
 
@@ -198,6 +272,19 @@ def test_boogu_text_encoder_load_plan_supports_comfy_qwen3vl_single_file():
     assert plan.processor_subfolder is None
 
 
+def test_boogu_edit_message_helpers_use_image_drop_template_without_vision_in_drop():
+    from musubi_tuner.boogu_image_cache_text_encoder_outputs import build_boogu_drop_messages, build_boogu_edit_messages
+
+    edit_messages = build_boogu_edit_messages("make the person do a chest stand", image="image-object")
+    drop_messages = build_boogu_drop_messages("")
+
+    assert "Describe the key features of the input image" in edit_messages[0]["content"][0]["text"]
+    assert edit_messages[1]["content"][0] == {"type": "image", "image": "image-object"}
+    assert edit_messages[1]["content"][1] == {"type": "text", "text": "make the person do a chest stand"}
+    assert "Describe the key features of the input image" in drop_messages[0]["content"][0]["text"]
+    assert drop_messages[1]["content"] == [{"type": "text", "text": ""}]
+
+
 def test_boogu_qwen3vl_8b_config_matches_boogu_instruction_width_and_local_shapes():
     from musubi_tuner.boogu_image_cache_text_encoder_outputs import build_boogu_qwen3vl_8b_config
 
@@ -273,6 +360,330 @@ def test_boogu_text_cache_script_encodes_natural_length_instruction_features(tmp
     assert list(saved) == ["varlen_boogu_instruction_embed_float32"]
     assert saved["varlen_boogu_instruction_embed_float32"].shape == (2, 4)
     assert "high-quality images" in processor.messages[0][0][0]["content"][0]["text"]
+
+
+def test_boogu_process_sample_prompts_caches_image_conditioned_qwen_features_by_prompt_and_image(tmp_path, monkeypatch):
+    from PIL import Image
+
+    import musubi_tuner.boogu_image_cache_text_encoder_outputs as text_cache
+    from musubi_tuner.boogu_image_train_network import BooguImageNetworkTrainer
+
+    class _FakeProcessor:
+        def __init__(self):
+            self.messages = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            message_group = messages[0]
+            self.messages.append(message_group)
+            has_image = any(item.get("type") == "image" for message in message_group for item in message["content"])
+            inputs = {
+                "input_ids": torch.tensor([[11, 12, 13, 14]]),
+                "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+            }
+            if has_image:
+                inputs["pixel_values"] = torch.ones(1, 3, 2, 2)
+                inputs["image_grid_thw"] = torch.tensor([[1, 1, 1]])
+            return inputs
+
+    class _FakeEncoder:
+        def __init__(self):
+            self.calls = []
+
+        def eval(self):
+            return self
+
+        def __call__(self, **inputs):
+            self.calls.append(tuple(sorted(inputs)))
+            value = float(len(self.calls))
+            hidden = torch.full((1, 4, 3), value, dtype=torch.float32)
+            return types.SimpleNamespace(last_hidden_state=hidden)
+
+    class _FakeLatentDist:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def sample(self):
+            bsz, _channels, height, width = self.tensor.shape
+            return torch.ones(bsz, 16, height // 8, width // 8)
+
+    class _FakeVAE(nn.Module):
+        dtype = torch.float32
+        device = torch.device("cpu")
+
+        def __init__(self):
+            super().__init__()
+            self.config = {"scaling_factor": 1.0, "shift_factor": 0.0}
+
+        def to(self, *args, **kwargs):
+            if "device" in kwargs:
+                self.device = torch.device(kwargs["device"])
+            elif args:
+                try:
+                    self.device = torch.device(args[0])
+                except (TypeError, RuntimeError):
+                    pass
+            if "dtype" in kwargs and kwargs["dtype"] is not None:
+                self.dtype = kwargs["dtype"]
+            return self
+
+        def eval(self):
+            return self
+
+        def encode(self, tensor):
+            return types.SimpleNamespace(latent_dist=_FakeLatentDist(tensor))
+
+    class _FakeVAETrainer(BooguImageNetworkTrainer):
+        def load_vae(self, args, vae_dtype, vae_path):
+            return _FakeVAE()
+
+    image_a = tmp_path / "a.png"
+    image_b = tmp_path / "b.png"
+    Image.new("RGB", (32, 32), "red").save(image_a)
+    Image.new("RGB", (32, 32), "blue").save(image_b)
+    prompt_file = tmp_path / "prompts.toml"
+    prompt_file.write_text(
+        f"""
+[prompt]
+width = 1024
+height = 1024
+input_image = "{image_a.name}"
+
+[[prompt.subset]]
+prompt = "make a yoga pose"
+negative_prompt = ""
+
+[[prompt.subset]]
+prompt = "make a yoga pose"
+negative_prompt = ""
+
+[[prompt.subset]]
+prompt = "make a yoga pose"
+negative_prompt = ""
+input_image = "{image_b.name}"
+""",
+        encoding="utf-8",
+    )
+
+    processor = _FakeProcessor()
+    encoder = _FakeEncoder()
+    monkeypatch.setattr(text_cache, "load_boogu_text_encoder", lambda *args, **kwargs: (processor, encoder))
+    trainer = _FakeVAETrainer()
+
+    sample_parameters = trainer.process_sample_prompts(
+        types.SimpleNamespace(
+            text_encoder="/fake/qwen.safetensors",
+            processor="/fake/processor",
+            text_encoder_subfolder="auto",
+            max_text_length=64,
+            fp8_llm=False,
+            vae="/fake/vae.safetensors",
+            vae_dtype="float32",
+        ),
+        _FakeCPUAccelerator(),
+        str(prompt_file),
+    )
+
+    image_messages = [
+        messages
+        for messages in processor.messages
+        if any(item.get("type") == "image" for message in messages for item in message["content"])
+    ]
+    no_image_messages = [
+        messages
+        for messages in processor.messages
+        if not any(item.get("type") == "image" for message in messages for item in message["content"])
+    ]
+    assert len(image_messages) == 2
+    assert len(no_image_messages) == 1
+    assert any("Describe the key features" in messages[0]["content"][0]["text"] for messages in no_image_messages)
+    assert sum("pixel_values" in call and "image_grid_thw" in call for call in encoder.calls) == 2
+    assert sum("pixel_values" not in call for call in encoder.calls) == 1
+    assert torch.equal(sample_parameters[0]["boogu_instruction_embed"], sample_parameters[1]["boogu_instruction_embed"])
+    assert not torch.equal(sample_parameters[0]["boogu_instruction_embed"], sample_parameters[2]["boogu_instruction_embed"])
+    assert sample_parameters[0]["negative_boogu_instruction_embed"].shape == (3, 3)
+    assert all(param["boogu_instruction_embed"].dtype is torch.bfloat16 for param in sample_parameters)
+    assert all(param["boogu_instruction_embed"].device.type == "cpu" for param in sample_parameters)
+
+
+def test_boogu_process_sample_prompts_precaches_reference_latents_once_per_unique_image(tmp_path, monkeypatch):
+    from PIL import Image
+
+    import musubi_tuner.boogu_image_cache_text_encoder_outputs as text_cache
+    from musubi_tuner.boogu_image_train_network import BooguImageNetworkTrainer
+
+    class _FakeProcessor:
+        def apply_chat_template(self, messages, **kwargs):
+            has_image = any(item.get("type") == "image" for message in messages[0] for item in message["content"])
+            inputs = {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "attention_mask": torch.tensor([[1, 1, 0]]),
+            }
+            if has_image:
+                inputs["pixel_values"] = torch.ones(1, 3, 2, 2)
+                inputs["image_grid_thw"] = torch.tensor([[1, 1, 1]])
+            return inputs
+
+    class _FakeEncoder:
+        def eval(self):
+            return self
+
+        def __call__(self, **inputs):
+            return types.SimpleNamespace(last_hidden_state=torch.ones(1, 3, 4))
+
+    class _FakeLatentDist:
+        def __init__(self, latent):
+            self.latent = latent
+
+        def sample(self):
+            return self.latent
+
+    class _RecordingVAE(nn.Module):
+        dtype = torch.float32
+        device = torch.device("cpu")
+
+        def __init__(self):
+            super().__init__()
+            self.config = {"scaling_factor": 1.0, "shift_factor": 0.0}
+            self.encode_inputs = []
+
+        def to(self, *args, **kwargs):
+            if "device" in kwargs:
+                self.device = torch.device(kwargs["device"])
+            elif args:
+                try:
+                    self.device = torch.device(args[0])
+                except (TypeError, RuntimeError):
+                    pass
+            if "dtype" in kwargs and kwargs["dtype"] is not None:
+                self.dtype = kwargs["dtype"]
+            return self
+
+        def eval(self):
+            return self
+
+        def encode(self, tensor):
+            self.encode_inputs.append(tensor.detach().cpu())
+            value = float(len(self.encode_inputs))
+            bsz, _channels, height, width = tensor.shape
+            latent = torch.full((bsz, 16, height // 8, width // 8), value, dtype=torch.float32)
+            return types.SimpleNamespace(latent_dist=_FakeLatentDist(latent))
+
+    class _RecordingVAETrainer(BooguImageNetworkTrainer):
+        def __init__(self):
+            super().__init__()
+            self.loaded_vaes = []
+
+        def load_vae(self, args, vae_dtype, vae_path):
+            vae = _RecordingVAE()
+            self.loaded_vaes.append((vae, vae_dtype, vae_path))
+            return vae
+
+    image_a = tmp_path / "a.png"
+    image_b = tmp_path / "b.png"
+    Image.new("RGB", (33, 65), "red").save(image_a)
+    Image.new("RGB", (80, 31), "blue").save(image_b)
+    prompt_file = tmp_path / "prompts.toml"
+    prompt_file.write_text(
+        f"""
+[prompt]
+width = 1024
+height = 1024
+input_image = "{image_a.name}"
+
+[[prompt.subset]]
+prompt = "pose one"
+
+[[prompt.subset]]
+prompt = "pose two"
+
+[[prompt.subset]]
+prompt = "pose three"
+input_image = "{image_b.name}"
+""",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(text_cache, "load_boogu_text_encoder", lambda *args, **kwargs: (_FakeProcessor(), _FakeEncoder()))
+    trainer = _RecordingVAETrainer()
+
+    sample_parameters = trainer.process_sample_prompts(
+        types.SimpleNamespace(
+            text_encoder="/fake/qwen.safetensors",
+            processor="/fake/processor",
+            text_encoder_subfolder="auto",
+            max_text_length=64,
+            fp8_llm=False,
+            vae="/fake/vae.safetensors",
+            vae_dtype="float32",
+        ),
+        _FakeCPUAccelerator(),
+        str(prompt_file),
+    )
+
+    assert len(trainer.loaded_vaes) == 1
+    vae, vae_dtype, vae_path = trainer.loaded_vaes[0]
+    assert vae_dtype is torch.float32
+    assert vae_path == "/fake/vae.safetensors"
+    assert len(vae.encode_inputs) == 2
+    assert all(tensor.shape[2] % 16 == 0 and tensor.shape[3] % 16 == 0 for tensor in vae.encode_inputs)
+    assert all(tensor.min() >= -1.0 and tensor.max() <= 1.0 for tensor in vae.encode_inputs)
+    assert torch.equal(sample_parameters[0]["boogu_ref_image_hidden_states"][0], sample_parameters[1]["boogu_ref_image_hidden_states"][0])
+    assert not torch.equal(sample_parameters[0]["boogu_ref_image_hidden_states"][0], sample_parameters[2]["boogu_ref_image_hidden_states"][0])
+    assert all(param["boogu_ref_image_hidden_states"][0].device.type == "cpu" for param in sample_parameters)
+
+
+def test_boogu_process_sample_prompts_does_not_load_vae_for_text_only_prompts(tmp_path, monkeypatch):
+    import musubi_tuner.boogu_image_cache_text_encoder_outputs as text_cache
+    from musubi_tuner.boogu_image_train_network import BooguImageNetworkTrainer
+
+    class _FakeProcessor:
+        def apply_chat_template(self, messages, **kwargs):
+            return {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "attention_mask": torch.tensor([[1, 1, 0]]),
+            }
+
+    class _FakeEncoder:
+        def eval(self):
+            return self
+
+        def __call__(self, **inputs):
+            return types.SimpleNamespace(last_hidden_state=torch.ones(1, 3, 4))
+
+    class _NoVAETrainer(BooguImageNetworkTrainer):
+        def load_vae(self, args, vae_dtype, vae_path):
+            raise AssertionError("text-only Boogu sample prompts must not load the temporary VAE")
+
+    prompt_file = tmp_path / "prompts.toml"
+    prompt_file.write_text(
+        """
+[prompt]
+width = 1024
+height = 1024
+
+[[prompt.subset]]
+prompt = "pose one"
+""",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(text_cache, "load_boogu_text_encoder", lambda *args, **kwargs: (_FakeProcessor(), _FakeEncoder()))
+
+    sample_parameters = _NoVAETrainer().process_sample_prompts(
+        types.SimpleNamespace(
+            text_encoder="/fake/qwen.safetensors",
+            processor="/fake/processor",
+            text_encoder_subfolder="auto",
+            max_text_length=64,
+            fp8_llm=False,
+            vae="/fake/vae.safetensors",
+            vae_dtype="float32",
+        ),
+        _FakeCPUAccelerator(),
+        str(prompt_file),
+    )
+
+    assert "boogu_ref_image_hidden_states" not in sample_parameters[0]
 
 
 def test_boogu_instruction_feature_padding_preserves_natural_lengths():
@@ -673,6 +1084,7 @@ def test_boogu_preview_sampler_uses_cached_embeddings_cfg_and_decodes_pixels():
                     "timestep": float(timestep.item()),
                     "instruction_shape": tuple(instruction_hidden_states.shape),
                     "mask_shape": tuple(instruction_attention_mask.shape),
+                    "ref_image_hidden_states": ref_image_hidden_states,
                 }
             )
             scale = 2.0 if instruction_hidden_states.sum() > 0 else 0.5
@@ -725,5 +1137,220 @@ def test_boogu_preview_sampler_uses_cached_embeddings_cfg_and_decodes_pixels():
     assert len(transformer.calls) == 4
     assert {call["instruction_shape"] for call in transformer.calls} == {(1, 2, 4), (1, 1, 4)}
     assert all(call["hidden_states_shape"] == (1, 16, 2, 2) for call in transformer.calls)
+    assert all(call["ref_image_hidden_states"] is None for call in transformer.calls)
     assert transformer.calls[0]["timestep"] == pytest.approx(0.0, abs=1e-6)
     assert transformer.calls[-1]["timestep"] < 1.0
+
+
+def test_boogu_preview_dmd_sampler_uses_turbo_sigmas_without_cfg_branch(caplog):
+    from musubi_tuner.boogu_image_train_network import BooguImageNetworkTrainer
+
+    class _FakeBooguTransformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(
+                patch_size=2,
+                axes_dim_rope=(2, 2, 2),
+                axes_lens=(16, 16, 16),
+                in_channels=16,
+            )
+            self.calls = []
+
+        def forward(
+            self,
+            hidden_states,
+            timestep,
+            instruction_hidden_states,
+            freqs_cis,
+            instruction_attention_mask,
+            ref_image_hidden_states=None,
+            return_dict=False,
+        ):
+            self.calls.append(
+                {
+                    "timestep": float(timestep.item()),
+                    "instruction_shape": tuple(instruction_hidden_states.shape),
+                    "ref_image_hidden_states": ref_image_hidden_states,
+                }
+            )
+            return torch.ones_like(hidden_states) * float(timestep.item())
+
+    class _FakeVAE(nn.Module):
+        dtype = torch.float32
+
+        def __init__(self):
+            super().__init__()
+            self.config = {"scaling_factor": 1.0, "shift_factor": 0.0}
+
+        def decode(self, latents):
+            bsz, _channels, height, width = latents.shape
+            return types.SimpleNamespace(sample=torch.zeros(bsz, 3, height * 8, width * 8))
+
+    trainer = BooguImageNetworkTrainer()
+    accelerator = _FakeCPUAccelerator()
+    transformer = _FakeBooguTransformer()
+    ref_latent = torch.ones(16, 2, 2, dtype=torch.float64)
+    sample_parameter = {
+        "boogu_sampler": "dmd",
+        "boogu_dmd_conditioning_sigma": 0.2,
+        "boogu_instruction_embed": torch.ones(2, 4),
+        "negative_boogu_instruction_embed": torch.zeros(1, 4),
+        "boogu_ref_image_hidden_states": [ref_latent],
+    }
+
+    with caplog.at_level(logging.INFO, logger="musubi_tuner.boogu_image_train_network"):
+        pixels = trainer.do_inference(
+            accelerator=accelerator,
+            args=types.SimpleNamespace(),
+            sample_parameter=sample_parameter,
+            vae=_FakeVAE(),
+            dit_dtype=torch.float32,
+            transformer=transformer,
+            discrete_flow_shift=3.0,
+            sample_steps=3,
+            width=16,
+            height=16,
+            frame_count=1,
+            generator=torch.Generator(device="cpu").manual_seed(1),
+            do_classifier_free_guidance=True,
+            guidance_scale=1.0,
+            cfg_scale=1.0,
+        )
+
+    assert pixels.shape == (1, 3, 1, 16, 16)
+    assert "Boogu sample sampler: DMD/turbo" in caplog.text
+    assert [call["timestep"] for call in transformer.calls] == pytest.approx([0.2, 0.4666667, 0.7333333])
+    assert [call["instruction_shape"] for call in transformer.calls] == [(1, 2, 4)] * 3
+    assert all(call["ref_image_hidden_states"][0][0].dtype is torch.float32 for call in transformer.calls)
+
+
+def test_boogu_preview_dmd_sampler_rejects_cfg_above_one():
+    from musubi_tuner.boogu_image_train_network import BooguImageNetworkTrainer
+
+    class _FakeBooguTransformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(
+                patch_size=2,
+                axes_dim_rope=(2, 2, 2),
+                axes_lens=(16, 16, 16),
+                in_channels=16,
+            )
+
+        def forward(
+            self,
+            hidden_states,
+            timestep,
+            instruction_hidden_states,
+            freqs_cis,
+            instruction_attention_mask,
+            ref_image_hidden_states=None,
+            return_dict=False,
+        ):
+            return torch.zeros_like(hidden_states)
+
+    class _FakeVAE(nn.Module):
+        dtype = torch.float32
+        config = {"scaling_factor": 1.0, "shift_factor": 0.0}
+
+        def decode(self, latents):
+            bsz, _channels, height, width = latents.shape
+            return types.SimpleNamespace(sample=torch.zeros(bsz, 3, height * 8, width * 8))
+
+    trainer = BooguImageNetworkTrainer()
+    with pytest.raises(ValueError, match="DMD"):
+        trainer.do_inference(
+            accelerator=_FakeCPUAccelerator(),
+            args=types.SimpleNamespace(),
+            sample_parameter={
+                "boogu_sampler": "dmd",
+                "boogu_instruction_embed": torch.ones(2, 4),
+                "negative_boogu_instruction_embed": torch.zeros(1, 4),
+            },
+            vae=_FakeVAE(),
+            dit_dtype=torch.float32,
+            transformer=_FakeBooguTransformer(),
+            discrete_flow_shift=3.0,
+            sample_steps=4,
+            width=16,
+            height=16,
+            frame_count=1,
+            generator=torch.Generator(device="cpu").manual_seed(1),
+            do_classifier_free_guidance=True,
+            guidance_scale=4.0,
+            cfg_scale=4.0,
+        )
+
+
+def test_boogu_preview_sampler_passes_cached_reference_latents_to_both_cfg_branches():
+    from musubi_tuner.boogu_image_train_network import BooguImageNetworkTrainer
+
+    class _FakeBooguTransformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(
+                patch_size=2,
+                axes_dim_rope=(2, 2, 2),
+                axes_lens=(16, 16, 16),
+                in_channels=16,
+            )
+            self.calls = []
+
+        def forward(
+            self,
+            hidden_states,
+            timestep,
+            instruction_hidden_states,
+            freqs_cis,
+            instruction_attention_mask,
+            ref_image_hidden_states=None,
+            return_dict=False,
+        ):
+            self.calls.append(ref_image_hidden_states)
+            return torch.zeros_like(hidden_states)
+
+    class _FakeVAE(nn.Module):
+        dtype = torch.float32
+
+        def __init__(self):
+            super().__init__()
+            self.config = {"scaling_factor": 1.0, "shift_factor": 0.0}
+
+        def decode(self, latents):
+            bsz, _channels, height, width = latents.shape
+            return types.SimpleNamespace(sample=torch.zeros(bsz, 3, height * 8, width * 8))
+
+    trainer = BooguImageNetworkTrainer()
+    accelerator = _FakeCPUAccelerator()
+    transformer = _FakeBooguTransformer()
+    ref_latent = torch.ones(16, 2, 2, dtype=torch.float64)
+    sample_parameter = {
+        "boogu_instruction_embed": torch.ones(2, 4),
+        "negative_boogu_instruction_embed": torch.zeros(1, 4),
+        "boogu_ref_image_hidden_states": [ref_latent],
+    }
+
+    trainer.do_inference(
+        accelerator=accelerator,
+        args=types.SimpleNamespace(),
+        sample_parameter=sample_parameter,
+        vae=_FakeVAE(),
+        dit_dtype=torch.float32,
+        transformer=transformer,
+        discrete_flow_shift=3.0,
+        sample_steps=1,
+        width=16,
+        height=16,
+        frame_count=1,
+        generator=torch.Generator(device="cpu").manual_seed(1),
+        do_classifier_free_guidance=True,
+        guidance_scale=4.0,
+        cfg_scale=3.0,
+    )
+
+    assert len(transformer.calls) == 2
+    assert all(call is not None for call in transformer.calls)
+    assert all(len(call) == 1 and len(call[0]) == 1 for call in transformer.calls)
+    assert all(call[0][0].dtype is torch.float32 for call in transformer.calls)
+    assert all(call[0][0].device.type == "cpu" for call in transformer.calls)
+    assert all(torch.equal(call[0][0], ref_latent.to(dtype=torch.float32)) for call in transformer.calls)
