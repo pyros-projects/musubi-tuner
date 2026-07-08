@@ -115,6 +115,44 @@ Input images are pre-cached before transformer loading: Qwen3-VL receives the re
 
 Use `boogu_sampler = "dmd"` for turbo edit preview sampling. It follows Boogu's few-step DMD path and requires the no-CFG shape `cfg_scale = 1.0` with `guidance_scale = 1.0`. Omit `boogu_sampler` for the default flow sampler used by the base/edit checkpoints.
 
+### Edit Prompting Guide
+
+Boogu edit preview prompts are instruction prompts, not plain final-image captions. With `input_image`, Qwen3-VL receives the source image and the prompt under an edit system prompt, so wording like `make her ...`, `transform this image ...`, or `use the input as reference ...` usually gives stronger edits than a caption such as `a woman sitting on a chair`.
+
+Use a preservation budget when you want broader edits without specifying every detail:
+
+```text
+make [subject] [do/change X]. Preserve [A, B]. Freely change everything else.
+```
+
+Common patterns:
+
+```text
+make Yuna sit naturally on a simple chair. Preserve her face, hairstyle, and neon-city identity. Freely change pose, hands, composition, camera angle, and clothing folds as needed. No weapon, no handheld prop.
+```
+
+```text
+use the input image only as a reference for Yuna's identity and style. Create a new image where she is sitting casually on a simple chair.
+```
+
+```text
+transform the image so Yuna is sitting on a simple chair. Keep the same character and visual style, but allow major changes to pose, background, and framing.
+```
+
+Edit-strength tiers:
+
+```text
+Surgical: make her dress blue. Preserve pose, face, hands, background, lighting, and composition.
+
+Medium: make her sit on a chair. Preserve face, hairstyle, outfit style, and neon-city mood. Adjust pose and composition as needed.
+
+Free: make Yuna sitting casually on a chair. Use the input only as character/style reference. Freely change pose, camera angle, background, and outfit details.
+
+Wild: reinterpret Yuna as a relaxed character portrait of her sitting on a chair in a new scene. Preserve only her identity and anime style.
+```
+
+For the turbo/DMD path, avoid caption-only prompts when you expect an edit. Prefer imperative/reference language plus explicit freedom and preservation clauses: `Preserve only X; freely change Y`.
+
 ### Standalone Prompt File Inference
 
 Use `boogu_image_generate_image.py` to run a sample prompt file without starting a training job. This uses the same prompt/image cache and preview sampler as training.

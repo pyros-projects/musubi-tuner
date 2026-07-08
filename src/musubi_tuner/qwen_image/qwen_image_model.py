@@ -16,6 +16,7 @@
 
 import inspect
 import numbers
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 import math
 from math import prod
@@ -1226,6 +1227,77 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
         self.offloader.prepare_block_devices_before_forward(self.transformer_blocks)
+
+    def _wait_for_pending_block_swaps(self):
+        if self.offloader is None:
+            return
+        futures = getattr(self.offloader, "futures", None)
+        if futures is not None:
+            for block_idx in list(futures.keys()):
+                if hasattr(self.offloader, "_wait_blocks_move"):
+                    self.offloader._wait_blocks_move(block_idx)
+                else:
+                    self.offloader.wait_for_block(block_idx)
+            return
+        if hasattr(self.offloader, "set_forward_only"):
+            self.offloader.set_forward_only(getattr(self.offloader, "forward_only", True))
+
+    @contextmanager
+    def override_block_swap_for_sampling(self, sample_blocks_to_swap: int | None, device: torch.device):
+        if sample_blocks_to_swap is None:
+            yield None
+            return
+
+        target_blocks_to_swap = int(sample_blocks_to_swap)
+        if target_blocks_to_swap < 0:
+            raise ValueError("Qwen Image sample_blocks_to_swap must be a non-negative integer.")
+
+        num_blocks = len(self.transformer_blocks)
+        max_blocks_to_swap = num_blocks - 1
+        if target_blocks_to_swap > max_blocks_to_swap:
+            raise ValueError(
+                f"Cannot swap more than {max_blocks_to_swap} Qwen Image blocks during sampling. "
+                f"Requested {target_blocks_to_swap}."
+            )
+
+        original_blocks_to_swap = int(self.blocks_to_swap or 0)
+        if (original_blocks_to_swap > 0 or target_blocks_to_swap > 0) and self.offloader is None:
+            raise ValueError("Qwen Image sample_blocks_to_swap override requires initialized block swap when a positive count is involved.")
+
+        offloader = self.offloader
+        original_offloader_blocks_to_swap = getattr(offloader, "blocks_to_swap", None) if offloader is not None else None
+        original_forward_only = getattr(offloader, "forward_only", None) if offloader is not None else None
+
+        if target_blocks_to_swap == original_blocks_to_swap and (
+            offloader is None or original_offloader_blocks_to_swap == target_blocks_to_swap
+        ):
+            yield target_blocks_to_swap
+            return
+
+        self._wait_for_pending_block_swaps()
+        try:
+            self.blocks_to_swap = target_blocks_to_swap
+            if offloader is not None:
+                offloader.blocks_to_swap = target_blocks_to_swap
+
+            if target_blocks_to_swap > 0:
+                self.prepare_block_swap_before_forward()
+            else:
+                self.to(device)
+
+            yield target_blocks_to_swap
+        finally:
+            self._wait_for_pending_block_swaps()
+            self.blocks_to_swap = original_blocks_to_swap
+            if offloader is not None:
+                offloader.blocks_to_swap = original_offloader_blocks_to_swap
+                if original_forward_only is not None:
+                    offloader.forward_only = original_forward_only
+
+            if original_blocks_to_swap > 0:
+                self.prepare_block_swap_before_forward()
+            else:
+                self.to(device)
 
     def _gradient_checkpointing_func(self, block, *args):
         if self.activation_cpu_offloading:

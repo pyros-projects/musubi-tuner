@@ -1,5 +1,7 @@
 import argparse
 import gc
+import os
+from pathlib import Path
 from typing import Optional
 
 
@@ -16,6 +18,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_QWEN_IMAGE_LAYERED,
     ARCHITECTURE_QWEN_IMAGE_LAYERED_FULL,
 )
+from musubi_tuner.krea2 import krea2_sampling
 from musubi_tuner.qwen_image import qwen_image_autoencoder_kl, qwen_image_model, qwen_image_utils
 from musubi_tuner.hv_train_network import (
     NetworkTrainer,
@@ -31,6 +34,56 @@ import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _has_qwen_sample_image_value(value):
+    return value is not None and value != "" and value != []
+
+
+def _qwen_sample_image_values_to_list(value, source_key: str) -> list[str | os.PathLike]:
+    if not _has_qwen_sample_image_value(value):
+        return []
+    if isinstance(value, (str, os.PathLike)):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        values = list(value)
+        if not values:
+            return []
+        if any(not _has_qwen_sample_image_value(item) for item in values):
+            raise ValueError(f"Qwen sample prompt {source_key} must contain only non-empty image paths.")
+        return values
+    raise ValueError(f"Qwen sample prompt {source_key} must be an image path string or a list of image path strings.")
+
+
+def _resolve_qwen_sample_image_path(image_value: str | os.PathLike, prompt_file: str | os.PathLike | None = None) -> str:
+    if not isinstance(image_value, (str, os.PathLike)):
+        raise ValueError("Qwen sample prompt image path must be a string.")
+
+    image_path = Path(os.path.expanduser(os.fspath(image_value)))
+    if not image_path.is_absolute() and prompt_file is not None:
+        image_path = Path(prompt_file).expanduser().resolve().parent / image_path
+    image_path = image_path.resolve()
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Qwen sample prompt image path does not exist: {image_path}")
+    return str(image_path)
+
+
+def resolve_qwen_sample_control_image_paths(
+    prompt_dict: dict, prompt_file: str | os.PathLike | None = None
+) -> list[str]:
+    control_value = prompt_dict.get("control_image_path")
+    image_value = prompt_dict.get("image_path")
+    has_control_image = _has_qwen_sample_image_value(control_value)
+    has_image_path = _has_qwen_sample_image_value(image_value)
+
+    if has_control_image and has_image_path:
+        raise ValueError("Qwen sample prompts should use either image_path or control_image_path, not both.")
+    if not has_control_image and not has_image_path:
+        return []
+
+    source_key = "control_image_path" if has_control_image else "image_path"
+    image_values = _qwen_sample_image_values_to_list(control_value if has_control_image else image_value, source_key)
+    return [_resolve_qwen_sample_image_path(image_value, prompt_file) for image_value in image_values]
 
 
 class QwenImageNetworkTrainer(NetworkTrainer):
@@ -114,6 +167,12 @@ class QwenImageNetworkTrainer(NetworkTrainer):
 
         return converted
 
+    def _encode_sample_control_latent(self, vae, control_image_tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        vae_dtype = getattr(vae, "dtype", torch.bfloat16)
+        with torch.no_grad():
+            control_latent = vae.encode_pixels_to_latents(control_image_tensor.to(device=device, dtype=vae_dtype))
+        return control_latent.to(torch.bfloat16).detach().cpu()
+
     def process_sample_prompts(
         self,
         args: argparse.Namespace,
@@ -124,6 +183,11 @@ class QwenImageNetworkTrainer(NetworkTrainer):
 
         logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
         prompts = load_prompts(sample_prompts)
+        if self.is_edit or self.is_layered:
+            for prompt_dict in prompts:
+                control_image_paths = resolve_qwen_sample_control_image_paths(prompt_dict, sample_prompts)
+                if control_image_paths:
+                    prompt_dict["control_image_path"] = control_image_paths
 
         # Load Qwen2.5-VL
         vl_dtype = torch.float8_e4m3fn if args.fp8_vl else torch.bfloat16
@@ -212,6 +276,43 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         gc.collect()
         clean_memory_on_device(device)
 
+        control_latent_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
+        control_tensor_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
+        if self.is_edit or self.is_layered:
+            for prompt_dict in prompts:
+                control_image_paths = prompt_dict.get("control_image_path")
+                control_image_tensors = prompt_dict.get("control_image_tensors")
+                if not control_image_paths or not control_image_tensors:
+                    continue
+                for control_image_path, control_image_tensor in zip(control_image_paths, control_image_tensors):
+                    cache_key = (control_image_path, tuple(control_image_tensor.shape))
+                    control_tensor_cache.setdefault(cache_key, control_image_tensor)
+
+        if control_tensor_cache:
+            if not getattr(args, "vae", None):
+                raise ValueError("Qwen edit sample input images require --vae so control latents can be pre-cached.")
+            vae_dtype = torch.bfloat16 if getattr(args, "vae_dtype", None) is None else model_utils.str_to_dtype(args.vae_dtype)
+            vae = self.load_vae(args, vae_dtype=vae_dtype, vae_path=args.vae)
+            vae.to(device=device, dtype=vae_dtype)
+            vae.eval()
+            try:
+                for cache_key, control_image_tensor in control_tensor_cache.items():
+                    control_latent_cache[cache_key] = self._encode_sample_control_latent(vae, control_image_tensor, device)
+            finally:
+                vae.to("cpu")
+                del vae
+                clean_memory_on_device(device)
+
+            for prompt_dict in prompts:
+                control_image_paths = prompt_dict.get("control_image_path")
+                control_image_tensors = prompt_dict.get("control_image_tensors")
+                if not control_image_paths or not control_image_tensors:
+                    continue
+                prompt_dict["qwen_control_latents"] = [
+                    control_latent_cache[(control_image_path, tuple(control_image_tensor.shape))]
+                    for control_image_path, control_image_tensor in zip(control_image_paths, control_image_tensors)
+                ]
+
         # prepare sample parameters
         sample_parameters = []
         for prompt_dict in prompts:
@@ -229,6 +330,7 @@ class QwenImageNetworkTrainer(NetworkTrainer):
             p = prompt_dict.get("negative_prompt", " ")
             embed_key = embed_key_fn(p, control_image_paths)
             prompt_dict_copy["negative_vl_embed"] = sample_prompts_te_outputs[embed_key]
+            prompt_dict_copy.pop("control_image_tensors", None)
 
             sample_parameters.append(prompt_dict_copy)
 
@@ -289,17 +391,24 @@ class QwenImageNetworkTrainer(NetworkTrainer):
 
         if is_edit or self.is_layered:
             # 4.1 Prepare control latents
-            logger.info("Preparing control latents from control image")
-            control_image_tensors = sample_parameter.get("control_image_tensors")  # list of tensors
-            vae.to(device)
-            vae.eval()
+            cached_control_latents = sample_parameter.get("qwen_control_latents")
+            if cached_control_latents is not None:
+                logger.info("Using cached control latents")
+                control_latents = [cl.to(torch.bfloat16).to("cpu") for cl in cached_control_latents]
+            else:
+                logger.info("Preparing control latents from control image")
+                control_image_tensors = sample_parameter.get("control_image_tensors")  # list of tensors
+                if control_image_tensors is None:
+                    raise ValueError("Qwen edit sampling requires cached control latents or control image tensors.")
+                vae.to(device)
+                vae.eval()
 
-            with torch.no_grad():
-                control_latents = [vae.encode_pixels_to_latents(t.to(device, vae.dtype)) for t in control_image_tensors]
-            control_latents = [cl.to(torch.bfloat16).to("cpu") for cl in control_latents]
+                with torch.no_grad():
+                    control_latents = [vae.encode_pixels_to_latents(t.to(device, vae.dtype)) for t in control_image_tensors]
+                control_latents = [cl.to(torch.bfloat16).to("cpu") for cl in control_latents]
 
-            vae.to("cpu")
-            clean_memory_on_device(device)
+                vae.to("cpu")
+                clean_memory_on_device(device)
 
             img_shapes = [img_shapes + [(1, cl.shape[-2] // 2, cl.shape[-1] // 2) for cl in control_latents]]
             control_latent = [qwen_image_utils.pack_latents(cl) for cl in control_latents]  # B, C, 1, H, W -> B, H*W, C
@@ -386,28 +495,37 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         # BLCHW for layered with num_layers > 0, or BC1HW for non-layered (backward compatibility) or layered with num_layers=0
         latents = qwen_image_utils.unpack_latents(latents, height, width, is_layered=args.is_layered)
 
-        # Move VAE to the appropriate device for sampling
-        vae.to(device)
-        vae.eval()
-
         # Decode latents to video
         logger.info(f"Decoding video from latents: {latents.shape}")
         if latents.shape[2] != 1:  # 1 L C H W
             latents = latents.permute(1, 2, 0, 3, 4)  # 1 L C H W -> L C 1 H W
         pixels_list = []
-        with torch.no_grad():
-            for i in range(latents.shape[0]):
-                latents_i = latents[i : i + 1].to(device)
-                pixels_i = vae.decode_to_pixels(latents_i)  # decode to pixels, 0-1
-                pixels_list.append(pixels_i.to(torch.float32).cpu())
-                del latents_i, pixels_i
+        with krea2_sampling.transformer_decode_offload(
+            model,
+            device,
+            enabled=bool(getattr(args, "sample_with_offloading", False)),
+            restore_after=False,
+            clean_fn=clean_memory_on_device,
+        ):
+            # Move VAE to the appropriate device for sampling after optional DiT offload.
+            vae.to(device)
+            vae.eval()
+
+            try:
+                with torch.no_grad():
+                    for i in range(latents.shape[0]):
+                        latents_i = latents[i : i + 1].to(device)
+                        pixels_i = vae.decode_to_pixels(latents_i)  # decode to pixels, 0-1
+                        pixels_list.append(pixels_i.to(torch.float32).cpu())
+                        del latents_i, pixels_i
+            finally:
+                vae.to("cpu")
         latents = None
         pixels = torch.cat(pixels_list, dim=0)  # L C H W
 
         logger.info("Decoding complete")
         pixels = pixels.to(torch.float32).cpu()
 
-        vae.to("cpu")
         clean_memory_on_device(device)
 
         pixels = pixels.unsqueeze(2)  # add a dummy dimension for video frames, L C H W -> L C 1 H W
