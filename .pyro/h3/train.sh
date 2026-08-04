@@ -17,23 +17,28 @@ DIT="${DIT:-/home/pyro/models/comfy/diffusion_models/minimax_h3_fl2va_pruned_int
 TEXT_ENCODER="${TEXT_ENCODER:-/home/pyro/models/comfy/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors}"
 VAE="${VAE:-/home/pyro/models/comfy/vae/minimax_h3_video_vae_fp16.safetensors}"
 
-H3_NAME="${H3_NAME:-lucy_v2}"
-CACHE_DATASET="${CACHE_DATASET:-0}"
-MAX_STEPS="${MAX_STEPS:-4000}"
+H3_NAME="${H3_NAME:-bb}"
+CACHE_DATASET="${CACHE_DATASET:-1}"
+MAX_STEPS="${MAX_STEPS:-1000}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
-SAMPLE_EVERY="${SAMPLE_EVERY:-25}"
+SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
 SAMPLE_PROMPTS="${SAMPLE_PROMPTS:-.pyro/h3/cfg/p_${H3_NAME}.toml}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
 NETWORK_DIM="${NETWORK_DIM:-32}"
 NETWORK_ALPHA="${NETWORK_ALPHA:-$NETWORK_DIM}"
 LORA_PRESET="${LORA_PRESET:-attn_mlp}"
-LEARNING_RATE="${LEARNING_RATE:-1e-4}"
-BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-4}"
-CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-1}"
+OPTIMIZER="${OPTIMIZER:-prodigy}"  # adamw8bit | adafactor | prodigy
+LEARNING_RATE="${LEARNING_RATE:-}"   # empty = optimizer-specific default
+BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-12}"
+CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-8}"
 CACHE_TEXT_BATCH_SIZE="${CACHE_TEXT_BATCH_SIZE:-1}"
 IMAGE_FRAME_COUNT="${IMAGE_FRAME_COUNT:-1}"
 IMAGE_AUDIO_MODE="${IMAGE_AUDIO_MODE:-none}"
 TIMESTEP_PRESET="${TIMESTEP_PRESET:-image}"
+SAMPLE_LATENT_FRAMES="${SAMPLE_LATENT_FRAMES:-2}"
+SAMPLE_AUDIO_MODE="${SAMPLE_AUDIO_MODE:-auto}"
+SAMPLE_SOLVER="${SAMPLE_SOLVER:-ab2}"
+SAMPLE_FRAME_SELECT="${SAMPLE_FRAME_SELECT:-dup_last}"
 
 if [[ ! "$H3_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "H3_NAME may only contain letters, numbers, dot, underscore, and dash: $H3_NAME" >&2
@@ -51,9 +56,25 @@ case "$IMAGE_AUDIO_MODE" in
     none|silent) ;;
     *) echo "IMAGE_AUDIO_MODE must be none or silent: $IMAGE_AUDIO_MODE" >&2; exit 1 ;;
 esac
+if [[ "$SAMPLE_LATENT_FRAMES" != 1 && "$SAMPLE_LATENT_FRAMES" != 2 ]]; then
+    echo "SAMPLE_LATENT_FRAMES must be 1 or 2: $SAMPLE_LATENT_FRAMES" >&2
+    exit 1
+fi
+case "$SAMPLE_AUDIO_MODE" in
+    auto|none|silent) ;;
+    *) echo "SAMPLE_AUDIO_MODE must be auto, none, or silent: $SAMPLE_AUDIO_MODE" >&2; exit 1 ;;
+esac
+case "$SAMPLE_SOLVER" in
+    euler|ab2) ;;
+    *) echo "SAMPLE_SOLVER must be euler or ab2: $SAMPLE_SOLVER" >&2; exit 1 ;;
+esac
+case "$SAMPLE_FRAME_SELECT" in
+    dup_last|first|last|sharpest) ;;
+    *) echo "SAMPLE_FRAME_SELECT must be dup_last, first, last, or sharpest: $SAMPLE_FRAME_SELECT" >&2; exit 1 ;;
+esac
 case "$LORA_PRESET" in
-    attn|attn_mlp|full) ;;
-    *) echo "LORA_PRESET must be attn, attn_mlp, or full: $LORA_PRESET" >&2; exit 1 ;;
+    attn|attn_mlp|no_packed_attn|full) ;;
+    *) echo "LORA_PRESET must be attn, attn_mlp, no_packed_attn, or full: $LORA_PRESET" >&2; exit 1 ;;
 esac
 case "$TIMESTEP_PRESET" in
     image_v0)
@@ -70,7 +91,7 @@ case "$TIMESTEP_PRESET" in
             --discrete_flow_shift 12
             --preserve_distribution_shape
             --min_timestep 0
-            --max_timestep 875
+            --max_timestep 900
         )
         ;;
     h3_video)
@@ -81,6 +102,33 @@ case "$TIMESTEP_PRESET" in
         )
         ;;
     *) echo "TIMESTEP_PRESET must be image or h3_video: $TIMESTEP_PRESET" >&2; exit 1 ;;
+esac
+
+case "$OPTIMIZER" in
+    adamw8bit)
+        LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+        OPT_ARGS=(--optimizer_type adamw8bit --learning_rate "$LEARNING_RATE" --lr_scheduler constant)
+        ;;
+    adafactor)
+        LEARNING_RATE="${LEARNING_RATE:-2e-4}"
+        OPT_ARGS=(
+            --optimizer_type adafactor
+            --optimizer_args "scale_parameter=False" "relative_step=False" "warmup_init=False"
+            --learning_rate "$LEARNING_RATE"
+            --lr_scheduler constant
+            --max_grad_norm 0
+        )
+        ;;
+    prodigy)
+        LEARNING_RATE="${LEARNING_RATE:-1.0}"
+        OPT_ARGS=(
+            --optimizer_type ProdigyPlusScheduleFree
+            --optimizer_args "betas=(0.9,0.99)" "weight_decay=0.0"
+            --learning_rate "$LEARNING_RATE"
+            --max_grad_norm 0
+        )
+        ;;
+    *) echo "OPTIMIZER must be adamw8bit, adafactor, or prodigy: $OPTIMIZER" >&2; exit 1 ;;
 esac
 
 truthy() {
@@ -120,7 +168,7 @@ LORA_TAG="$LORA_PRESET"
 if [[ "$LORA_PRESET" == full ]]; then
     LORA_TAG="all"
 fi
-RUN_NAME="${H3_NAME}${FRAME_SUFFIX}${AUDIO_SUFFIX}${TIMESTEP_SUFFIX}-${LORA_TAG}-r${NETWORK_DIM}-${TIMESTEP_PRESET}-adamw8bit"
+RUN_NAME="${H3_NAME}${FRAME_SUFFIX}${AUDIO_SUFFIX}${TIMESTEP_SUFFIX}-${LORA_TAG}-r${NETWORK_DIM}-${TIMESTEP_PRESET}-${IMAGE_AUDIO_MODE}-${OPTIMIZER}"
 OUTPUT_DIR="${OUTPUT_DIR:-/home/pyro/models/_out/h3/$RUN_NAME}"
 
 for path in "$PYTHON" "$ACCELERATE"; do
@@ -149,19 +197,23 @@ if (( SAMPLE_EVERY > 0 )); then
         --vae_dtype float16
         --sample_prompts "$SAMPLE_PROMPTS"
         --sample_every_n_steps "$SAMPLE_EVERY"
+        --sample_latent_frames "$SAMPLE_LATENT_FRAMES"
+        --sample_audio_mode "$SAMPLE_AUDIO_MODE"
+        --sample_solver "$SAMPLE_SOLVER"
+        --sample_frame_select "$SAMPLE_FRAME_SELECT"
     )
 fi
 
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 refuse_while_comfy_runs
 
-echo "H3 image LoRA: dataset=$H3_NAME output=$RUN_NAME steps=$MAX_STEPS rank=$NETWORK_DIM"
+echo "H3 image LoRA: dataset=$H3_NAME output=$RUN_NAME steps=$MAX_STEPS rank=$NETWORK_DIM optimizer=$OPTIMIZER lr=$LEARNING_RATE"
 echo "H3 cache step: CACHE_DATASET=$CACHE_DATASET"
 echo "H3 image cache: frames=$IMAGE_FRAME_COUNT config=$DATASET_TOML"
 echo "H3 image audio: mode=$IMAGE_AUDIO_MODE"
 echo "H3 timesteps: preset=$TIMESTEP_PRESET"
 echo "H3 LoRA targets: preset=$LORA_PRESET"
-echo "H3 preview: every=$SAMPLE_EVERY prompts=$SAMPLE_PROMPTS"
+echo "H3 preview: every=$SAMPLE_EVERY prompts=$SAMPLE_PROMPTS latents=$SAMPLE_LATENT_FRAMES audio=$SAMPLE_AUDIO_MODE solver=$SAMPLE_SOLVER frame=$SAMPLE_FRAME_SELECT"
 
 CACHE_DATASET_ENABLED=0
 if truthy "$CACHE_DATASET"; then
@@ -231,9 +283,7 @@ exec "$ACCELERATE" launch \
     --network_dim "$NETWORK_DIM" \
     --network_alpha "$NETWORK_ALPHA" \
     --lora_target_preset "$LORA_PRESET" \
-    --optimizer_type adamw8bit \
-    --learning_rate "$LEARNING_RATE" \
-    --lr_scheduler constant \
+    "${OPT_ARGS[@]}" \
     --gradient_accumulation_steps "$GRAD_ACCUM" \
     --max_train_steps "$MAX_STEPS" \
     --save_every_n_steps "$SAVE_EVERY" --save_state --save_last_n_steps_state 2 \

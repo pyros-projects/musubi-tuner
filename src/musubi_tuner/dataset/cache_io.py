@@ -543,8 +543,9 @@ def save_text_encoder_output_cache_common(
                 sd[key] = f.get_tensor(key)
 
         assert existing_metadata["architecture"] == metadata["architecture"], "architecture mismatch"
-        if existing_metadata["caption1"] != metadata["caption1"]:
-            logger.warning(f"caption mismatch: existing={existing_metadata['caption1']}, new={metadata['caption1']}, overwrite")
+        existing_caption = existing_metadata.get("caption1")
+        if existing_caption != metadata["caption1"]:
+            logger.warning(f"caption mismatch: existing={existing_caption}, new={metadata['caption1']}, overwrite")
         # TODO verify format_version
 
         existing_metadata.pop("caption1", None)

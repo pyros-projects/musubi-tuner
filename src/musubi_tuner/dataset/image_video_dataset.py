@@ -119,9 +119,11 @@ class BaseDataset(torch.utils.data.Dataset):
         cache_directory: Optional[str] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        caption_prefix: str = "",
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
+        self.caption_prefix = caption_prefix or ""
         self.batch_size = batch_size
         self.num_repeats = num_repeats
         self.enable_bucket = enable_bucket
@@ -140,6 +142,7 @@ class BaseDataset(torch.utils.data.Dataset):
         metadata = {
             "resolution": self.resolution,
             "caption_extension": self.caption_extension,
+            "caption_prefix": self.caption_prefix,
             "batch_size_per_device": self.batch_size,
             "num_repeats": self.num_repeats,
             "enable_bucket": bool(self.enable_bucket),
@@ -291,6 +294,7 @@ class ImageDataset(BaseDataset):
         control_resolution: Optional[Tuple[int, int]] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        caption_prefix: str = "",
     ):
         super(ImageDataset, self).__init__(
             resolution,
@@ -302,6 +306,7 @@ class ImageDataset(BaseDataset):
             cache_directory,
             debug_dataset,
             architecture,
+            caption_prefix=caption_prefix,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -335,10 +340,20 @@ class ImageDataset(BaseDataset):
 
         if image_directory is not None:
             self.datasource = ImageDirectoryDatasource(
-                image_directory, caption_extension, control_directory, control_count_per_image, multiple_target
+                image_directory,
+                caption_extension,
+                control_directory,
+                control_count_per_image,
+                multiple_target,
+                caption_prefix=caption_prefix,
             )
         elif image_jsonl_file is not None:
-            self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image, multiple_target)
+            self.datasource = ImageJsonlDatasource(
+                image_jsonl_file,
+                control_count_per_image,
+                multiple_target,
+                caption_prefix=caption_prefix,
+            )
         else:
             raise ValueError("image_directory or image_jsonl_file must be specified")
 
@@ -607,6 +622,7 @@ class VideoDataset(BaseDataset):
         fp_latent_window_size: Optional[int] = 9,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        caption_prefix: str = "",
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -618,6 +634,7 @@ class VideoDataset(BaseDataset):
             cache_directory,
             debug_dataset,
             architecture,
+            caption_prefix=caption_prefix,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
@@ -670,9 +687,14 @@ class VideoDataset(BaseDataset):
         self.target_frames = target_frames
 
         if video_directory is not None:
-            self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory)
+            self.datasource = VideoDirectoryDatasource(
+                video_directory,
+                caption_extension,
+                control_directory,
+                caption_prefix=caption_prefix,
+            )
         elif video_jsonl_file is not None:
-            self.datasource = VideoJsonlDatasource(video_jsonl_file)
+            self.datasource = VideoJsonlDatasource(video_jsonl_file, caption_prefix=caption_prefix)
 
         if self.frame_extraction == "uniform" and self.frame_sample == 1:
             self.frame_extraction = "head"

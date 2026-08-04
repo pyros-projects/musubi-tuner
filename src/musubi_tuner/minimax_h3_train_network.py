@@ -25,6 +25,11 @@ logging.basicConfig(level=logging.INFO)
 H3_LORA_TARGET_PRESETS: dict[str, list[str] | None] = {
     "attn": [r".*\.attn\.(qkv_proj|out_proj)$"],
     "attn_mlp": [r".*\.attn\.(qkv_proj|out_proj)$", r".*\.mlp\.(fc1|fc2)$"],
+    "no_packed_attn": [
+        r"token_refiner\.blocks\.[0-9]+\.attn\.(qkv_proj|out_proj)$",
+        r"token_refiner\.blocks\.[0-9]+\.mlp\.(fc1|fc2)$",
+        r"blocks\.[0-9]+\.mlp\.(fc1|fc2)$",
+    ],
     "full": None,
 }
 
@@ -75,11 +80,19 @@ def sample_h3_image_latents(
     device: torch.device,
     dtype: torch.dtype,
     generator: torch.Generator,
+    audio_flow_shift: float = 3.0,
+    latent_frames: int = 2,
+    audio_latent_frames: int = 0,
+    solver: str = "ab2",
     latents: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if height % 32 or width % 32:
         raise ValueError("H3 preview width and height must be divisible by 32")
-    shape = (1, 24, 1, height // 16, width // 16)
+    if latent_frames != 1 and (latent_frames < 2 or (latent_frames - 2) % 5):
+        raise ValueError("H3 previews support 1 temporal latent or the video contract 5n+2")
+    if solver not in ("euler", "ab2"):
+        raise ValueError(f"Unknown H3 preview solver: {solver}")
+    shape = (1, 24, latent_frames, height // 16, width // 16)
     if latents is None:
         latents = torch.randn(shape, generator=generator, device=device, dtype=torch.float32)
     elif tuple(latents.shape) != shape:
@@ -89,17 +102,40 @@ def sample_h3_image_latents(
 
     context = context.to(device=device, dtype=dtype)
     token_tags = token_tags.to(device=device, dtype=torch.long)
-    audio = torch.empty((1, 32, 2, 0), device=device, dtype=dtype)
+    if audio_latent_frames > 0:
+        audio = torch.randn((1, 32, 2, audio_latent_frames), generator=generator, device=device, dtype=torch.float32)
+    else:
+        audio = torch.zeros((1, 32, 2, 0), device=device, dtype=torch.float32)
     sigmas = build_h3_sigma_schedule(sample_steps, video_flow_shift, device)
-    for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
-        prediction, _ = transformer(
+    audio_sigmas = time_shift_sigma(sigmas, video_flow_shift, audio_flow_shift)
+
+    previous_video = previous_audio = None
+    previous_step = previous_audio_step = None
+    for index in range(sample_steps):
+        video_step = (sigmas[index] - sigmas[index + 1]).item()
+        audio_step = (audio_sigmas[index] - audio_sigmas[index + 1]).item()
+        pred_video, pred_audio = transformer(
             latents.to(dtype),
-            audio,
-            sigma.view(1),
+            audio.to(dtype),
+            sigmas[index].view(1),
             [context],
             [token_tags],
         )
-        latents = latents + (sigma - sigma_next) * prediction.float()
+        pred_video = pred_video.float()
+        pred_audio = pred_audio.float()
+        if solver == "ab2" and previous_video is not None:
+            # Variable-step Adams-Bashforth 2 on the velocity field.
+            ratio = video_step / previous_step
+            latents = latents + video_step * ((1.0 + ratio / 2.0) * pred_video - (ratio / 2.0) * previous_video)
+            if audio.numel():
+                audio_ratio = audio_step / previous_audio_step
+                audio = audio + audio_step * ((1.0 + audio_ratio / 2.0) * pred_audio - (audio_ratio / 2.0) * previous_audio)
+        else:
+            latents = latents + video_step * pred_video
+            if audio.numel():
+                audio = audio + audio_step * pred_audio
+        previous_video, previous_audio = pred_video, pred_audio
+        previous_step, previous_audio_step = video_step, audio_step
     return latents
 
 
@@ -136,9 +172,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     def process_sample_prompts(self, args, accelerator, sample_prompts):
         samples = load_prompts(sample_prompts)
         for sample in samples:
-            if sample.get("frame_count", 1) != 1:
-                raise ValueError("H3 image previews require frame_count=1")
-            sample["frame_count"] = 1
+            frame_count = int(sample.get("frame_count", 1))
+            if frame_count != 1:
+                aligned = minimax_h3_utils.align_frame_count(frame_count, "down")
+                if aligned != frame_count:
+                    logger.warning("H3 preview frame_count %d aligned down to %d (17*n+5)", frame_count, aligned)
+                frame_count = aligned
+            sample["frame_count"] = frame_count
             sample.setdefault("width", 512)
             sample.setdefault("height", 512)
             sample.setdefault("sample_steps", 12)
@@ -146,6 +186,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError("H3 preview width and height must be divisible by 32")
             if sample.get("negative_prompt") is not None:
                 raise ValueError("MiniMax H3 preview sampling does not support negative prompts")
+            if int(sample.get("sample_latent_frames", 2)) not in (1, 2):
+                raise ValueError("Prompt-level sample_latent_frames must be 1 or 2")
+            if sample.get("sample_audio_mode", "auto") not in ("auto", "none", "silent"):
+                raise ValueError("Prompt-level sample_audio_mode must be auto, none, or silent")
+            if sample.get("sample_solver", "ab2") not in ("euler", "ab2"):
+                raise ValueError("Prompt-level sample_solver must be euler or ab2")
+            if sample.get("sample_frame_select", "dup_last") not in ("dup_last", "first", "last", "sharpest"):
+                raise ValueError("Prompt-level sample_frame_select must be dup_last, first, last, or sharpest")
 
         cache_path = resolve_sample_prompts_cache_path(args.dataset_config)
         cached_prompts = load_sample_prompt_cache(cache_path, samples)
@@ -182,8 +230,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         control_video_path=None,
     ):
         del guidance_scale, cfg_scale, image_path, control_video_path
-        if frame_count != 1 or do_classifier_free_guidance:
-            raise ValueError("MiniMax H3 training previews support only single-frame generation without CFG")
+        if do_classifier_free_guidance:
+            raise ValueError("MiniMax H3 training previews do not support CFG")
+        # The base trainer rounds frame_count with a stride contract H3 does not
+        # follow, so trust the aligned value from process_sample_prompts.
+        del frame_count
+        frame_count = int(sample_parameter.get("frame_count", 1))
+        if frame_count == 1:
+            # Per-prompt sampling overrides beat the CLI flags so one run can A/B configurations.
+            latent_frames = int(sample_parameter.get("sample_latent_frames", getattr(args, "sample_latent_frames", 2)))
+        else:
+            latent_frames = minimax_h3_utils.video_latent_length(frame_count)
+        audio_mode = sample_parameter.get("sample_audio_mode", getattr(args, "sample_audio_mode", "auto"))
+        if audio_mode == "auto":
+            audio_mode = getattr(args, "image_audio_mode", "none")
+        audio_latent_frames = _silent_audio_latent_length(latent_frames) if audio_mode == "silent" else 0
         latents = sample_h3_image_latents(
             transformer,
             sample_parameter["h3_text_embed"],
@@ -195,6 +256,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             device=accelerator.device,
             dtype=dit_dtype,
             generator=generator,
+            audio_flow_shift=args.audio_flow_shift,
+            latent_frames=latent_frames,
+            audio_latent_frames=audio_latent_frames,
+            solver=sample_parameter.get("sample_solver", getattr(args, "sample_solver", "ab2")),
         ).cpu()
 
         parked = False
@@ -202,7 +267,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             transformer.park_main_block_weights_for_decode()
             parked = True
             vae.to(accelerator.device)
-            pixels = vae.decode(latents.to(accelerator.device))
+            if frame_count == 1:
+                frame_select = sample_parameter.get("sample_frame_select", getattr(args, "sample_frame_select", "dup_last"))
+                pixels = vae.decode(latents.to(accelerator.device), frame_select=frame_select)
+            else:
+                # Sampled audio latents are discarded; video previews save as silent mp4.
+                pixels = vae.decode_video(latents.to(accelerator.device))
             return ((pixels.float() + 1.0) * 0.5).clamp_(0.0, 1.0).cpu()
         finally:
             vae.to("cpu")
@@ -373,7 +443,35 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         "--lora_target_preset",
         choices=list(H3_LORA_TARGET_PRESETS),
         default="attn_mlp",
-        help="LoRA targets: attn (104), attn_mlp (208, portable default), or full (258, checkpoint-layout specific)",
+        help=(
+            "LoRA targets: attn (104), attn_mlp (208, portable default), "
+            "no_packed_attn (108), or full (258, checkpoint-layout specific)"
+        ),
+    )
+    parser.add_argument(
+        "--sample_latent_frames",
+        type=int,
+        choices=(1, 2),
+        default=2,
+        help="temporal latents for H3 previews: 2 samples the minimum natural video packet, 1 is the legacy single-latent mode",
+    )
+    parser.add_argument(
+        "--sample_audio_mode",
+        choices=("auto", "none", "silent"),
+        default="auto",
+        help="preview audio rows: silent adds duration-matched audio tokens, auto follows --image_audio_mode",
+    )
+    parser.add_argument(
+        "--sample_solver",
+        choices=("euler", "ab2"),
+        default="ab2",
+        help="preview ODE solver; ab2 is a second-order multistep and sharper at low step counts",
+    )
+    parser.add_argument(
+        "--sample_frame_select",
+        choices=("dup_last", "first", "last", "sharpest"),
+        default="dup_last",
+        help="preview frame from the two-latent packet: dup_last decodes the second latent through the measured-best duplicate path; first/last/sharpest pick from the natural five-frame clip",
     )
     parser.set_defaults(timestep_sampling="shift", discrete_flow_shift=12.0, mixed_precision="bf16")
     return parser

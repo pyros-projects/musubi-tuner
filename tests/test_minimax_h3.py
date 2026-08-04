@@ -114,7 +114,10 @@ def test_tiny_h3_forward_and_backward():
     assert image_context.grad is not None
 
 
-@pytest.mark.parametrize(("preset", "expected_modules"), [("attn", 6), ("attn_mlp", 12), ("full", 14)])
+@pytest.mark.parametrize(
+    ("preset", "expected_modules"),
+    [("attn", 6), ("attn_mlp", 12), ("no_packed_attn", 8), ("full", 14)],
+)
 def test_h3_lora_target_presets_select_expected_modules(preset, expected_modules):
     args = SimpleNamespace(lora_target_preset=preset, network_args=None)
     _apply_h3_lora_target_preset(args)
@@ -138,6 +141,17 @@ def test_h3_lora_target_presets_select_expected_modules(preset, expected_modules
     network = lora.create_arch_network(1.0, 4, 4, None, None, model, **network_kwargs)
 
     assert len(network.unet_loras) == expected_modules
+    if preset == "no_packed_attn":
+        assert {module.lora_name for module in network.unet_loras} == {
+            "lora_unet_token_refiner_blocks_0_attn_qkv_proj",
+            "lora_unet_token_refiner_blocks_0_attn_out_proj",
+            "lora_unet_token_refiner_blocks_0_mlp_fc1",
+            "lora_unet_token_refiner_blocks_0_mlp_fc2",
+            "lora_unet_blocks_0_mlp_fc1",
+            "lora_unet_blocks_0_mlp_fc2",
+            "lora_unet_blocks_1_mlp_fc1",
+            "lora_unet_blocks_1_mlp_fc2",
+        }
 
 
 def test_h3_image_only_latent_cache(monkeypatch):
@@ -420,7 +434,7 @@ def test_h3_existing_dataset_text_cache_skips_text_encoder_load(monkeypatch, tmp
     cache_dir.mkdir()
     Image.new("RGB", (32, 32)).save(image_dir / "lucy.png")
     (image_dir / "lucy.txt").write_text("lucy the cat", encoding="utf-8")
-    save_file({"cached": torch.zeros(1)}, cache_dir / "lucy_h3_te.safetensors")
+    save_file({"cached": torch.zeros(1)}, cache_dir / "lucy_h3_te.safetensors", metadata={"caption1": "lucy the cat"})
     dataset_path = tmp_path / "dataset.toml"
     dataset_path.write_text(
         f'''

@@ -123,6 +123,8 @@ To train against a Comfy INT8/ConvRot base, point `--dit` at either FL2VA INT8 f
 
 `--lora_target_preset attn_mlp` is the default and is portable between the full and modulation-pruned transformer layouts. The optional `full` preset also targets AdaLN projections, whose input width is `2688` in the full checkpoint but `8` in the pruned curve-table checkpoint. Use `full` only when training and inference use the same transformer layout.
 
+`--lora_target_preset no_packed_attn` freezes attention in all 50 packed audio/video/text blocks while training their MLP projections plus every attention and MLP projection in the two text-only token-refiner blocks (108 modules). This removes direct LoRA updates from H3's shared spatiotemporal attention path; it does not make temporal behavior immutable because the trained MLP outputs still feed later frozen attention blocks.
+
 H3 uses a video sigma shift of 12 and an audio sigma shift of 3. The trainer samples the video schedule, maps the same base time to the audio schedule, noises both cached streams, and optimizes both raw `clean-noise` velocity targets. `--audio_loss_weight` controls the audio term relative to video.
 
 ### Image previews during training
@@ -152,12 +154,12 @@ Add the decoder and cadence to the training command:
 
 The local launcher selects `.pyro/h3/cfg/p_${H3_NAME}.toml`; set `SAMPLE_PROMPTS` only to override it explicitly. Prompt changes invalidate and rebuild the aggregate cache automatically before training.
 
-The trainer denoises a true single-frame latent without CFG. For decoding, it duplicates that latent into the decoder's minimum in-distribution two-token temporal shape and keeps the aligned first frame. Before VAE decoding, the frozen transformer is temporarily parked on CPU to keep peak VRAM bounded. Preview PNGs are written under `<output_dir>/sample/`.
+By default the trainer samples the minimum natural video packet without CFG: two temporal latents plus duration-matched silent audio rows when the training run uses them (`--sample_audio_mode auto` follows `--image_audio_mode`), integrated with a second-order multistep solver (`--sample_solver ab2`). H3 is a video model, so giving it an in-distribution packet and harvesting one frame produces markedly better stills than denoising a lone latent. The packet is reduced to one preview via `--sample_frame_select`: the default `dup_last` decodes the packet's second latent through the measured-best duplicate path, while `first`, `last`, and `sharpest` pick from the natural five-frame clip (the seam frame between the two latent patches decodes with striping and is skipped). `--sample_latent_frames 1` restores the legacy single-latent mode, whose decode duplicates the latent and keeps the final frame. Setting `frame_count` to a `17*n+5` value in a prompt turns that subset into a video preview: the full latent clip is sampled, decoded through the chunked reference decoder, and saved as a silent `.mp4` (sampled audio latents are discarded; other counts are aligned down). Before VAE decoding, the frozen transformer is temporarily parked on CPU to keep peak VRAM bounded. Preview PNGs are written under `<output_dir>/sample/`.
 
 Notes:
 
 - With classic block swap, keep the loader `batch_size` at `1`; use `--gradient_accumulation_steps` for a larger effective batch.
 - `--blocks_to_swap` can be at most 48 for the 50-block transformer.
 - `--fp8_base` and `--fp8_scaled` are rejected. INT8/ConvRot is selected by the `--dit` checkpoint itself.
-- H3 training previews currently support `frame_count=1`, positive prompts, and classic block swap only.
+- H3 training previews support single images (`frame_count=1`) and silent video clips (`frame_count` of `17*n+5`), positive prompts, and classic block swap only. Video previews are much slower per tick; prefer 512px canvases and a low sampling cadence. The preview flags `--sample_latent_frames`, `--sample_audio_mode`, `--sample_solver`, and `--sample_frame_select` control the internal sampling packet for A/B testing; each can also be set per prompt inside the prompt file (`sample_latent_frames = 1` in a `[[prompt.subset]]` overrides the CLI flag), so one run can preview several sampling configurations side by side.
 - Video samples without an audio track use encoded silent audio latents. For image caches, choose `--image_audio_mode none` or `silent`; synthesized silent rows remain loss-excluded and require `--audio_loss_weight 0`.

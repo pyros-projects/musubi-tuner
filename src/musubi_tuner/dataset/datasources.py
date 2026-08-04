@@ -16,6 +16,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def apply_caption_prefix(caption_prefix: str, caption: str) -> str:
+    return f"{caption_prefix}{caption}"
+
+
+def read_caption_with_prefix(item_path: str, caption_extension: Optional[str], caption_prefix: str) -> str:
+    if not caption_extension:
+        if caption_prefix:
+            return caption_prefix
+        raise FileNotFoundError("caption_extension is required when caption_prefix is empty")
+
+    caption_path = os.path.splitext(item_path)[0] + caption_extension
+    try:
+        with open(caption_path, "r", encoding="utf-8") as f:
+            return apply_caption_prefix(caption_prefix, f.read().strip())
+    except FileNotFoundError:
+        if caption_prefix:
+            return caption_prefix
+        raise
+
+
 class ContentDatasource:
     def __init__(self):
         self.caption_only = False  # set to True to only fetch caption for Text Encoder caching
@@ -64,18 +84,31 @@ class ImageDirectoryDatasource(ImageDatasource):
         control_directory: Optional[str] = None,
         control_count_per_image: Optional[int] = None,
         multiple_target: bool = False,
+        caption_prefix: str = "",
     ):
         super().__init__()
         self.image_directory = image_directory
         self.caption_extension = caption_extension
+        self.caption_prefix = caption_prefix or ""
         self.control_directory = control_directory
         self.control_count_per_image = control_count_per_image
         self.multiple_target = multiple_target
         self.current_idx = 0
 
+        if self.caption_prefix and self.multiple_target and not self.caption_extension:
+            raise ValueError("caption_extension is required when caption_prefix is used with multiple_target=True")
+
         # glob images
         logger.info(f"glob images in {self.image_directory}")
-        self.image_paths = glob_images(self.image_directory, caption_extension=self.caption_extension)
+        caption_filter_extension = self.caption_extension
+        if self.caption_prefix and not self.multiple_target:
+            caption_filter_extension = None
+        elif self.caption_prefix and self.multiple_target:
+            logger.warning(
+                "caption_prefix fallback for missing image sidecars is disabled when multiple_target=True "
+                "because caption files identify base images."
+            )
+        self.image_paths = glob_images(self.image_directory, caption_extension=caption_filter_extension)
         logger.info(f"found {len(self.image_paths)} images")
 
         # check if multiple-target images exist
@@ -240,9 +273,7 @@ class ImageDirectoryDatasource(ImageDatasource):
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         image_path = self.image_paths[idx]
-        caption_path = os.path.splitext(image_path)[0] + self.caption_extension if self.caption_extension else ""
-        with open(caption_path, "r", encoding="utf-8") as f:
-            caption = f.read().strip()
+        caption = read_caption_with_prefix(image_path, self.caption_extension, self.caption_prefix)
         return image_path, caption
 
     def __iter__(self):
@@ -274,11 +305,18 @@ class ImageDirectoryDatasource(ImageDatasource):
 
 
 class ImageJsonlDatasource(ImageDatasource):
-    def __init__(self, image_jsonl_file: str, control_count_per_image: Optional[int] = None, multiple_target: bool = False):
+    def __init__(
+        self,
+        image_jsonl_file: str,
+        control_count_per_image: Optional[int] = None,
+        multiple_target: bool = False,
+        caption_prefix: str = "",
+    ):
         super().__init__()
         self.image_jsonl_file = image_jsonl_file
         self.control_count_per_image = control_count_per_image
         self.multiple_target = multiple_target
+        self.caption_prefix = caption_prefix or ""
         self.current_idx = 0
 
         # load jsonl
@@ -353,7 +391,7 @@ class ImageJsonlDatasource(ImageDatasource):
                 img = img.convert("RGB")
             images.append(img)
 
-        caption = data["caption"]
+        _, caption = self.get_caption(idx)
 
         controls = None
         if self.has_control:
@@ -372,7 +410,7 @@ class ImageJsonlDatasource(ImageDatasource):
     def get_caption(self, idx: int) -> tuple[str, str]:
         data = self.data[idx]
         image_path = data.get("image_path", data.get("image_path_0"))
-        caption = data["caption"]
+        caption = apply_caption_prefix(self.caption_prefix, data["caption"])
         return image_path, caption
 
     def __iter__(self):
@@ -470,10 +508,17 @@ class VideoDatasource(ContentDatasource):
 
 
 class VideoDirectoryDatasource(VideoDatasource):
-    def __init__(self, video_directory: str, caption_extension: Optional[str] = None, control_directory: Optional[str] = None):
+    def __init__(
+        self,
+        video_directory: str,
+        caption_extension: Optional[str] = None,
+        control_directory: Optional[str] = None,
+        caption_prefix: str = "",
+    ):
         super().__init__()
         self.video_directory = video_directory
         self.caption_extension = caption_extension
+        self.caption_prefix = caption_prefix or ""
         self.control_directory = control_directory
         self.current_idx = 0
 
@@ -549,9 +594,7 @@ class VideoDirectoryDatasource(VideoDatasource):
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         video_path = self.video_paths[idx]
-        caption_path = os.path.splitext(video_path)[0] + self.caption_extension if self.caption_extension else ""
-        with open(caption_path, "r", encoding="utf-8") as f:
-            caption = f.read().strip()
+        caption = read_caption_with_prefix(video_path, self.caption_extension, self.caption_prefix)
         return video_path, caption
 
     def __iter__(self):
@@ -581,9 +624,10 @@ class VideoDirectoryDatasource(VideoDatasource):
 
 
 class VideoJsonlDatasource(VideoDatasource):
-    def __init__(self, video_jsonl_file: str):
+    def __init__(self, video_jsonl_file: str, caption_prefix: str = ""):
         super().__init__()
         self.video_jsonl_file = video_jsonl_file
+        self.caption_prefix = caption_prefix or ""
         self.current_idx = 0
 
         # load jsonl
@@ -622,7 +666,7 @@ class VideoJsonlDatasource(VideoDatasource):
         video_path = data["video_path"]
         video = self.get_video_data_from_path(video_path, start_frame, end_frame, bucket_selector)
 
-        caption = data["caption"]
+        _, caption = self.get_caption(idx)
 
         control = None
         if "control_path" in data and data["control_path"]:
@@ -634,7 +678,7 @@ class VideoJsonlDatasource(VideoDatasource):
     def get_caption(self, idx: int) -> tuple[str, str]:
         data = self.data[idx]
         video_path = data["video_path"]
-        caption = data["caption"]
+        caption = apply_caption_prefix(self.caption_prefix, data["caption"])
         return video_path, caption
 
     def __iter__(self):

@@ -474,6 +474,110 @@ def decode_single_frame_latent(latents: torch.Tensor, decode_video: Callable[[to
     return decode_video(torch.cat((latents, latents), dim=2))[:, :, -1:]
 
 
+def _select_sharpest_frame(frames: torch.Tensor) -> torch.Tensor:
+    """Pick the temporal frame with the highest Laplacian variance."""
+
+    batch, _, length, height, width = frames.shape
+    weights = torch.tensor([0.2126, 0.7152, 0.0722], device=frames.device, dtype=torch.float32)
+    gray = (frames.float() * weights.view(1, 3, 1, 1, 1)).sum(dim=1)
+    kernel = torch.tensor(
+        [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], device=frames.device, dtype=torch.float32
+    ).view(1, 1, 3, 3)
+    laplacian = F.conv2d(gray.reshape(batch * length, 1, height, width), kernel, padding=1)
+    index = int(laplacian.var(dim=(1, 2, 3)).view(batch, length).mean(dim=0).argmax())
+    return frames[:, :, index : index + 1]
+
+
+# Chunked temporal decode constants, ported from the Apache-2.0 ai-toolkit
+# MiniMax H3 implementation (minimax_h3/src/vae.py). A 17-frame clip maps to 5
+# latents; the decoder emits 4 raw frames per latent, the first 3 of a chunk
+# are temporal pre-padding, chunks overlap by 2 latents and cross-fade over 5
+# pixel frames.
+_CLIP_LENGTH = 17
+_TEMPORAL_RATIO = 4
+_TOKEN_DROP = 3
+_FRAME_PRE_PADDING = (-_CLIP_LENGTH) % _TEMPORAL_RATIO
+_TOKENS_CHUNK_SIZE = math.ceil(_CLIP_LENGTH / _TEMPORAL_RATIO)
+_TOKEN_OVERLAP = (-_TOKEN_DROP) % _TOKENS_CHUNK_SIZE
+_FRAME_OVERLAP = max(_TOKEN_OVERLAP * _TEMPORAL_RATIO - _FRAME_PRE_PADDING, 0)
+
+
+def _blend_time(first: torch.Tensor, second: torch.Tensor, extent: int) -> torch.Tensor:
+    extent = min(first.shape[2], second.shape[2], extent)
+    if extent == 0:
+        return second
+    weights = torch.arange(extent, device=second.device, dtype=second.dtype) / extent
+    weights = weights.view(1, 1, extent, 1, 1)
+    blended = first[:, :, -extent:] * (1.0 - weights) + second[:, :, :extent] * weights
+    if extent == second.shape[2]:
+        return blended
+    return torch.cat((blended, second[:, :, extent:]), dim=2)
+
+
+def decode_video_latents(latents: torch.Tensor, decode_clip: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+    """Chunked H3 video decode: ``5n+2`` latents to ``17n+5`` pixel frames.
+
+    Faithful port of the ai-toolkit reference decode, including its handling
+    of clips shorter than one chunk (padded by repeating the final latent).
+    """
+
+    tcs = _TOKENS_CHUNK_SIZE
+    chunk_frames = tcs * _TEMPORAL_RATIO
+    split_count = 2 if _TOKEN_DROP > 0 else 1
+
+    num_tokens = latents.shape[2] + _TOKEN_DROP
+    pad_tokens = (-num_tokens) % tcs
+    num_chunks = (num_tokens + pad_tokens) // tcs - (split_count - 1)
+    if num_chunks < 1:
+        pad_tokens += tcs
+        num_chunks += 1
+    if pad_tokens > 0:
+        latents = torch.cat([latents, latents[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
+
+    decoded = []
+    overlap = None
+    for index in range(num_chunks):
+        start = index * tcs
+        clip = decode_clip(latents[:, :, start : start + tcs + _TOKEN_OVERLAP])
+        for part_index in range(split_count):
+            part = clip[:, :, part_index * chunk_frames : (part_index + 1) * chunk_frames]
+            part = part[:, :, _FRAME_PRE_PADDING :]
+            if part_index == 0:
+                if overlap is not None:
+                    part = _blend_time(overlap, part, _FRAME_OVERLAP)
+                decoded.append(part)
+            else:
+                overlap = part
+    if overlap is not None:
+        decoded.append(overlap)
+    frames = torch.cat(decoded, dim=2)
+
+    if pad_tokens > 0:
+        # Repeated latents produced trailing frames that were never requested;
+        # a chunk's final token covers clip_length % ratio frames, others cover
+        # the full temporal ratio.
+        intra_tail = _CLIP_LENGTH % _TEMPORAL_RATIO
+        before_pad = latents.shape[2] - pad_tokens
+        pad_frames = sum(
+            intra_tail if intra_tail and (before_pad + offset) % tcs == 0 else _TEMPORAL_RATIO
+            for offset in range(pad_tokens)
+        )
+        frames = frames[:, :, :-pad_frames]
+    return frames
+
+
+def select_preview_frame(frames: torch.Tensor, frame_select: str) -> torch.Tensor:
+    """Reduce a decoded clip to the single preview frame."""
+
+    if frame_select == "first":
+        return frames[:, :, :1]
+    if frame_select == "last":
+        return frames[:, :, -1:]
+    if frame_select == "sharpest":
+        return _select_sharpest_frame(frames)
+    raise ValueError(f"Unknown H3 preview frame_select: {frame_select}")
+
+
 class MiniMaxH3VideoDecoder(nn.Module):
     def __init__(self, tile_size=256, tile_overlap=64, tiling=True):
         super().__init__()
@@ -562,20 +666,48 @@ class MiniMaxH3VideoDecoder(nn.Module):
                             left // self.vae_ratio : (left + tile_width) // self.vae_ratio,
                         ]
                     )
-                )[:, :, -1:]
+                )
                 for left, tile_width in zip(width_starts, width_lengths)
             ]
             for top, tile_height in zip(height_starts, height_lengths)
         ]
         return self._stitch_tiles(tiles, height_overlaps, width_overlaps)
 
-    def decode(self, latents):
+    def _denormalize_latents(self, latents):
         latent_mean = self.latents_mean.view(1, -1, 1, 1, 1).to(latents)
         latent_std = self.latents_std.view(1, -1, 1, 1, 1).to(latents)
-        latents = (latents.float() * latent_std + latent_mean).to(self.dtype)
-        pixels = decode_single_frame_latent(latents, self._decode_clip)
+        return (latents.float() * latent_std + latent_mean).to(self.dtype)
+
+    def _denormalize_pixels(self, pixels):
         pixels = pixels.float() * self.pixel_std.to(pixels) + self.pixel_mean.to(pixels)
         return pixels.clamp(0.0, 1.0) * 2.0 - 1.0
+
+    def decode(self, latents, frame_select: str = "dup_last"):
+        """Decode a one- or two-latent preview to a single image frame."""
+
+        latents = self._denormalize_latents(latents)
+        if latents.shape[2] == 1:
+            pixels = decode_single_frame_latent(latents, self._decode_clip)
+        elif latents.shape[2] == 2:
+            if frame_select == "dup_last":
+                # Keep the packet's second latent and decode it through the
+                # measured-best duplicate-and-keep-last-frame path.
+                pixels = decode_single_frame_latent(latents[:, :, 1:], self._decode_clip)
+            else:
+                # Proper chunked decode (pads to a full chunk internally), then
+                # reduce the natural 5-frame clip to one image.
+                frames = decode_video_latents(latents, self._decode_clip)
+                pixels = select_preview_frame(frames, frame_select)
+        else:
+            raise ValueError("H3 image preview decoding supports one or two temporal latents")
+        return self._denormalize_pixels(pixels)
+
+    def decode_video(self, latents):
+        """Decode a full ``5n+2``-latent video to all ``17n+5`` pixel frames."""
+
+        latents = self._denormalize_latents(latents)
+        frames = decode_video_latents(latents, self._decode_clip)
+        return self._denormalize_pixels(frames)
 
 
 def load_video_vae(

@@ -153,10 +153,12 @@ class NetworkTrainer:
             # Check prodigyplusschedulefree first: it is handled via optimizer.param_groups below and does not
             # expose `d` on lr_scheduler.optimizers, so it must not fall into the substring "prodigy" path.
             if args.optimizer_type.lower().endswith("prodigyplusschedulefree") and optimizer is not None:
-                # tracking d*lr value of unet.
-                logs[f"lr/d*lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
-                if "effective_lr" in optimizer.param_groups[i]:
-                    logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
+                group = optimizer.param_groups[i]
+                logs[f"lr/d/{lr_desc}"] = group["d"]
+                logs[f"lr/d*lr/{lr_desc}"] = group["d"] * group["lr"]
+                if "effective_lr" in group:
+                    logs[f"lr/effective_lr/{lr_desc}"] = group["effective_lr"]
+                    logs[f"lr/d*eff_lr/{lr_desc}"] = group["d"] * group["effective_lr"]
 
             elif args.optimizer_type.lower().startswith("dadapt") or "prodigy" in args.optimizer_type.lower():
                 # tracking d*lr value (Prodigy, Prodigy_Adv, Prodigy_Lion_Adv, etc.)
@@ -167,8 +169,6 @@ class NetworkTrainer:
         return logs
 
     def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
-        # adamw, adamw8bit, adafactor
-
         optimizer_type = args.optimizer_type.lower()
 
         # split optimizer_type and optimizer_args
@@ -232,6 +232,20 @@ class NetworkTrainer:
         elif optimizer_type == "AdamW".lower():
             logger.info(f"use AdamW optimizer | {optimizer_kwargs}")
             optimizer_class = torch.optim.AdamW
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type == "ProdigyPlusScheduleFree".lower():
+            try:
+                from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
+            except ImportError as exc:
+                raise ImportError(
+                    "ProdigyPlusScheduleFree could not be imported. "
+                    "The optimizer is vendored under `src/prodigyplus`, so this usually means "
+                    "the repo `src/` directory is not on PYTHONPATH or the package was removed."
+                ) from exc
+
+            logger.info(f"use ProdigyPlusScheduleFree optimizer | {optimizer_kwargs}")
+            optimizer_class = ProdigyPlusScheduleFree
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         if optimizer is None:
@@ -2196,13 +2210,25 @@ class NetworkTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                step_logs = None
+                if args.optimizer_type.lower().endswith("prodigyplusschedulefree"):
+                    step_logs = self.generate_step_logs(
+                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
+                    )
+                    logs.update(
+                        {
+                            key: value
+                            for key, value in step_logs.items()
+                            if key.startswith(("lr/d/", "lr/effective_lr/"))
+                        }
+                    )
                 progress_bar.set_postfix(**logs)
 
                 if args.scale_weight_norms:
                     progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                 if len(accelerator.trackers) > 0:
-                    logs = self.generate_step_logs(
+                    logs = step_logs or self.generate_step_logs(
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
                     )
                     logs.update(loss_metrics)

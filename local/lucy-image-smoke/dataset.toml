@@ -1,0 +1,10 @@
+[general]
+resolution = [512, 512]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = true
+
+[[datasets]]
+image_directory = "/home/pyro/datasets/h3-lucy-smoke/images"
+cache_directory = "/home/pyro/datasets/h3-lucy-smoke/cache"

@@ -7,5 +7,5 @@ bucket_no_upscale = true
 
 [[datasets]]
 image_directory = "/home/pyro/datasets/lucy"
-cache_directory = "/home/pyro/models/_out/h3/cache/lucyv2"
+cache_directory = "/home/pyro/models/_out/h3/cache/lucyv2-5f"
 num_repeats = 1
