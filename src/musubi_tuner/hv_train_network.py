@@ -951,10 +951,12 @@ class NetworkTrainer:
                 )
 
             if args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None:
-                # tracking d*lr value of unet.
-                logs[f"lr/d*lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
-                if "effective_lr" in optimizer.param_groups[i]:
-                    logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
+                group = optimizer.param_groups[i]
+                logs[f"lr/d/{lr_desc}"] = group["d"]
+                logs[f"lr/d*lr/{lr_desc}"] = group["d"] * group["lr"]
+                if "effective_lr" in group:
+                    logs[f"lr/effective_lr/{lr_desc}"] = group["effective_lr"]
+                    logs[f"lr/d*eff_lr/{lr_desc}"] = group["d"] * group["effective_lr"]
 
             if args.optimizer_type.lower() == "automagic" and optimizer is not None:
                 logs["lr/automagic_avg"] = optimizer.get_avg_learning_rate()
@@ -4184,15 +4186,46 @@ class NetworkTrainer:
                         logs["audio_w"] = audio_weight_effective_value
                     if audio_presence_ema_value is not None:
                         logs["audio_p"] = audio_presence_ema_value
+                step_logs = None
+                if args.optimizer_type.lower().endswith("prodigyplusschedulefree"):
+                    step_logs = self.generate_step_logs(
+                        args,
+                        current_loss,
+                        avr_loss,
+                        lr_scheduler,
+                        lr_descriptions,
+                        optimizer,
+                        keys_scaled,
+                        mean_norm,
+                        maximum_norm,
+                        video_loss=video_loss_value,
+                        audio_loss=audio_loss_value,
+                    )
+                    logs.update(
+                        {
+                            key: value
+                            for key, value in step_logs.items()
+                            if key.startswith(("lr/d/", "lr/effective_lr/"))
+                        }
+                    )
                 progress_bar.set_postfix(**logs)
 
                 if args.scale_weight_norms:
                     progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                 if len(accelerator.trackers) > 0:
-                    logs = self.generate_step_logs(
-                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm,
-                        video_loss=video_loss_value, audio_loss=audio_loss_value,
+                    logs = step_logs or self.generate_step_logs(
+                        args,
+                        current_loss,
+                        avr_loss,
+                        lr_scheduler,
+                        lr_descriptions,
+                        optimizer,
+                        keys_scaled,
+                        mean_norm,
+                        maximum_norm,
+                        video_loss=video_loss_value,
+                        audio_loss=audio_loss_value,
                     )
                     if audio_weight_effective_value is not None:
                         logs["loss/audio_weight_effective"] = audio_weight_effective_value

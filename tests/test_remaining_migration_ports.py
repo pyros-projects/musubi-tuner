@@ -728,6 +728,27 @@ loras = [
         self.assertEqual(optimizer.__class__.__name__, "ProdigyPlusScheduleFree")
         self.assertIn("betas=(0.9, 0.99)", optimizer_args)
 
+    def test_prodigy_step_logs_include_dynamic_learning_rate_values(self) -> None:
+        trainer = NetworkTrainer()
+        params = [nn.Parameter(torch.ones(1)), nn.Parameter(torch.ones(1))]
+        optimizer = torch.optim.SGD([{"params": [params[0]]}, {"params": [params[1]], "lr": 0.5}], lr=1.0)
+        optimizer.param_groups[0].update(d=0.25, effective_lr=0.4)
+        optimizer.param_groups[1].update(d=0.5, effective_lr=0.2)
+
+        logs = trainer.generate_step_logs(
+            types.SimpleNamespace(optimizer_type="ProdigyPlusScheduleFree"),
+            current_loss=1.0,
+            avr_loss=1.0,
+            lr_scheduler=trainer.get_dummy_scheduler(optimizer),
+            lr_descriptions=["video", "audio"],
+            optimizer=optimizer,
+        )
+
+        self.assertEqual(logs["lr/d/video"], 0.25)
+        self.assertEqual(logs["lr/effective_lr/video"], 0.4)
+        self.assertEqual(logs["lr/d/audio"], 0.5)
+        self.assertEqual(logs["lr/effective_lr/audio"], 0.2)
+
 
 if __name__ == "__main__":
     unittest.main()
