@@ -19,7 +19,7 @@ from torch import nn
 
 from musubi_tuner.modules.attention import AttentionParams
 from musubi_tuner.modules.attention import attention as common_attention
-from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, LoRAStreamOffloader, create_offloader
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FRAME_RESCALE = 5.0 / 3.0
@@ -457,6 +457,31 @@ class MiniMaxH3Model(nn.Module):
         if self.blocks_to_swap:
             self.offloader.set_forward_only(False)
             self.prepare_block_swap_before_forward()
+
+    def park_main_block_weights_for_decode(self):
+        """Temporarily free the transformer's VRAM before loading the video decoder."""
+
+        if isinstance(self.offloader, LoRAStreamOffloader):
+            raise RuntimeError(
+                "H3 preview decoding currently requires classic block swap; disable --block_swap_h2d_only"
+            )
+        if self.offloader is not None:
+            self.offloader.set_forward_only(True)
+        self._decode_restore_device = self.video_patch_proj.weight.device
+        self.to("cpu")
+        if self._decode_restore_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def restore_main_block_weights_after_decode(self):
+        device = getattr(self, "_decode_restore_device", None)
+        if device is None:
+            return
+        if self.blocks_to_swap:
+            self.move_to_device_except_swap_blocks(device)
+            self.prepare_block_swap_before_forward()
+        else:
+            self.to(device)
+        del self._decode_restore_device
 
     def rope_angles(self, position_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
         positions = position_ids.to(device=device, dtype=torch.float32)

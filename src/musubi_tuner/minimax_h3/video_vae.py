@@ -1,8 +1,9 @@
-"""Encoder-only MiniMax H3 video VAE used by latent caching."""
+"""MiniMax H3 video VAE components used by caching and training previews."""
 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -10,24 +11,62 @@ import torch.nn.functional as F
 
 from musubi_tuner.minimax_h3.minimax_h3_utils import load_selected_weights, resolve_safetensor_files
 
+# Decoder architecture follows the Apache-2.0 MiniMax-H3 implementation from
+# Hugging Face Diffusers PR #14355 (commit abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc).
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 LATENTS_MEAN = (
-    0.858090341091156, -0.9606591463088989, 1.0661640167236328, -0.5090325474739075,
-    -0.2727581858634949, -1.3675414323806763, -0.2553254961967468, -0.26907554268836975,
-    -0.5376840829849243, -0.0464097298681736, 0.6657370328903198, 0.19690127670764923,
-    -0.5460608005523682, -0.4035342037677765, -0.23683024942874908, 0.25928452610969543,
-    -0.30133944749832153, 0.211341992020607, -1.1206848621368408, 0.3581933379173279,
-    -0.04225143790245056, 0.2604829967021942, 0.22864092886447906, 0.7056031823158264,
+    0.858090341091156,
+    -0.9606591463088989,
+    1.0661640167236328,
+    -0.5090325474739075,
+    -0.2727581858634949,
+    -1.3675414323806763,
+    -0.2553254961967468,
+    -0.26907554268836975,
+    -0.5376840829849243,
+    -0.0464097298681736,
+    0.6657370328903198,
+    0.19690127670764923,
+    -0.5460608005523682,
+    -0.4035342037677765,
+    -0.23683024942874908,
+    0.25928452610969543,
+    -0.30133944749832153,
+    0.211341992020607,
+    -1.1206848621368408,
+    0.3581933379173279,
+    -0.04225143790245056,
+    0.2604829967021942,
+    0.22864092886447906,
+    0.7056031823158264,
 )
 LATENTS_STD = (
-    1.2223774194717407, 1.2767263650894165, 1.68317747116088865, 1.7549455165863037,
-    1.5636216402053833, 2.194143533706665, 0.96531379222869875, 1.05698859691619875,
-    0.841948926448822, 0.7729952931404114, 1.8955937623977661, 0.946841835975647,
-    0.7996809482574463, 0.44988900423049925, 0.7197399735450745, 0.69362932443618775,
-    2.961095094680786, 2.7694199085235595, 3.0496184825897215, 2.1088054180145265,
-    3.276226282119751, 3.1627357006073, 2.28168129920959475, 2.6127843856811525,
+    1.2223774194717407,
+    1.2767263650894165,
+    1.68317747116088865,
+    1.7549455165863037,
+    1.5636216402053833,
+    2.194143533706665,
+    0.96531379222869875,
+    1.05698859691619875,
+    0.841948926448822,
+    0.7729952931404114,
+    1.8955937623977661,
+    0.946841835975647,
+    0.7996809482574463,
+    0.44988900423049925,
+    0.7197399735450745,
+    0.69362932443618775,
+    2.961095094680786,
+    2.7694199085235595,
+    3.0496184825897215,
+    2.1088054180145265,
+    3.276226282119751,
+    3.1627357006073,
+    2.28168129920959475,
+    2.6127843856811525,
 )
 
 
@@ -65,9 +104,7 @@ class Downsample3D(nn.Module):
     def __init__(self, in_channels, out_channels, time_stride=1, space_stride=2):
         super().__init__()
         self.space_stride = space_stride
-        self.conv = CausalConv3d(
-            in_channels, out_channels, 3, padding=(1, 0, 0), stride=(time_stride, space_stride, space_stride)
-        )
+        self.conv = CausalConv3d(in_channels, out_channels, 3, padding=(1, 0, 0), stride=(time_stride, space_stride, space_stride))
 
     def forward(self, x):
         if self.space_stride == 2:
@@ -220,9 +257,9 @@ class MiniMaxH3VideoEncoder(nn.Module):
                 if j:
                     tile = self.blend(row[j - 1], tile, lx[j - 1], -1)
                 if i < len(rows) - 1:
-                    tile = tile[..., :-ly[i], :]
+                    tile = tile[..., : -ly[i], :]
                 if j < len(row) - 1:
-                    tile = tile[..., :, :-lx[j]]
+                    tile = tile[..., :, : -lx[j]]
                 output.append(tile)
             output_rows.append(torch.cat(output, dim=-1))
         return torch.cat(output_rows, dim=-2)
@@ -248,6 +285,292 @@ class MiniMaxH3VideoEncoder(nn.Module):
         mean_value = self.latents_mean.view(1, -1, 1, 1, 1).to(mean)
         std_value = self.latents_std.view(1, -1, 1, 1, 1).to(mean)
         return (mean - mean_value) / std_value
+
+
+def _create_token_ids(patch_dims, device, dtype=torch.float32):
+    grids = [2.0 * (torch.arange(0.5, size, dtype=dtype, device=device) / size) - 1.0 for size in patch_dims]
+    return torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, len(patch_dims) - 1).unsqueeze(0)
+
+
+class RotaryEmbeddingND(nn.Module):
+    def __init__(self, dim, rotary_base=100.0, n_dim=3):
+        super().__init__()
+        if dim % (2 * n_dim):
+            raise ValueError(f"Rotary dimension {dim} must be divisible by {2 * n_dim}")
+        self.dim = dim
+        self.rotary_base = rotary_base
+        self.n_dim = n_dim
+        self.register_buffer("inv_freq", self._make_inv_freq(), persistent=False)
+
+    def _make_inv_freq(self, device=None):
+        return 1.0 / self.rotary_base ** torch.arange(0, 1, 2 * self.n_dim / self.dim, dtype=torch.float32, device=device)
+
+    def materialize(self, device):
+        self.inv_freq = self._make_inv_freq(device)
+
+    def forward(self, position_ids):
+        angles = 2.0 * math.pi * position_ids[:, :, :, None].float() * self.inv_freq[None, None, None, :]
+        angles = angles.flatten(2, 3).tile(2).unsqueeze(2)
+        return angles.cos(), angles.sin()
+
+
+def _apply_rotary_emb(hidden_states, rotary_emb):
+    cosine, sine = (value.to(hidden_states.dtype) for value in rotary_emb)
+    rotary_dim = cosine.shape[-1]
+    rotary, passthrough = hidden_states[..., :rotary_dim], hidden_states[..., rotary_dim:]
+    first, second = rotary.chunk(2, dim=-1)
+    rotated = torch.cat((-second, first), dim=-1)
+    return torch.cat((rotary * cosine + rotated * sine, passthrough), dim=-1)
+
+
+class DecoderFeedForward(nn.Module):
+    def __init__(self, dim, mult=4, bias=True):
+        super().__init__()
+        inner_dim = dim * mult
+        self.w1 = nn.Linear(dim, inner_dim * 2, bias=bias)
+        self.w2 = nn.Linear(inner_dim, dim, bias=bias)
+
+    def forward(self, hidden_states):
+        gate, value = self.w1(hidden_states).chunk(2, dim=-1)
+        return self.w2(F.silu(gate) * value)
+
+
+class DecoderAttention(nn.Module):
+    def __init__(self, heads, dim_head, bias=True, eps=1e-5):
+        super().__init__()
+        self.dim_head = dim_head
+        self.heads = heads
+        inner_dim = heads * dim_head
+        self.norm_q = nn.RMSNorm(dim_head, eps=eps, elementwise_affine=False)
+        self.norm_k = nn.RMSNorm(dim_head, eps=eps, elementwise_affine=False)
+        self.to_qkv = nn.Linear(inner_dim, inner_dim * 3, bias=bias)
+        self.to_out = nn.Linear(inner_dim, inner_dim, bias=bias)
+
+    def forward(self, hidden_states, rotary_emb=None):
+        batch_size, sequence_length, _ = hidden_states.shape
+        qkv = self.to_qkv(hidden_states).view(batch_size, sequence_length, self.heads, 3 * self.dim_head)
+        query, key, value = qkv.chunk(3, dim=-1)
+        query = self.norm_q(query.float()).to(query.dtype)
+        key = self.norm_k(key.float()).to(key.dtype)
+        if rotary_emb is not None:
+            query = _apply_rotary_emb(query, rotary_emb)
+            key = _apply_rotary_emb(key, rotary_emb)
+        hidden_states = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+        )
+        return self.to_out(hidden_states.transpose(1, 2).reshape(batch_size, sequence_length, -1))
+
+
+class DecoderTransformerBlock(nn.Module):
+    def __init__(self, heads, dim_head, bias=True, eps=1e-5):
+        super().__init__()
+        dim = heads * dim_head
+        self.norm1 = nn.RMSNorm(dim, elementwise_affine=True, eps=eps)
+        self.attn = DecoderAttention(heads, dim_head, bias, eps)
+        self.scale1 = nn.Parameter(torch.empty(dim))
+        self.norm2 = nn.RMSNorm(dim, elementwise_affine=True, eps=eps)
+        self.ff = DecoderFeedForward(dim, bias=bias)
+        self.scale2 = nn.Parameter(torch.empty(dim))
+
+    def forward(self, hidden_states, rotary_emb=None):
+        normalized = F.rms_norm(
+            hidden_states.float(),
+            (hidden_states.shape[-1],),
+            self.norm1.weight.float(),
+            self.norm1.eps,
+        ).to(hidden_states.dtype)
+        hidden_states = hidden_states + self.attn(normalized, rotary_emb) * self.scale1
+        normalized = F.rms_norm(
+            hidden_states.float(),
+            (hidden_states.shape[-1],),
+            self.norm2.weight.float(),
+            self.norm2.eps,
+        ).to(hidden_states.dtype)
+        return hidden_states + self.ff(normalized) * self.scale2
+
+
+class ViT3DDecoder(nn.Module):
+    def __init__(
+        self,
+        patch_size=16,
+        patch_size_t=4,
+        in_channels=24,
+        out_channels=3,
+        num_layers=36,
+        heads=32,
+        dim_head=64,
+        rope_theta=100.0,
+        rope_dim_ratio=0.75,
+        bias=True,
+        eps=1e-5,
+        num_register_tokens=4,
+    ):
+        super().__init__()
+        dim = heads * dim_head
+        self.patch_size = patch_size
+        self.patch_size_t = patch_size_t
+        self.out_channels = out_channels
+        self.num_register_tokens = num_register_tokens
+        self.pos_embed = RotaryEmbeddingND(int(dim_head * rope_dim_ratio), rope_theta, n_dim=3)
+        self.x_embedder = nn.Linear(in_channels, dim)
+        self.register_tokens = nn.Parameter(torch.empty(1, num_register_tokens, dim))
+        # Unused at inference; retained so the released checkpoint loads exactly.
+        self.register_buffer("mask_token", torch.empty(1, 1, dim))
+        self.transformer_blocks = nn.ModuleList([DecoderTransformerBlock(heads, dim_head, bias, eps) for _ in range(num_layers)])
+        self.norm_out = nn.LayerNorm(dim, elementwise_affine=True, eps=eps)
+        self.proj_out = nn.Linear(dim, out_channels * patch_size_t * patch_size * patch_size)
+
+    def forward(self, hidden_states):
+        batch_size, channels, frames, height, width = hidden_states.shape
+        hidden_states = hidden_states.permute(0, 2, 3, 4, 1).reshape(batch_size, frames * height * width, channels)
+        hidden_states = self.x_embedder(hidden_states)
+        num_patches = hidden_states.shape[1]
+        hidden_states = torch.cat(
+            (
+                hidden_states,
+                self.register_tokens.expand(batch_size, -1, -1),
+                torch.zeros_like(hidden_states[:, :1]),
+            ),
+            dim=1,
+        )
+        position_ids = _create_token_ids((frames, height, width), hidden_states.device).expand(batch_size, -1, -1)
+        suffix_ids = position_ids.new_zeros((batch_size, self.num_register_tokens + 1, 3))
+        rotary_emb = self.pos_embed(torch.cat((position_ids, suffix_ids), dim=1))
+        for block in self.transformer_blocks:
+            hidden_states = block(hidden_states, rotary_emb)
+        hidden_states = self.proj_out(self.norm_out(hidden_states))[:, :num_patches]
+        hidden_states = hidden_states.view(
+            batch_size,
+            frames,
+            height,
+            width,
+            self.out_channels,
+            self.patch_size_t,
+            self.patch_size,
+            self.patch_size,
+        )
+        hidden_states = hidden_states.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()
+        return hidden_states.reshape(
+            batch_size,
+            self.out_channels,
+            frames * self.patch_size_t,
+            height * self.patch_size,
+            width * self.patch_size,
+        )
+
+
+def decode_single_frame_latent(latents: torch.Tensor, decode_video: Callable[[torch.Tensor], torch.Tensor]):
+    """Decode a T=1 latent through the decoder's minimum in-distribution T=2 shape."""
+
+    if latents.shape[2] != 1:
+        raise ValueError("decode_single_frame_latent expects exactly one temporal latent")
+    return decode_video(torch.cat((latents, latents), dim=2))[:, :, :1]
+
+
+class MiniMaxH3VideoDecoder(nn.Module):
+    def __init__(self, tile_size=256, tile_overlap=64, tiling=True):
+        super().__init__()
+        self.vae_ratio = 16
+        self.tile_size = tile_size
+        self.tile_overlap_min = tile_overlap
+        self.tiling = tiling
+        self.post_quant_conv = nn.Conv3d(24, 24, 1)
+        self.decoder = ViT3DDecoder()
+        self.register_buffer("latents_mean", torch.tensor(LATENTS_MEAN))
+        self.register_buffer("latents_std", torch.tensor(LATENTS_STD))
+        self.register_buffer("pixel_mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1, 1), persistent=False)
+        self.register_buffer("pixel_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1, 1), persistent=False)
+
+    @property
+    def device(self):
+        return self.post_quant_conv.weight.device
+
+    @property
+    def dtype(self):
+        return self.post_quant_conv.weight.dtype
+
+    def _split_tiles(self, length):
+        if self.tile_size >= length:
+            return [0], [length], []
+        count = math.ceil(length / self.tile_size)
+        while self.tile_size * count - self.tile_overlap_min * (count - 1) < length:
+            count += 1
+        overlaps = [self.tile_overlap_min] * (count - 1)
+        remaining = self.tile_size * count - sum(overlaps) - length
+        for index in range(remaining // self.vae_ratio):
+            overlaps[index % (count - 1)] += self.vae_ratio
+        starts = [0]
+        for index in range(count - 1):
+            starts.append(starts[-1] + self.tile_size - overlaps[index])
+        return starts, [self.tile_size] * count, overlaps
+
+    @staticmethod
+    def _blend(first, second, extent, dim):
+        extent = min(first.shape[dim], second.shape[dim], extent)
+        positions = torch.arange(extent, device=second.device, dtype=second.dtype)
+        shape = [1] * first.ndim
+        shape[dim] = extent
+        first_weight = (1 - positions / extent).view(shape)
+        second_weight = (positions / extent).view(shape)
+        first_slice = [slice(None)] * first.ndim
+        first_slice[dim] = slice(-extent, None)
+        second_slice = [slice(None)] * second.ndim
+        second_slice[dim] = slice(0, extent)
+        blended = first[tuple(first_slice)] * first_weight + second[tuple(second_slice)] * second_weight
+        if extent == second.shape[dim]:
+            return blended
+        rest = [slice(None)] * second.ndim
+        rest[dim] = slice(extent, None)
+        return torch.cat((blended, second[tuple(rest)]), dim=dim)
+
+    def _stitch_tiles(self, tiles, height_overlaps, width_overlaps):
+        stitched_rows = []
+        for row_index, row in enumerate(tiles):
+            stitched_row = []
+            for column_index, tile in enumerate(row):
+                if row_index:
+                    tile = self._blend(tiles[row_index - 1][column_index], tile, height_overlaps[row_index - 1], -2)
+                if column_index:
+                    tile = self._blend(row[column_index - 1], tile, width_overlaps[column_index - 1], -1)
+                if row_index < len(tiles) - 1:
+                    tile = tile[..., : -height_overlaps[row_index], :]
+                if column_index < len(row) - 1:
+                    tile = tile[..., :, : -width_overlaps[column_index]]
+                stitched_row.append(tile)
+            stitched_rows.append(torch.cat(stitched_row, dim=-1))
+        return torch.cat(stitched_rows, dim=-2)
+
+    def _decode_clip(self, latents):
+        if not self.tiling:
+            return self.decoder(self.post_quant_conv(latents))
+        height_starts, height_lengths, height_overlaps = self._split_tiles(latents.shape[-2] * self.vae_ratio)
+        width_starts, width_lengths, width_overlaps = self._split_tiles(latents.shape[-1] * self.vae_ratio)
+        tiles = [
+            [
+                self.decoder(
+                    self.post_quant_conv(
+                        latents[
+                            ...,
+                            top // self.vae_ratio : (top + tile_height) // self.vae_ratio,
+                            left // self.vae_ratio : (left + tile_width) // self.vae_ratio,
+                        ]
+                    )
+                )[:, :, :1]
+                for left, tile_width in zip(width_starts, width_lengths)
+            ]
+            for top, tile_height in zip(height_starts, height_lengths)
+        ]
+        return self._stitch_tiles(tiles, height_overlaps, width_overlaps)
+
+    def decode(self, latents):
+        latent_mean = self.latents_mean.view(1, -1, 1, 1, 1).to(latents)
+        latent_std = self.latents_std.view(1, -1, 1, 1, 1).to(latents)
+        latents = (latents.float() * latent_std + latent_mean).to(self.dtype)
+        pixels = decode_single_frame_latent(latents, self._decode_clip)
+        pixels = pixels.float() * self.pixel_std.to(pixels) + self.pixel_mean.to(pixels)
+        return pixels.clamp(0.0, 1.0) * 2.0 - 1.0
 
 
 def load_video_vae(
@@ -277,3 +600,30 @@ def load_video_vae(
     model.eval().requires_grad_(False)
     return model
 
+
+def load_video_vae_decoder(
+    path: str,
+    *,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float16,
+    tile_size: int = 256,
+    tile_overlap: int = 64,
+    tiling: bool = True,
+    disable_numpy_memmap: bool = False,
+) -> MiniMaxH3VideoDecoder:
+    """Load only the decoder half needed for scheduled training previews."""
+
+    with torch.device("meta"):
+        model = MiniMaxH3VideoDecoder(tile_size, tile_overlap, tiling)
+    load_selected_weights(
+        model,
+        resolve_safetensor_files(path, "video_vae"),
+        device=device,
+        dtype=dtype,
+        disable_numpy_memmap=disable_numpy_memmap,
+    )
+    model.pixel_mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1, 1)
+    model.pixel_std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1, 1)
+    model.decoder.pos_embed.materialize(device)
+    model.eval().requires_grad_(False)
+    return model

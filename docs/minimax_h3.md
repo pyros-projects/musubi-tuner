@@ -2,7 +2,7 @@
 
 ## Scope
 
-Musubi Tuner supports experimental LoRA training of the MiniMax H3 **FL2VA** checkpoint in joint text-to-video-with-audio (T2VA) mode. Video and stereo audio are trained together. The separate Ref2VA checkpoint and reference-media conditioning are not supported yet, nor is sample generation during training.
+Musubi Tuner supports experimental LoRA training of the MiniMax H3 **FL2VA** checkpoint with either joint video/audio samples or image-only `T=1` samples. The separate Ref2VA checkpoint and reference-media conditioning are not supported yet. Training previews currently generate images only.
 
 H3 is exceptionally large. BF16 compute is required, but the frozen transformer base may use either BF16 or ComfyUI INT8/ConvRot weights. Both the regular and pruned FL2VA INT8/ConvRot checkpoints are supported; NVFP4 is not. Gradient checkpointing and block swap are strongly recommended.
 
@@ -33,7 +33,7 @@ uv sync --extra int8
 
 ## Dataset
 
-Use a video dataset. H3 treats video as 24 fps and accepts frame counts of `17*n+5`: `5, 22, 39, 56, 73, 90, 107, 124, ...`. Other requested lengths are rounded down. `5` frames is supported by the VAE, but longer clips are normally more useful for training.
+For joint audio/video training, use a video dataset. H3 treats video as 24 fps and accepts frame counts of `17*n+5`: `5, 22, 39, 56, 73, 90, 107, 124, ...`. Other requested lengths are rounded down. `5` frames is supported by the VAE, but longer clips are normally more useful for training.
 
 Set `source_fps` to the actual frame rate of the source videos so video resampling and audio crops stay synchronized. Source audio is resampled to stereo 32 kHz. A video with no audio track gets a matching silent audio latent.
 
@@ -53,6 +53,24 @@ source_fps = 30.0
 ```
 
 Spatial bucket sizes are aligned to 32 pixels (video-VAE compression 16 multiplied by the transformer's spatial patch size 2).
+
+### Image-only LoRA
+
+For subjects or styles that do not need temporal or audio targets, an image dataset is encoded as a one-frame video stream. `--image_audio_mode none` keeps the legacy image-only `[text | video]` sequence. `--image_audio_mode silent` instead adds duration-matched noised zero-audio rows so the packed sequence retains H3's joint audio-video geometry.
+
+```toml
+[general]
+resolution = [512, 512]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+
+[[datasets]]
+image_directory = "/path/to/images"
+cache_directory = "/path/to/cache"
+```
+
+Image-only latent caching does not require `--audio_vae`. The cache stores an empty audio sentinel; `--image_audio_mode silent` expands it on the fly, so switching modes does not require recaching. Train these caches with `--audio_loss_weight 0`; a positive audio weight is rejected because there is no audio target.
 
 ## Pre-caching
 
@@ -74,6 +92,15 @@ python minimax_h3_cache_text_encoder_outputs.py \
 
 For ComfyUI weights, give each corresponding `.safetensors` path instead. `--tokenizer` may point to the official `FL2VA/tokenizer` directory; if omitted, it is loaded from the official Hugging Face repository.
 
+ComfyUI INT8/ConvRot text encoders can be cached through ComfyUI's own loader. Run this command with ComfyUI's Python environment so its runtime dependencies are available:
+
+```bash
+PYTHONPATH=src /path/to/ComfyUI/.venv/bin/python -m musubi_tuner.minimax_h3_cache_text_encoder_outputs \
+  --dataset_config path/to/dataset.toml \
+  --text_encoder models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
+  --comfyui_path /path/to/ComfyUI
+```
+
 The text cache contains raw-prompt Qwen3-VL features immediately after layer 50, before the final RMSNorm. Chat templates and automatic special tokens are intentionally not applied, matching H3 FL2VA inference.
 
 ## Training
@@ -86,7 +113,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 minimax
   --timestep_sampling shift --discrete_flow_shift 12 \
   --weighting_scheme none --audio_loss_weight 1.0 \
   --gradient_checkpointing --blocks_to_swap 40 \
-  --network_module networks.lora --network_dim 32 \
+  --network_module networks.lora --network_dim 32 --lora_target_preset attn_mlp \
   --optimizer_type adamw8bit --learning_rate 1e-4 \
   --max_train_epochs 16 --save_every_n_epochs 1 \
   --output_dir path/to/output --output_name h3-lora
@@ -94,12 +121,43 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 minimax
 
 To train against a Comfy INT8/ConvRot base, point `--dit` at either FL2VA INT8 file listed above. Do not pass `--fp8_base` or `--fp8_scaled`; quantization is detected from the checkpoint metadata. The frozen base uses INT8 forward matmuls, while its input-gradient path dequantizes bounded BF16 chunks for training accuracy. The trainable LoRA and model compute remain BF16.
 
+`--lora_target_preset attn_mlp` is the default and is portable between the full and modulation-pruned transformer layouts. The optional `full` preset also targets AdaLN projections, whose input width is `2688` in the full checkpoint but `8` in the pruned curve-table checkpoint. Use `full` only when training and inference use the same transformer layout.
+
 H3 uses a video sigma shift of 12 and an audio sigma shift of 3. The trainer samples the video schedule, maps the same base time to the audio schedule, noises both cached streams, and optimizes both raw `clean-noise` velocity targets. `--audio_loss_weight` controls the audio term relative to video.
+
+### Image previews during training
+
+The launcher caches all preview prompts before training and stores them in the first dataset's `cache_directory` as `minimax_h3_sample_prompts_cache.pt`. The 32B text encoder is loaded only when that cache is missing or stale, and its cache process exits before the trainer starts. Prompt files therefore contain only generation settings:
+
+```toml
+[prompt]
+width = 512
+height = 512
+frame_count = 1
+sample_steps = 12
+
+[[prompt.subset]]
+prompt = "lucy the cat"
+seed = 42
+```
+
+Add the decoder and cadence to the training command:
+
+```bash
+--vae models/vae/minimax_h3_video_vae_fp16.safetensors \
+--vae_dtype float16 \
+--sample_prompts path/to/p_lucy.toml \
+--sample_every_n_steps 100
+```
+
+The local launcher selects `.pyro/h3/cfg/p_${H3_NAME}.toml`; set `SAMPLE_PROMPTS` only to override it explicitly. Prompt changes invalidate and rebuild the aggregate cache automatically before training.
+
+The trainer denoises a true single-frame latent without CFG. For decoding, it duplicates that latent into the decoder's minimum in-distribution two-token temporal shape and keeps the aligned first frame. Before VAE decoding, the frozen transformer is temporarily parked on CPU to keep peak VRAM bounded. Preview PNGs are written under `<output_dir>/sample/`.
 
 Notes:
 
-- Loader batches larger than one are accepted, but each packed H3 sequence is evaluated serially because sequence lengths are shape-dependent.
+- With classic block swap, keep the loader `batch_size` at `1`; use `--gradient_accumulation_steps` for a larger effective batch.
 - `--blocks_to_swap` can be at most 48 for the 50-block transformer.
 - `--fp8_base` and `--fp8_scaled` are rejected. INT8/ConvRot is selected by the `--dit` checkpoint itself.
-- Omit `--sample_prompts`; in-training H3 sampling is not implemented.
-- Cached audio is part of every sample. Audio-free training is represented by silent source tracks rather than dropping the audio stream.
+- H3 training previews currently support `frame_count=1`, positive prompts, and classic block swap only.
+- Video samples without an audio track use encoded silent audio latents. For image caches, choose `--image_audio_mode none` or `silent`; synthesized silent rows remain loss-excluded and require `--audio_loss_weight 0`.

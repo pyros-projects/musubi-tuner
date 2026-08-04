@@ -613,6 +613,11 @@ def _add_save_load_args(parser: argparse.ArgumentParser) -> None:
         help="base name of trained model file / 学習後のモデルの拡張子を除くファイル名",
     )
     parser.add_argument("--resume", type=str, default=None, help="saved state to resume training / 学習再開するモデルのstate")
+    parser.add_argument(
+        "--autoresume",
+        action="store_true",
+        help="automatically resume from the latest saved state in output_dir (ignored if --resume is specified)",
+    )
 
     parser.add_argument(
         "--save_every_n_epochs",

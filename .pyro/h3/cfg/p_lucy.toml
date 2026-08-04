@@ -1,0 +1,9 @@
+[prompt]
+width = 1024
+height = 1024
+frame_count = 1
+sample_steps = 20
+
+[[prompt.subset]]
+prompt = "lucy the cat"
+seed = 42
