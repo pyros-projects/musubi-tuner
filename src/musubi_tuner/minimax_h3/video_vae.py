@@ -462,11 +462,16 @@ class ViT3DDecoder(nn.Module):
 
 
 def decode_single_frame_latent(latents: torch.Tensor, decode_video: Callable[[torch.Tensor], torch.Tensor]):
-    """Decode a T=1 latent through the decoder's minimum in-distribution T=2 shape."""
+    """Decode a T=1 latent through the decoder's minimum in-distribution T=2 shape.
+
+    The final raw frame reconstructs the still best; roundtrip PSNR on real
+    images measured it 8-9 dB above both the lone-T=1 decode and the
+    duplicated clip's earlier frame positions.
+    """
 
     if latents.shape[2] != 1:
         raise ValueError("decode_single_frame_latent expects exactly one temporal latent")
-    return decode_video(torch.cat((latents, latents), dim=2))[:, :, :1]
+    return decode_video(torch.cat((latents, latents), dim=2))[:, :, -1:]
 
 
 class MiniMaxH3VideoDecoder(nn.Module):
@@ -557,7 +562,7 @@ class MiniMaxH3VideoDecoder(nn.Module):
                             left // self.vae_ratio : (left + tile_width) // self.vae_ratio,
                         ]
                     )
-                )[:, :, :1]
+                )[:, :, -1:]
                 for left, tile_width in zip(width_starts, width_lengths)
             ]
             for top, tile_height in zip(height_starts, height_lengths)

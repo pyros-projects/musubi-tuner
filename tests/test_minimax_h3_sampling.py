@@ -115,7 +115,7 @@ def test_h3_sample_prompt_requires_single_frame(tmp_path):
         MiniMaxH3NetworkTrainer().process_sample_prompts(SimpleNamespace(), None, str(prompt_path))
 
 
-def test_h3_single_frame_decode_duplicates_t1_and_returns_first_decoder_frame():
+def test_h3_single_frame_decode_duplicates_t1_and_returns_last_decoder_frame():
     latent = torch.randn(1, 24, 1, 2, 2)
     seen = {}
 
@@ -132,7 +132,7 @@ def test_h3_single_frame_decode_duplicates_t1_and_returns_first_decoder_frame():
     torch.testing.assert_close(seen["value"][:, :, :1], latent)
     torch.testing.assert_close(seen["value"][:, :, 1:], latent)
     assert decoded.shape == (1, 3, 1, 4, 4)
-    torch.testing.assert_close(decoded, torch.ones_like(decoded))
+    torch.testing.assert_close(decoded, torch.full_like(decoded, 2))
 
 
 def test_h3_lora_target_default_is_pruned_checkpoint_portable():
