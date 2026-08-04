@@ -34,17 +34,21 @@ def test_trainer_supports_vendored_prodigy_plus_schedule_free():
 
 def test_prodigy_step_logs_include_dynamic_learning_rate_values():
     trainer = NetworkTrainer()
-    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.ones(1))], lr=1.0)
+    params = [torch.nn.Parameter(torch.ones(1)), torch.nn.Parameter(torch.ones(1))]
+    optimizer = torch.optim.SGD([{"params": [params[0]]}, {"params": [params[1]], "lr": 0.5}], lr=1.0)
     optimizer.param_groups[0].update(d=0.25, effective_lr=0.4)
+    optimizer.param_groups[1].update(d=0.5, effective_lr=0.2)
 
     logs = trainer.generate_step_logs(
         SimpleNamespace(optimizer_type="ProdigyPlusScheduleFree"),
         current_loss=1.0,
         avr_loss=1.0,
         lr_scheduler=trainer.get_dummy_scheduler(optimizer),
-        lr_descriptions=["unet"],
+        lr_descriptions=["video", "audio"],
         optimizer=optimizer,
     )
 
-    assert logs["lr/d/unet"] == 0.25
-    assert logs["lr/effective_lr/unet"] == 0.4
+    assert logs["lr/d/video"] == 0.25
+    assert logs["lr/effective_lr/video"] == 0.4
+    assert logs["lr/d/audio"] == 0.5
+    assert logs["lr/effective_lr/audio"] == 0.2
