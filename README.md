@@ -9,7 +9,12 @@
 
 Train a character or style LoRA for [MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) (the 33B video+audio model) **from still images only**, on a single consumer GPU, using the same INT8 ConvRot model files your ComfyUI H3 setup already uses. Images go in, a normal `.safetensors` LoRA comes out that works for both H3 image generation and video.
 
-The trick that makes this not suck: image-only training on a video model normally wrecks motion (jump cuts, melting fur, slideshow vibes). By default this fork trains with the `no_packed_attn` preset — only the per-token MLPs and the text refiner get LoRA weights, while the packed-sequence attention (the part that handles *how things move*) stays frozen. You get the likeness without teaching the model that the world is a still photo. That, plus an image-tuned timestep schedule (`image` preset), is the whole recipe.
+Image-only training on a video model normally wrecks motion: jump cuts, melting fur, slideshow vibes. The defaults in this fork encode everything we found while debugging exactly that:
+
+- **`no_packed_attn` LoRA preset.** H3 is a single-stream DiT — there are no separate "temporal blocks" you could exclude, because temporal mixing happens inside the same packed attention as everything else. So the default preset skips attention entirely: LoRA weights go only on the per-token MLPs and the text token refiner. MLPs act on each token independently and physically cannot move information between frames — likeness trains, motion stays stock. (Presets that also train attention, like `attn_mlp`, give slightly stronger stills and visibly broken video.)
+- **Resolution-shifted timesteps instead of H3's video schedule.** H3's native shift-12 schedule spends most training steps at very high noise, where video layout and motion live — an image LoRA trained there learns the least likeness while doing the most temporal damage. The `image` preset (`krea2_shift`) instead draws timesteps from a resolution-dependent distribution centered where image identity actually lives.
+- **`max_timestep 875` cutoff.** The very top of the noise range is composition-and-motion territory. Capping training below it (`preserve_distribution_shape` keeps the rest of the curve unchanged) was the single biggest "stills stay good, video stops degrading" lever in our A/B runs.
+- **Two-latent preview decode.** H3's ViT video decoder cannot decode a lone single-frame latent — it's out of distribution and comes out soft. Training previews instead sample a duplicated 2-frame packet with a 2nd-order (AB2) solver and decode the last frame — measured ~8 dB PSNR better than the naive single-latent decode.
 
 ### You need
 
@@ -62,8 +67,7 @@ Checkpoints land in `OUTPUT_DIR` every 100 steps as regular LoRA `.safetensors` 
 
 - **Inference strength ~0.8** is the sweet spot. 1.0 gives maximum likeness but can mangle fast motion (jumps, landings); 0.5 loses identity.
 - **Judge results with EasyCache off.** Cache reuse adds background wobble that is not your LoRA's fault and dampens real motion. It scammed us for a day.
-- Defaults (`no_packed_attn` + `image` timesteps + Prodigy) are the best recipe we found. `LORA_PRESET=attn_mlp` trains attention too — stronger stills, visibly worse video.
-- With Prodigy, 500–1000 steps is usually plenty at rank 32.
+- With the default Prodigy optimizer, 500–1000 steps is usually plenty at rank 32.
 - Tight on VRAM? Raise `BLOCKS_TO_SWAP` (default 6) — slower but smaller.
 - Before publishing weights, read the MiniMax H3 community license — it has jurisdiction restrictions.
 
