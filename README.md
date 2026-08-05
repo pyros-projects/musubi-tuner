@@ -2,6 +2,73 @@
 
 [English](./README.md) | [日本語](./README.ja.md)
 
+> [!NOTE]
+> **This fork adds MiniMax H3 image-LoRA training.** The quick start is right below; everything after it is the regular Musubi Tuner README (installation lives there). Full H3 details: [docs/minimax_h3.md](./docs/minimax_h3.md).
+
+## MiniMax H3 Image LoRA — Quick Start
+
+Train a character or style LoRA for [MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) (the 33B video+audio model) **from still images only**, on a single consumer GPU, using the same INT8 ConvRot model files your ComfyUI H3 setup already uses. Images go in, a normal `.safetensors` LoRA comes out that works for both H3 image generation and video.
+
+The trick that makes this not suck: image-only training on a video model normally wrecks motion (jump cuts, melting fur, slideshow vibes). By default this fork trains with the `no_packed_attn` preset — only the per-token MLPs and the text refiner get LoRA weights, while the packed-sequence attention (the part that handles *how things move*) stays frozen. You get the likeness without teaching the model that the world is a still photo. That, plus an image-tuned timestep schedule (`image` preset), is the whole recipe.
+
+### You need
+
+- A working ComfyUI install that already runs MiniMax H3 — the trainer borrows its Python env to run the INT8 text encoder — including the three model files you already have for it:
+  - DiT: `minimax_h3_fl2va_pruned_int8_convrot.safetensors`
+  - Text encoder: `qwen3vl_32b_minimax_h3_int8_convrot.safetensors`
+  - VAE: `minimax_h3_video_vae_fp16.safetensors`
+- This repo installed with its own venv ([Installation](#installation) below).
+- A folder of images of your subject with `.txt` captions next to them. Captioning rule: **describe everything you want to keep control over.** If every photo has a white door behind your cat and you never mention it, the white door becomes part of your cat.
+
+### 1. Point train.sh at your setup
+
+Open `.pyro/h3/train.sh` and edit the paths at the top: `MUSUBI_VENV` (this repo's venv), `COMFYUI_DIR`, `DIT`, `TEXT_ENCODER`, `VAE` — and `OUTPUT_DIR` further down (where LoRAs get written).
+
+### 2. Create a dataset file
+
+Copy the demo `.pyro/h3/cfg/lucy_v2.toml` to `.pyro/h3/cfg/<yourname>.toml` and set `image_directory` (your images + captions) and `cache_directory` (anywhere writable — latents get cached there once):
+
+```toml
+[general]
+resolution = [768, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = true
+
+[[datasets]]
+image_directory = "/path/to/your/images"
+cache_directory = "/path/to/cache/yourname"
+num_repeats = 1
+```
+
+### 3. Create a prompt file
+
+Copy `.pyro/h3/cfg/p_lucy_v2.toml` to `.pyro/h3/cfg/p_<yourname>.toml` and put your trigger prompt in it. These render as preview images every 50 steps during training, so you watch the LoRA learn instead of praying. `frame_count = 1` is a still; any `frame_count` of the form 17n+5 (22, 39, 73, …) renders a short silent video preview instead.
+
+### 4. Train
+
+```bash
+# first run: caches latents + text embeddings, then trains
+H3_NAME=yourname CACHE_DATASET=1 .pyro/h3/train.sh
+
+# later runs: reuse the cache
+H3_NAME=yourname .pyro/h3/train.sh
+```
+
+Checkpoints land in `OUTPUT_DIR` every 100 steps as regular LoRA `.safetensors` — load them in ComfyUI like any other LoRA.
+
+### Tips from our testing
+
+- **Inference strength ~0.8** is the sweet spot. 1.0 gives maximum likeness but can mangle fast motion (jumps, landings); 0.5 loses identity.
+- **Judge results with EasyCache off.** Cache reuse adds background wobble that is not your LoRA's fault and dampens real motion. It scammed us for a day.
+- Defaults (`no_packed_attn` + `image` timesteps + Prodigy) are the best recipe we found. `LORA_PRESET=attn_mlp` trains attention too — stronger stills, visibly worse video.
+- With Prodigy, 500–1000 steps is usually plenty at rank 32.
+- Tight on VRAM? Raise `BLOCKS_TO_SWAP` (default 6) — slower but smaller.
+- Before publishing weights, read the MiniMax H3 community license — it has jurisdiction restrictions.
+
+---
+
 ## Table of Contents
 
 <details>
