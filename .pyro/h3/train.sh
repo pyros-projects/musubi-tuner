@@ -17,19 +17,20 @@ DIT="${DIT:-/home/pyro/models/comfy/diffusion_models/minimax_h3_fl2va_pruned_int
 TEXT_ENCODER="${TEXT_ENCODER:-/home/pyro/models/comfy/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors}"
 VAE="${VAE:-/home/pyro/models/comfy/vae/minimax_h3_video_vae_fp16.safetensors}"
 
-H3_NAME="${H3_NAME:-bb}"
+H3_NAME="${H3_NAME:-lucy_v2}"
 CACHE_DATASET="${CACHE_DATASET:-1}"
-MAX_STEPS="${MAX_STEPS:-1000}"
+MAX_STEPS="${MAX_STEPS:-2000}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
 SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
 SAMPLE_PROMPTS="${SAMPLE_PROMPTS:-.pyro/h3/cfg/p_${H3_NAME}.toml}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
 NETWORK_DIM="${NETWORK_DIM:-32}"
 NETWORK_ALPHA="${NETWORK_ALPHA:-$NETWORK_DIM}"
-LORA_PRESET="${LORA_PRESET:-attn_mlp}"
+LORA_PRESET="${LORA_PRESET:-no_packed_attn}" # attn, attn_mlp, no_packed_attn, or full
 OPTIMIZER="${OPTIMIZER:-prodigy}"  # adamw8bit | adafactor | prodigy
 LEARNING_RATE="${LEARNING_RATE:-}"   # empty = optimizer-specific default
-BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-12}"
+BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-6}"
+SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-0}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
 CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-8}"
 CACHE_TEXT_BATCH_SIZE="${CACHE_TEXT_BATCH_SIZE:-1}"
 IMAGE_FRAME_COUNT="${IMAGE_FRAME_COUNT:-1}"
@@ -91,7 +92,7 @@ case "$TIMESTEP_PRESET" in
             --discrete_flow_shift 12
             --preserve_distribution_shape
             --min_timestep 0
-            --max_timestep 900
+            --max_timestep 875
         )
         ;;
     h3_video)
@@ -194,6 +195,7 @@ if (( SAMPLE_EVERY > 0 )); then
     done
     SAMPLE_ARGS=(
         --vae "$VAE"
+        --sample_at_first
         --vae_dtype float16
         --sample_prompts "$SAMPLE_PROMPTS"
         --sample_every_n_steps "$SAMPLE_EVERY"
@@ -202,6 +204,9 @@ if (( SAMPLE_EVERY > 0 )); then
         --sample_solver "$SAMPLE_SOLVER"
         --sample_frame_select "$SAMPLE_FRAME_SELECT"
     )
+    if [[ "$SAMPLE_BLOCKS_TO_SWAP" != "inherit" ]]; then
+        SAMPLE_ARGS+=(--sample_blocks_to_swap "$SAMPLE_BLOCKS_TO_SWAP")
+    fi
 fi
 
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
@@ -213,7 +218,7 @@ echo "H3 image cache: frames=$IMAGE_FRAME_COUNT config=$DATASET_TOML"
 echo "H3 image audio: mode=$IMAGE_AUDIO_MODE"
 echo "H3 timesteps: preset=$TIMESTEP_PRESET"
 echo "H3 LoRA targets: preset=$LORA_PRESET"
-echo "H3 preview: every=$SAMPLE_EVERY prompts=$SAMPLE_PROMPTS latents=$SAMPLE_LATENT_FRAMES audio=$SAMPLE_AUDIO_MODE solver=$SAMPLE_SOLVER frame=$SAMPLE_FRAME_SELECT"
+echo "H3 preview: every=$SAMPLE_EVERY prompts=$SAMPLE_PROMPTS latents=$SAMPLE_LATENT_FRAMES audio=$SAMPLE_AUDIO_MODE solver=$SAMPLE_SOLVER frame=$SAMPLE_FRAME_SELECT sample_blocks_to_swap=$SAMPLE_BLOCKS_TO_SWAP"
 
 CACHE_DATASET_ENABLED=0
 if truthy "$CACHE_DATASET"; then

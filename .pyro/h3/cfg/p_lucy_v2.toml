@@ -4,6 +4,11 @@ height = 1024
 frame_count = 1
 sample_steps = 20
 
+# Video also works
+# width = 320
+# height = 480
+# frame_count = 73
+
 # Bare trigger prompt: measures raw trigger binding, comparable with all
 # earlier previews (same seed 42 lineage).
 [[prompt.subset]]

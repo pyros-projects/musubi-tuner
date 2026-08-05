@@ -160,6 +160,7 @@ Notes:
 
 - With classic block swap, keep the loader `batch_size` at `1`; use `--gradient_accumulation_steps` for a larger effective batch.
 - `--blocks_to_swap` can be at most 48 for the 50-block transformer.
+- `--sample_blocks_to_swap` overrides block swap during previews: leave it unset to inherit training, use `0` for faster unswapped sampling, or a smaller positive count if `0` does not fit VRAM. The local launcher defaults this to `0`; set `SAMPLE_BLOCKS_TO_SWAP=inherit` to reuse `BLOCKS_TO_SWAP`.
 - `--fp8_base` and `--fp8_scaled` are rejected. INT8/ConvRot is selected by the `--dit` checkpoint itself.
 - H3 training previews support single images (`frame_count=1`) and silent video clips (`frame_count` of `17*n+5`), positive prompts, and classic block swap only. Video previews are much slower per tick; prefer 512px canvases and a low sampling cadence. The preview flags `--sample_latent_frames`, `--sample_audio_mode`, `--sample_solver`, and `--sample_frame_select` control the internal sampling packet for A/B testing; each can also be set per prompt inside the prompt file (`sample_latent_frames = 1` in a `[[prompt.subset]]` overrides the CLI flag), so one run can preview several sampling configurations side by side.
 - Video samples without an audio track use encoded silent audio latents. For image caches, choose `--image_audio_mode none` or `silent`; synthesized silent rows remain loss-excluded and require `--audio_loss_weight 0`.

@@ -158,6 +158,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 flow shifts must be positive")
         if args.audio_loss_weight < 0:
             raise ValueError("--audio_loss_weight must be non-negative")
+        sample_blocks_to_swap = getattr(args, "sample_blocks_to_swap", None)
+        if sample_blocks_to_swap is not None:
+            if sample_blocks_to_swap < 0:
+                raise ValueError("--sample_blocks_to_swap must be non-negative for MiniMax H3")
+            if sample_blocks_to_swap > 48:
+                raise ValueError("--sample_blocks_to_swap cannot exceed 48 for MiniMax H3")
+            if sample_blocks_to_swap > 0 and not getattr(args, "blocks_to_swap", 0):
+                raise ValueError(
+                    "Positive --sample_blocks_to_swap requires positive --blocks_to_swap to initialize MiniMax H3's "
+                    "classic block-swap offloader"
+                )
         if getattr(args, "sample_prompts", None) and getattr(args, "block_swap_h2d_only", False):
             raise ValueError("H3 preview sampling currently requires classic block swap; omit --block_swap_h2d_only")
         _apply_h3_lora_target_preset(args)

@@ -10,6 +10,7 @@ layouts so either BF16 distribution can be loaded without a key conversion.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import math
 
 import torch
@@ -447,6 +448,56 @@ class MiniMaxH3Model(nn.Module):
     def prepare_block_swap_before_forward(self):
         if self.blocks_to_swap:
             self.offloader.prepare_block_devices_before_forward(self.blocks)
+
+    @contextmanager
+    def override_block_swap_for_sampling(self, sample_blocks_to_swap: int | None, device: torch.device):
+        if sample_blocks_to_swap is None:
+            yield None
+            return
+
+        target_blocks_to_swap = int(sample_blocks_to_swap)
+        if target_blocks_to_swap < 0:
+            raise ValueError("H3 sample_blocks_to_swap must be a non-negative integer.")
+
+        max_blocks_to_swap = len(self.blocks) - 2
+        if target_blocks_to_swap > max_blocks_to_swap:
+            raise ValueError(f"Cannot swap more than {max_blocks_to_swap} H3 blocks during sampling. Requested {target_blocks_to_swap}.")
+
+        original_blocks_to_swap = int(self.blocks_to_swap or 0)
+        if (original_blocks_to_swap > 0 or target_blocks_to_swap > 0) and self.offloader is None:
+            raise ValueError("H3 sample_blocks_to_swap override requires initialized block swap when a positive count is involved.")
+        if isinstance(self.offloader, LoRAStreamOffloader):
+            raise ValueError("H3 sample_blocks_to_swap requires classic block swap; disable --block_swap_h2d_only.")
+
+        offloader = self.offloader
+        original_offloader_blocks_to_swap = getattr(offloader, "blocks_to_swap", None) if offloader is not None else None
+        original_forward_only = getattr(offloader, "forward_only", None) if offloader is not None else None
+
+        if offloader is None:
+            yield target_blocks_to_swap
+            return
+
+        try:
+            offloader.set_forward_only(True)
+            self.blocks_to_swap = target_blocks_to_swap
+            offloader.blocks_to_swap = target_blocks_to_swap
+
+            if target_blocks_to_swap > 0:
+                self.prepare_block_swap_before_forward()
+            else:
+                self.move_to_device_except_swap_blocks(device)
+
+            yield target_blocks_to_swap
+        finally:
+            if original_forward_only is not None:
+                offloader.set_forward_only(original_forward_only)
+            self.blocks_to_swap = original_blocks_to_swap
+            offloader.blocks_to_swap = original_offloader_blocks_to_swap
+
+            if original_blocks_to_swap > 0:
+                self.prepare_block_swap_before_forward()
+            else:
+                self.move_to_device_except_swap_blocks(device)
 
     def switch_block_swap_for_inference(self):
         if self.blocks_to_swap:

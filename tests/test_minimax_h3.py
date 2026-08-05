@@ -1,4 +1,4 @@
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import json
 import sys
 from types import ModuleType
@@ -35,7 +35,9 @@ from musubi_tuner.minimax_h3.model import (
 )
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer
 from musubi_tuner.minimax_h3_train_network import _apply_h3_lora_target_preset
+from musubi_tuner.minimax_h3_train_network import minimax_h3_setup_parser
 from musubi_tuner.networks import lora
+from musubi_tuner.training.parser_common import setup_parser_common
 from musubi_tuner.modules.int8_optimization_utils import (
     Int8ConvRotConfig,
     _convrot_hadamard,
@@ -112,6 +114,153 @@ def test_tiny_h3_forward_and_backward():
     image_out.square().mean().backward()
     assert image.grad is not None
     assert image_context.grad is not None
+
+
+def test_h3_parser_preserves_explicit_zero_sample_blocks_to_swap():
+    parser = setup_parser_common()
+
+    assert parser.parse_args([]).sample_blocks_to_swap is None
+    assert parser.parse_args(["--sample_blocks_to_swap", "0"]).sample_blocks_to_swap == 0
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param(["--sample_blocks_to_swap", "-1", "--blocks_to_swap", "2"], id="negative"),
+        pytest.param(["--sample_blocks_to_swap", "49", "--blocks_to_swap", "2"], id="over-48"),
+        pytest.param(["--sample_blocks_to_swap", "1"], id="training-unset"),
+        pytest.param(["--sample_blocks_to_swap", "1", "--blocks_to_swap", "0"], id="training-zero"),
+    ],
+)
+def test_h3_rejects_invalid_sampling_block_swap_at_startup(options):
+    args = minimax_h3_setup_parser(setup_parser_common()).parse_args(options)
+
+    with pytest.raises(ValueError, match="sample_blocks_to_swap"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_sampling_block_swap_override_restores_after_error_and_normal_exit():
+    class FakeOffloader:
+        def __init__(self):
+            self.blocks_to_swap = 2
+            self.forward_only = False
+            self.mode_calls = []
+            self.prepare_calls = []
+
+        def set_forward_only(self, value):
+            self.mode_calls.append(value)
+            self.forward_only = value
+
+        def prepare_block_devices_before_forward(self, blocks):
+            self.prepare_calls.append((self.blocks_to_swap, len(blocks)))
+
+    model = MiniMaxH3Model.__new__(MiniMaxH3Model)
+    torch.nn.Module.__init__(model)
+    model.blocks = torch.nn.ModuleList(torch.nn.Linear(1, 1) for _ in range(4))
+    model.blocks_to_swap = 2
+    model.offloader = FakeOffloader()
+    placement_counts = []
+    move_to_device = model.move_to_device_except_swap_blocks
+
+    def track_model_placement(device):
+        placement_counts.append(model.blocks_to_swap)
+        move_to_device(device)
+
+    model.move_to_device_except_swap_blocks = track_model_placement
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with model.override_block_swap_for_sampling(0, torch.device("cpu")) as effective_count:
+            assert effective_count == 0
+            assert model.blocks_to_swap == 0
+            assert model.offloader.blocks_to_swap == 0
+            raise RuntimeError("boom")
+
+    assert model.blocks_to_swap == 2
+    assert model.offloader.blocks_to_swap == 2
+    assert model.offloader.mode_calls == [True, False]
+    assert model.offloader.prepare_calls[-1] == (2, 4)
+    assert placement_counts == [0]
+
+    with model.override_block_swap_for_sampling(1, torch.device("cpu")) as effective_count:
+        assert effective_count == 1
+        assert model.blocks_to_swap == 1
+        assert model.offloader.blocks_to_swap == 1
+        assert model.offloader.forward_only
+        assert model.offloader.prepare_calls[-1] == (1, 4)
+
+    assert model.blocks_to_swap == 2
+    assert model.offloader.blocks_to_swap == 2
+    assert not model.offloader.forward_only
+    assert model.offloader.mode_calls == [True, False, True, False]
+    assert model.offloader.prepare_calls == [(2, 4), (1, 4), (2, 4)]
+
+
+@pytest.mark.parametrize(
+    ("sample_blocks_to_swap", "expected_events"),
+    [
+        (None, ["inference_mode", "sample", "training_mode"]),
+        (0, [("enter", 0, "cpu"), "sample", ("exit", 0)]),
+    ],
+)
+def test_h3_sample_images_restores_sampling_block_swap_after_failure(
+    monkeypatch, tmp_path, sample_blocks_to_swap, expected_events
+):
+    events = []
+
+    class FakeState:
+        num_processes = 1
+
+    class FakeAccelerator:
+        device = torch.device("cpu")
+
+        @staticmethod
+        def unwrap_model(transformer):
+            return transformer
+
+        @staticmethod
+        def autocast():
+            return nullcontext()
+
+    class FakeTransformer:
+        blocks_to_swap = 2
+
+        @staticmethod
+        def switch_block_swap_for_inference():
+            events.append("inference_mode")
+
+        @staticmethod
+        def switch_block_swap_for_training():
+            events.append("training_mode")
+
+        @contextmanager
+        def override_block_swap_for_sampling(self, count, device):
+            events.append(("enter", count, device.type))
+            try:
+                yield count
+            finally:
+                events.append(("exit", count))
+
+    trainer = MiniMaxH3NetworkTrainer()
+
+    def fail_sample(*_args, **_kwargs):
+        events.append("sample")
+        raise RuntimeError("sample failed")
+
+    trainer.sample_image_inference = fail_sample
+    monkeypatch.setattr("musubi_tuner.training.trainer_base.PartialState", lambda: FakeState())
+    args = SimpleNamespace(
+        sample_at_first=False,
+        sample_every_n_steps=1,
+        sample_every_n_epochs=None,
+        sample_prompts="samples.toml",
+        sample_blocks_to_swap=sample_blocks_to_swap,
+        output_dir=str(tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="sample failed"):
+        trainer.sample_images(FakeAccelerator(), args, None, 1, None, FakeTransformer(), [{}], torch.float32)
+
+    assert events == expected_events
 
 
 @pytest.mark.parametrize(

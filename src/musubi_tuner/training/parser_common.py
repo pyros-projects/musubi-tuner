@@ -395,6 +395,12 @@ def _add_memory_args(parser: argparse.ArgumentParser) -> None:
         help="number of blocks to swap in the model, max XXX / モデル内のブロックの数、最大XXX",
     )
     parser.add_argument(
+        "--sample_blocks_to_swap",
+        type=int,
+        default=None,
+        help="override block swap only during sample generation; unset inherits --blocks_to_swap, 0 disables sampling swap",
+    )
+    parser.add_argument(
         "--use_pinned_memory_for_block_swap",
         action="store_true",
         help="use pinned memory for block swapping, which may speed up data transfer between CPU and GPU but uses more shared GPU memory on Windows"

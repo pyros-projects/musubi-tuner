@@ -11,6 +11,7 @@ import ast
 import asyncio
 import importlib
 import argparse
+from contextlib import nullcontext
 import math
 import os
 import re
@@ -899,7 +900,6 @@ class NetworkTrainer:
 
         # Use the unwrapped model
         transformer = accelerator.unwrap_model(transformer)
-        transformer.switch_block_swap_for_inference()
 
         # Create a directory to save the samples
         save_dir = os.path.join(args.output_dir, "sample")
@@ -913,35 +913,63 @@ class NetworkTrainer:
         except Exception:
             pass
 
-        if distributed_state.num_processes <= 1:
-            # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
-            with torch.no_grad(), accelerator.autocast():
-                for sample_parameter in sample_parameters:
-                    self.sample_image_inference(
-                        accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+        sample_block_swap_context = nullcontext(None)
+        manages_block_swap_mode = False
+        sample_blocks_to_swap = getattr(args, "sample_blocks_to_swap", None)
+        if sample_blocks_to_swap is not None:
+            if hasattr(transformer, "override_block_swap_for_sampling"):
+                training_blocks_to_swap = getattr(transformer, "blocks_to_swap", 0)
+                sample_block_swap_context = transformer.override_block_swap_for_sampling(
+                    sample_blocks_to_swap, accelerator.device
+                )
+                manages_block_swap_mode = True
+            else:
+                logger.warning(
+                    "sample_blocks_to_swap=%s was requested, but this transformer does not support sampling block-swap override; using existing block-swap state.",
+                    sample_blocks_to_swap,
+                )
+
+        try:
+            if not manages_block_swap_mode:
+                transformer.switch_block_swap_for_inference()
+            with sample_block_swap_context as effective_sample_blocks_to_swap:
+                if effective_sample_blocks_to_swap is not None:
+                    logger.info(
+                        "Sampling block swap override active: training=%s sampling=%s",
+                        training_blocks_to_swap,
+                        effective_sample_blocks_to_swap,
                     )
-                    clean_memory_on_device(accelerator.device)
-        else:
-            # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
-            # prompt_dicts are assigned to lists based on order of processes, to attempt to time the image creation time to match enum order. Probably only works when steps and sampler are identical.
-            per_process_params = []  # list of lists
-            for i in range(distributed_state.num_processes):
-                per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
 
-            with torch.no_grad():
-                with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
-                    for sample_parameter in sample_parameter_lists[0]:
-                        self.sample_image_inference(
-                            accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
-                        )
-                        clean_memory_on_device(accelerator.device)
+                if distributed_state.num_processes <= 1:
+                    # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
+                    with torch.no_grad(), accelerator.autocast():
+                        for sample_parameter in sample_parameters:
+                            self.sample_image_inference(
+                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                            )
+                            clean_memory_on_device(accelerator.device)
+                else:
+                    # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
+                    # prompt_dicts are assigned to lists based on order of processes, to attempt to time the image creation time to match enum order. Probably only works when steps and sampler are identical.
+                    per_process_params = []  # list of lists
+                    for i in range(distributed_state.num_processes):
+                        per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
 
-        torch.set_rng_state(rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state(cuda_rng_state)
+                    with torch.no_grad():
+                        with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
+                            for sample_parameter in sample_parameter_lists[0]:
+                                self.sample_image_inference(
+                                    accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                                )
+                                clean_memory_on_device(accelerator.device)
+        finally:
+            torch.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state)
 
-        transformer.switch_block_swap_for_training()
-        clean_memory_on_device(accelerator.device)
+            if not manages_block_swap_mode:
+                transformer.switch_block_swap_for_training()
+            clean_memory_on_device(accelerator.device)
 
     def sample_image_inference(self, accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
         """architecture independent sample images"""
