@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,8 @@ from accelerate import Accelerator
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_MINIMAX_H3, ARCHITECTURE_MINIMAX_H3_FULL
 from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file, setup_parser_common
 from musubi_tuner.minimax_h3 import minimax_h3_utils
+from musubi_tuner.minimax_h3.convert_lora_to_comfy import convert_lora_to_comfy
+from musubi_tuner.utils import huggingface_utils
 from musubi_tuner.minimax_h3.model import MiniMaxH3Model, time_shift_sigma
 from musubi_tuner.minimax_h3.video_vae import load_video_vae_decoder
 from musubi_tuner.minimax_h3_cache_text_encoder_outputs import (
@@ -143,6 +146,31 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     @property
     def architecture(self) -> str:
         return ARCHITECTURE_MINIMAX_H3
+
+    def on_post_save(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        ckpt_name: str,
+        save_dtype,
+        metadata: dict,
+        force_sync_upload: bool,
+    ) -> None:
+        if getattr(args, "no_convert_to_comfy", False) or not ckpt_name.endswith(".safetensors"):
+            return
+        ckpt_file = os.path.join(args.output_dir, ckpt_name)
+        comfy_name = ckpt_name[: -len(".safetensors")] + ".comfy.safetensors"
+        comfy_file = os.path.join(args.output_dir, comfy_name)
+        try:
+            convert_lora_to_comfy(ckpt_file, comfy_file)
+        except Exception as e:
+            accelerator.print(f"Warning: ComfyUI LoRA conversion failed for {ckpt_file}: {e}")
+            return
+        accelerator.print(f"saved ComfyUI-format LoRA: {comfy_file}")
+        if args.huggingface_repo_id is not None:
+            huggingface_utils.upload(args, comfy_file, "/" + comfy_name, force_sync_upload=force_sync_upload)
 
     @property
     def architecture_full_name(self) -> str:
@@ -483,6 +511,11 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         choices=("dup_last", "first", "last", "sharpest"),
         default="dup_last",
         help="preview frame from the two-latent packet: dup_last decodes the second latent through the measured-best duplicate path; first/last/sharpest pick from the natural five-frame clip",
+    )
+    parser.add_argument(
+        "--no_convert_to_comfy",
+        action="store_true",
+        help="skip writing the ComfyUI-format .comfy.safetensors twin next to each saved LoRA",
     )
     parser.set_defaults(timestep_sampling="shift", discrete_flow_shift=12.0, mixed_precision="bf16")
     return parser

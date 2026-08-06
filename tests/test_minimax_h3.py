@@ -801,3 +801,82 @@ def test_tiny_pruned_h3_forward_and_backward():
     assert video.grad is not None
     assert audio.grad is not None
     assert context.grad is not None
+
+
+def test_h3_lora_comfy_module_name_conversion():
+    from musubi_tuner.minimax_h3.convert_lora_to_comfy import convert_module_name_to_comfy
+
+    cases = {
+        "lora_unet_blocks_0_mlp_fc1": "blocks.0.mlp.fc1",
+        "lora_unet_blocks_49_mlp_fc2": "blocks.49.mlp.fc2",
+        "lora_unet_blocks_12_attn_qkv_proj": "blocks.12.attn.qkv_proj",
+        "lora_unet_blocks_7_attn_out_proj": "blocks.7.attn.out_proj",
+        "lora_unet_blocks_3_adaln_proj_linear": "blocks.3.adaln_proj.linear",
+        "lora_unet_token_refiner_blocks_1_attn_qkv_proj": "token_refiner.blocks.1.attn.qkv_proj",
+        "lora_unet_token_refiner_blocks_0_mlp_fc2": "token_refiner.blocks.0.mlp.fc2",
+    }
+    for kohya, comfy in cases.items():
+        assert convert_module_name_to_comfy(kohya) == comfy
+
+
+def test_h3_lora_comfy_conversion_folds_alpha(tmp_path):
+    from musubi_tuner.minimax_h3.convert_lora_to_comfy import convert_lora_to_comfy
+    from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
+
+    rank, h = 4, 8
+    torch.manual_seed(0)
+    sd = {}
+    # alpha == rank: weights must pass through unchanged
+    sd["lora_unet_blocks_0_mlp_fc1.lora_down.weight"] = torch.randn(rank, h, dtype=torch.bfloat16)
+    sd["lora_unet_blocks_0_mlp_fc1.lora_up.weight"] = torch.randn(h, rank, dtype=torch.bfloat16)
+    sd["lora_unet_blocks_0_mlp_fc1.alpha"] = torch.tensor(float(rank))
+    # alpha == rank/2: lora_B must come out scaled by 0.5
+    sd["lora_unet_token_refiner_blocks_1_attn_qkv_proj.lora_down.weight"] = torch.randn(rank, h, dtype=torch.bfloat16)
+    sd["lora_unet_token_refiner_blocks_1_attn_qkv_proj.lora_up.weight"] = torch.randn(h, rank, dtype=torch.bfloat16)
+    sd["lora_unet_token_refiner_blocks_1_attn_qkv_proj.alpha"] = torch.tensor(rank / 2.0)
+
+    src = tmp_path / "lora.safetensors"
+    dst = tmp_path / "lora.comfy.safetensors"
+    save_file(sd, str(src), metadata={"ss_network_dim": "4"})
+
+    assert convert_lora_to_comfy(str(src), str(dst)) == 2
+
+    with MemoryEfficientSafeOpen(str(dst)) as f:
+        out = {k: f.get_tensor(k) for k in f.keys()}
+        metadata = f.metadata()
+
+    assert sorted(out) == [
+        "diffusion_model.blocks.0.mlp.fc1.lora_A.weight",
+        "diffusion_model.blocks.0.mlp.fc1.lora_B.weight",
+        "diffusion_model.token_refiner.blocks.1.attn.qkv_proj.lora_A.weight",
+        "diffusion_model.token_refiner.blocks.1.attn.qkv_proj.lora_B.weight",
+    ]
+    assert not any(".alpha" in k for k in out)
+    torch.testing.assert_close(out["diffusion_model.blocks.0.mlp.fc1.lora_A.weight"], sd["lora_unet_blocks_0_mlp_fc1.lora_down.weight"])
+    torch.testing.assert_close(out["diffusion_model.blocks.0.mlp.fc1.lora_B.weight"], sd["lora_unet_blocks_0_mlp_fc1.lora_up.weight"])
+    expected_scaled = (sd["lora_unet_token_refiner_blocks_1_attn_qkv_proj.lora_up.weight"].float() * 0.5).to(torch.bfloat16)
+    torch.testing.assert_close(out["diffusion_model.token_refiner.blocks.1.attn.qkv_proj.lora_B.weight"], expected_scaled)
+    assert metadata["ss_network_dim"] == "4"
+    assert metadata["ss_comfy_converted"] == "minimax_h3"
+
+
+def test_h3_on_post_save_writes_comfy_twin(tmp_path):
+    trainer = MiniMaxH3NetworkTrainer()
+
+    rank, h = 2, 4
+    sd = {
+        "lora_unet_blocks_5_mlp_fc2.lora_down.weight": torch.randn(rank, h, dtype=torch.bfloat16),
+        "lora_unet_blocks_5_mlp_fc2.lora_up.weight": torch.randn(h, rank, dtype=torch.bfloat16),
+        "lora_unet_blocks_5_mlp_fc2.alpha": torch.tensor(float(rank)),
+    }
+    ckpt_name = "demo-step00000010.safetensors"
+    save_file(sd, str(tmp_path / ckpt_name))
+
+    args = SimpleNamespace(output_dir=str(tmp_path), no_convert_to_comfy=False, huggingface_repo_id=None)
+    accelerator = SimpleNamespace(print=lambda *a, **k: None)
+    trainer.on_post_save(args, accelerator, None, None, ckpt_name, torch.bfloat16, {}, False)
+    assert (tmp_path / "demo-step00000010.comfy.safetensors").exists()
+
+    args.no_convert_to_comfy = True
+    trainer.on_post_save(args, accelerator, None, None, "other-step00000020.safetensors", torch.bfloat16, {}, False)
+    assert not (tmp_path / "other-step00000020.comfy.safetensors").exists()

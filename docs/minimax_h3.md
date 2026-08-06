@@ -127,6 +127,16 @@ To train against a Comfy INT8/ConvRot base, point `--dit` at either FL2VA INT8 f
 
 H3 uses a video sigma shift of 12 and an audio sigma shift of 3. The trainer samples the video schedule, maps the same base time to the audio schedule, noises both cached streams, and optimizes both raw `clean-noise` velocity targets. `--audio_loss_weight` controls the audio term relative to video.
 
+### ComfyUI-format LoRA output
+
+Every saved checkpoint gets a `.comfy.safetensors` twin in ComfyUI/ai-toolkit key format (`diffusion_model.blocks.N....lora_A/lora_B`, kohya `alpha/rank` scaling folded into `lora_B`). Disable with `--no_convert_to_comfy`. Existing musubi-format LoRAs convert standalone:
+
+```bash
+python -m musubi_tuner.minimax_h3.convert_lora_to_comfy path/to/lora.safetensors
+```
+
+ComfyUI's regular LoRA loader accepts both formats. Note for INT8 pre-bake nodes (e.g. `INT8 Pre-Lora Loader`): LoRA weights in either format can only be baked into layers that are still high-precision at load time. Pre-quantized `*_int8_convrot` checkpoints store all packed blocks as INT8, so only the BF16 token-refiner layers bake and the rest are silently skipped — bake against the BF16/pruned-BF16 transformer with on-the-fly quantization instead.
+
 ### Image previews during training
 
 The launcher caches all preview prompts before training and stores them in the first dataset's `cache_directory` as `minimax_h3_sample_prompts_cache.pt`. The 32B text encoder is loaded only when that cache is missing or stale, and its cache process exits before the trainer starts. Prompt files therefore contain only generation settings:

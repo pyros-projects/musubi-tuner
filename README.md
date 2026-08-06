@@ -61,7 +61,7 @@ H3_NAME=yourname CACHE_DATASET=1 .pyro/h3/train.sh
 H3_NAME=yourname .pyro/h3/train.sh
 ```
 
-Checkpoints land in `OUTPUT_DIR` every 100 steps as regular LoRA `.safetensors` — load them in ComfyUI like any other LoRA.
+Checkpoints land in `OUTPUT_DIR` every 100 steps as regular LoRA `.safetensors` — load them in ComfyUI like any other LoRA. Each save also writes a `.comfy.safetensors` twin in ComfyUI/ai-toolkit key format for tools that expect `diffusion_model.*.lora_A/lora_B` keys.
 
 ### Tips from our testing
 
