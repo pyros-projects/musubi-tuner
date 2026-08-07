@@ -1,0 +1,14 @@
+[general]
+resolution = [448, 448]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = true
+
+[[datasets]]
+video_directory = "/home/pyro/datasets/plushy"
+cache_directory = "/home/pyro/models/_out/h3/cache/plushy"
+target_frames = [73]
+frame_extraction = "head"
+source_fps = 30.0
+num_repeats = 1

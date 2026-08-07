@@ -16,6 +16,7 @@ COMFYUI_DIR="${COMFYUI_DIR:-/home/pyro/repos/comfy-ui}"
 DIT="${DIT:-/home/pyro/models/comfy/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors}"
 TEXT_ENCODER="${TEXT_ENCODER:-/home/pyro/models/comfy/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors}"
 VAE="${VAE:-/home/pyro/models/comfy/vae/minimax_h3_video_vae_fp16.safetensors}"
+AUDIO_VAE="${AUDIO_VAE:-/home/pyro/models/comfy/vae/minimax_h3_audio_vae_fp32.safetensors}"
 
 H3_NAME="${H3_NAME:-lucy_v2}"
 CACHE_DATASET="${CACHE_DATASET:-1}"
@@ -35,6 +36,7 @@ CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-8}"
 CACHE_TEXT_BATCH_SIZE="${CACHE_TEXT_BATCH_SIZE:-1}"
 IMAGE_FRAME_COUNT="${IMAGE_FRAME_COUNT:-1}"
 IMAGE_AUDIO_MODE="${IMAGE_AUDIO_MODE:-none}"
+AUDIO_LOSS_WEIGHT="${AUDIO_LOSS_WEIGHT:-0}"  # set 1 for video datasets with real audio
 TIMESTEP_PRESET="${TIMESTEP_PRESET:-image}"
 SAMPLE_LATENT_FRAMES="${SAMPLE_LATENT_FRAMES:-2}"
 SAMPLE_AUDIO_MODE="${SAMPLE_AUDIO_MODE:-auto}"
@@ -268,10 +270,15 @@ if (( CACHE_DATASET_ENABLED )); then
         echo "Missing H3 VAE: $VAE" >&2
         exit 1
     fi
+    AUDIO_VAE_ARGS=()
+    if [[ -f "$AUDIO_VAE" ]]; then
+        AUDIO_VAE_ARGS=(--audio_vae "$AUDIO_VAE")
+    fi
     "$PYTHON" -m musubi_tuner.minimax_h3_cache_latents \
         --dataset_config "$DATASET_TOML" \
         --vae "$VAE" \
         --vae_dtype float16 \
+        "${AUDIO_VAE_ARGS[@]}" \
         --device cuda \
         --batch_size "$CACHE_LATENTS_BATCH_SIZE" \
         --image_frame_count "$IMAGE_FRAME_COUNT" \
@@ -290,7 +297,7 @@ exec "$ACCELERATE" launch \
     --video_flow_shift 12 \
     --audio_flow_shift 3 \
     --weighting_scheme none \
-    --audio_loss_weight 0 \
+    --audio_loss_weight "$AUDIO_LOSS_WEIGHT" \
     --image_audio_mode "$IMAGE_AUDIO_MODE" \
     --gradient_checkpointing \
     --blocks_to_swap "$BLOCKS_TO_SWAP" \

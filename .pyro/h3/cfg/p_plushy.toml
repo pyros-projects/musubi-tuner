@@ -1,0 +1,11 @@
+[prompt]
+width = 448
+height = 448
+frame_count = 73
+sample_steps = 4
+sample_solver = "euler"
+
+# Turbo-overlay video preview arm (set SAMPLE_LORA_OVERLAY for 4-step sampling)
+[[prompt.subset]]
+prompt = "a red ceramic teapot suddenly turning into a cute plush toy"
+seed = 42
