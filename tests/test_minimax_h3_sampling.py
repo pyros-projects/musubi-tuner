@@ -524,8 +524,8 @@ def test_h3_overlay_normalize_formats_equivalent():
     n_comfy = slo.normalize_overlay_state_dict(comfy)
     n_kohya = slo.normalize_overlay_state_dict(kohya)
     assert list(n_bare) == list(n_comfy) == list(n_kohya) == ["blocks.3.attn.qkv_proj"]
-    assert n_bare["blocks.3.attn.qkv_proj"]["alpha"] is None
-    assert n_kohya["blocks.3.attn.qkv_proj"]["alpha"] == 1.0
+    assert n_bare["blocks.3.attn.qkv_proj"][0]["alpha"] is None
+    assert n_kohya["blocks.3.attn.qkv_proj"][0]["alpha"] == 1.0
     with pytest.raises(ValueError):
         slo.normalize_overlay_state_dict({"totally.unknown.key": down})
 
@@ -823,3 +823,73 @@ def test_h3_do_inference_overlay_prompt_strength():
     torch.testing.assert_close(run({"sample_lora_overlay": 0.5}), torch.full((1, 4), 3.0))
     torch.testing.assert_close(run({"sample_lora_overlay": 0}), torch.ones(1, 4))
     torch.testing.assert_close(run({"sample_lora_overlay": "true"}), torch.full((1, 4), 5.0))
+
+
+def test_h3_overlay_diffusers_peft_mapping():
+    from musubi_tuner.minimax_h3 import sampling_lora_overlay as slo
+
+    r, hidden, inner, ffn = 2, 6, 4, 3
+    sd = {}
+    for name in ("to_q", "to_k", "to_v"):
+        sd[f"transformer_blocks.7.attn.{name}.lora_A.default.weight"] = torch.randn(r, hidden)
+        sd[f"transformer_blocks.7.attn.{name}.lora_B.default.weight"] = torch.randn(inner, r)
+    sd["transformer_blocks.7.attn.to_out.0.lora_A.default.weight"] = torch.randn(r, inner)
+    sd["transformer_blocks.7.attn.to_out.0.lora_B.default.weight"] = torch.randn(hidden, r)
+    ff_up = torch.randn(2 * ffn, r)
+    sd["transformer_blocks.7.ff.net.0.proj.lora_A.default.weight"] = torch.randn(r, hidden)
+    sd["transformer_blocks.7.ff.net.0.proj.lora_B.default.weight"] = ff_up
+    sd["token_refiner.refiner_blocks.1.ff.net.2.lora_A.default.weight"] = torch.randn(r, ffn)
+    sd["token_refiner.refiner_blocks.1.ff.net.2.lora_B.default.weight"] = torch.randn(hidden, r)
+
+    modules = slo.normalize_overlay_state_dict(sd)
+    assert sorted(modules) == [
+        "blocks.7.attn.out_proj",
+        "blocks.7.attn.qkv_proj",
+        "blocks.7.mlp.fc1",
+        "token_refiner.blocks.1.mlp.fc2",
+    ]
+    qkv = modules["blocks.7.attn.qkv_proj"]
+    assert sorted(e["offset"] for e in qkv) == [0, inner, 2 * inner]
+    assert all(e["alpha"] == slo.DIFFUSERS_PEFT_ALPHA for e in qkv)
+    # SwiGLU halves swapped: diffusers [value; gate] -> ours [gate; value]
+    fc1 = modules["blocks.7.mlp.fc1"][0]
+    torch.testing.assert_close(fc1["up"], torch.cat([ff_up[ffn:], ff_up[:ffn]], dim=0))
+    assert modules["blocks.7.attn.out_proj"][0]["offset"] is None
+
+
+def test_h3_overlay_split_qkv_matches_fused_delta():
+    from musubi_tuner.minimax_h3 import sampling_lora_overlay as slo
+
+    hidden, inner, r = 6, 4, 2
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            block = torch.nn.Module()
+            block.attn = torch.nn.Module()
+            block.attn.qkv_proj = torch.nn.Linear(hidden, 3 * inner, bias=False)
+            self.blocks = torch.nn.ModuleList([block])
+
+    torch.manual_seed(3)
+    model = Tiny()
+    sd = {}
+    parts = {}
+    for name in ("to_q", "to_k", "to_v"):
+        a, b = torch.randn(r, hidden), torch.randn(inner, r)
+        sd[f"transformer_blocks.0.attn.{name}.lora_A.default.weight"] = a
+        sd[f"transformer_blocks.0.attn.{name}.lora_B.default.weight"] = b
+        parts[name] = (a, b)
+
+    x = torch.randn(1, 5, hidden)
+    base = model.blocks[0].attn.qkv_proj(x)
+    slo.attach_sampling_lora_overlays(model, [(slo.normalize_overlay_state_dict(sd), 1.0)])
+    got = model.blocks[0].attn.qkv_proj(x)
+
+    scale = slo.DIFFUSERS_PEFT_ALPHA / r
+    expected = base.clone()
+    for i, name in enumerate(("to_q", "to_k", "to_v")):
+        a, b = parts[name]
+        expected[..., i * inner : (i + 1) * inner] += scale * (x @ a.T @ b.T)
+    torch.testing.assert_close(got, expected)
+    slo.clear_sampling_lora_overlays(model)
+    torch.testing.assert_close(model.blocks[0].attn.qkv_proj(x), base)

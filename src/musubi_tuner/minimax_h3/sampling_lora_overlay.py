@@ -41,6 +41,60 @@ _SHARED_ATTR = "_h3_sampling_overlay_shared"
 
 _PAIR_RE = re.compile(r"^(?:diffusion_model\.)?(.+)\.(lora_A|lora_B|lora_down|lora_up)\.weight$")
 _ALPHA_RE = re.compile(r"^(?:diffusion_model\.)?(.+)\.alpha$")
+_PEFT_RE = re.compile(r"^(.+)\.(lora_A|lora_B)\.default\.weight$")
+
+# lightx2v/diffusers PEFT exports carry no alpha; their reference inference
+# applies lora_alpha=8 externally (effective scale alpha/rank).
+DIFFUSERS_PEFT_ALPHA = 8.0
+_DIFFUSERS_QKV_INDEX = {"to_q": 0, "to_k": 1, "to_v": 2}
+
+
+def _map_diffusers_module(path: str) -> tuple[str, str | None, int | None]:
+    """Diffusers H3 module path -> (our path, transform kind, qkv index).
+
+    Mirrors diffusers' convert_minimax_h3_to_diffusers plan: transformer_blocks<->blocks,
+    refiner_blocks<->blocks, fused qkv split into contiguous [q; k; v] thirds,
+    to_out.0<->out_proj, ff.net.0.proj<->fc1 with SwiGLU halves swapped
+    ([value; gate] in diffusers vs [gate; value] here), ff.net.2<->fc2.
+    """
+    p = path.replace("token_refiner.refiner_blocks.", "token_refiner.blocks.", 1)
+    if p.startswith("transformer_blocks."):
+        p = "blocks." + p[len("transformer_blocks."):]
+    if p.endswith(".attn.to_out.0"):
+        return p[: -len("to_out.0")] + "out_proj", None, None
+    for name, index in _DIFFUSERS_QKV_INDEX.items():
+        if p.endswith(f".attn.{name}"):
+            return p[: -len(name)] + "qkv_proj", "qkv", index
+    if p.endswith(".ff.net.0.proj"):
+        return p[: -len("ff.net.0.proj")] + "mlp.fc1", "swap_halves", None
+    if p.endswith(".ff.net.2"):
+        return p[: -len("ff.net.2")] + "mlp.fc2", None, None
+    return p, None, None
+
+
+def _normalize_diffusers_peft(sd: dict[str, torch.Tensor]) -> dict[str, list[dict]]:
+    pairs: dict[str, dict] = {}
+    for key, tensor in sd.items():
+        match = _PEFT_RE.match(key)
+        if not match:
+            raise ValueError(f"Unrecognized diffusers-PEFT LoRA key: {key}")
+        slot = "down" if match.group(2) == "lora_A" else "up"
+        pairs.setdefault(match.group(1), {})[slot] = tensor
+
+    modules: dict[str, list[dict]] = {}
+    for source_path, tensors in sorted(pairs.items()):
+        down, up = tensors.get("down"), tensors.get("up")
+        if down is None or up is None:
+            raise ValueError(f"Incomplete diffusers-PEFT LoRA module {source_path}")
+        path, kind, qkv_index = _map_diffusers_module(source_path)
+        offset = None
+        if kind == "qkv":
+            offset = qkv_index * up.shape[0]
+        elif kind == "swap_halves":
+            half = up.shape[0] // 2
+            up = torch.cat([up[half:], up[:half]], dim=0)
+        modules.setdefault(path, []).append({"down": down, "up": up, "alpha": DIFFUSERS_PEFT_ALPHA, "offset": offset})
+    return modules
 
 
 def load_overlay_file(path: str) -> dict[str, torch.Tensor]:
@@ -59,13 +113,20 @@ def load_temb_grid(path: str) -> torch.Tensor:
     return grid
 
 
-def normalize_overlay_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, dict]:
-    """Map any supported LoRA key format to {module_path: {down, up, alpha}}."""
+def normalize_overlay_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, list[dict]]:
+    """Map any supported LoRA key format to {module_path: [{down, up, alpha, offset}, ...]}.
+
+    A module may carry several adapters (diffusers split-qkv maps three per-projection
+    LoRAs onto the fused qkv_proj, each writing its own output slice via ``offset``).
+    """
+
+    if any(_PEFT_RE.match(key) for key in sd):
+        return _normalize_diffusers_peft(sd)
 
     modules: dict[str, dict] = {}
 
     def entry(path: str) -> dict:
-        return modules.setdefault(path, {"down": None, "up": None, "alpha": None})
+        return modules.setdefault(path, {"down": None, "up": None, "alpha": None, "offset": None})
 
     for key, tensor in sd.items():
         if key.startswith(KOHYA_PREFIX):
@@ -97,7 +158,7 @@ def normalize_overlay_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, dict]
     for path, tensors in modules.items():
         if tensors["down"] is None or tensors["up"] is None:
             raise ValueError(f"Incomplete LoRA overlay module {path}")
-    return modules
+    return {path: [tensors] for path, tensors in modules.items()}
 
 
 def _module_scale(tensors: dict, strength: float) -> float:
@@ -114,7 +175,15 @@ def _overlay_linear_forward(self, x, *args, **kwargs):
             down = adapter["down"] = down.to(x.device)
             up = adapter["up"] = up.to(x.device)
         delta = F.linear(F.linear(x.to(down.dtype), down), up)
-        out = out + adapter["scale"] * delta.to(dtype=out.dtype, device=out.device)
+        contribution = adapter["scale"] * delta.to(dtype=out.dtype, device=out.device)
+        offset = adapter.get("offset")
+        if offset is None:
+            out = out + contribution
+        else:
+            # split-projection adapter (e.g. diffusers to_q/to_k/to_v on fused qkv):
+            # the delta covers only its output slice
+            out = out.clone() if not out.is_contiguous() else out
+            out[..., offset : offset + up.shape[0]] += contribution
     return out
 
 
@@ -137,13 +206,21 @@ def _overlay_adaln_curve_forward(self, time_embedding):
     return projected.chunk(self.expand, dim=-1)
 
 
-def _attach_adapter(module: torch.nn.Module, forward_impl, down: torch.Tensor, up: torch.Tensor, scale: float, dtype: torch.dtype):
+def _attach_adapter(
+    module: torch.nn.Module,
+    forward_impl,
+    down: torch.Tensor,
+    up: torch.Tensor,
+    scale: float,
+    dtype: torch.dtype,
+    offset: int | None = None,
+):
     if not hasattr(module, _ORIG_FORWARD_ATTR):
         setattr(module, _ORIG_FORWARD_ATTR, module.forward)
         setattr(module, _ADAPTERS_ATTR, [])
         module.forward = forward_impl.__get__(module, module.__class__)
     getattr(module, _ADAPTERS_ATTR).append(
-        {"down": down.detach().to(dtype), "up": up.detach().to(dtype), "scale": float(scale)}
+        {"down": down.detach().to(dtype), "up": up.detach().to(dtype), "scale": float(scale), "offset": offset}
     )
 
 
@@ -160,7 +237,8 @@ def attach_sampling_lora_overlays(
     shared = {"silu_temb": None, "grid": temb_grid}
 
     for modules, strength in overlays:
-        for path, tensors in sorted(modules.items()):
+        for path, entries in sorted(modules.items()):
+          for tensors in entries:
             scale = _module_scale(tensors, strength)
             is_adaln = ".adaln_proj" in path or path.startswith("final_layer.adaln_proj")
             if is_adaln and use_curves:
@@ -185,7 +263,9 @@ def attach_sampling_lora_overlays(
                 is_int8 = isinstance(weight, torch.Tensor) and weight.dtype == torch.int8
                 # fp32 math over quantized bases (sibling-repo precedent); source dtype otherwise
                 dtype = torch.float32 if is_int8 else tensors["down"].dtype
-                _attach_adapter(module, _overlay_linear_forward, tensors["down"], tensors["up"], scale, dtype)
+                _attach_adapter(
+                    module, _overlay_linear_forward, tensors["down"], tensors["up"], scale, dtype, offset=tensors.get("offset")
+                )
                 stats["backbone"] += 1
 
     if stats["adaln_grid"]:
