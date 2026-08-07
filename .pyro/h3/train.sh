@@ -21,16 +21,16 @@ AUDIO_VAE="${AUDIO_VAE:-/home/pyro/models/comfy/vae/minimax_h3_audio_vae_fp32.sa
 H3_NAME="${H3_NAME:-headsit}"
 CACHE_DATASET="${CACHE_DATASET:-1}"
 MAX_STEPS="${MAX_STEPS:-2000}"
-SAVE_EVERY="${SAVE_EVERY:-100}"
-SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
+SAVE_EVERY="${SAVE_EVERY:-50}"
+SAMPLE_EVERY="${SAMPLE_EVERY:-25}"
 SAMPLE_PROMPTS="${SAMPLE_PROMPTS:-.pyro/h3/cfg/p_${H3_NAME}.toml}"
-GRAD_ACCUM="${GRAD_ACCUM:-1}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"
 NETWORK_DIM="${NETWORK_DIM:-32}"
 NETWORK_ALPHA="${NETWORK_ALPHA:-$NETWORK_DIM}"
 LORA_PRESET="${LORA_PRESET:-no_packed_attn}" # attn, attn_mlp, no_packed_attn, or full
-OPTIMIZER="${OPTIMIZER:-prodigy}"  # adamw8bit | adafactor | prodigy
+OPTIMIZER="${OPTIMIZER:-prodigy}"  # adamw8bit | adafactor | prodigy | adamw_optimi
 LEARNING_RATE="${LEARNING_RATE:-}"   # empty = optimizer-specific default
-BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-6}"
+BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-4}"
 SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-25}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
 CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-8}"
 CACHE_TEXT_BATCH_SIZE="${CACHE_TEXT_BATCH_SIZE:-1}"
@@ -43,7 +43,7 @@ TIMESTEP_PRESET="${TIMESTEP_PRESET:-image}"
 # (dw growth per step)/WEIGHT_DECAY — 0.005 targets dw ~140 at the measured
 # ~0.7/step push. The optimizer's default by_lr=True multiplies decay by the
 # adaptive lr (~1e-6) and is a no-op at any sane setting. 0.0 disables.
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.005}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.000}"
 # Timestep floor for the image preset. Weak lever under krea2_shift: its sigmoid
 # distribution has ~1-2% mass below t=0.075, ~10% below t=0.3 — needs 200-300 to
 # meaningfully bite. 0 = full range.
@@ -150,7 +150,18 @@ case "$OPTIMIZER" in
             --max_grad_norm 0
         )
         ;;
-    *) echo "OPTIMIZER must be adamw8bit, adafactor, or prodigy: $OPTIMIZER" >&2; exit 1 ;;
+    adamw_optimi)
+        # diffusion-pipe favorite; Kahan summation keeps bf16 updates precise.
+        # Needs torch-optimi in MUSUBI_VENV: uv pip install torch-optimi
+        LEARNING_RATE="${LEARNING_RATE:-2e-4}"
+        OPT_ARGS=(
+            --optimizer_type optimi.AdamW
+            --optimizer_args "betas=(0.9,0.99)" "weight_decay=0.0" "eps=1e-8"
+            --learning_rate "$LEARNING_RATE"
+            --lr_scheduler constant
+        )
+        ;;
+    *) echo "OPTIMIZER must be adamw8bit, adafactor, prodigy, or adamw_optimi: $OPTIMIZER" >&2; exit 1 ;;
 esac
 
 truthy() {

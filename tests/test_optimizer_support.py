@@ -52,3 +52,28 @@ def test_prodigy_step_logs_include_dynamic_learning_rate_values():
     assert logs["lr/effective_lr/video"] == 0.4
     assert logs["lr/d/audio"] == 0.5
     assert logs["lr/effective_lr/audio"] == 0.2
+
+
+def test_trainer_supports_optimi_adamw():
+    trainer = NetworkTrainer()
+    params = [torch.nn.Parameter(torch.ones(8))]
+    args = SimpleNamespace(
+        optimizer_type="optimi.AdamW",
+        optimizer_args=["betas=(0.9,0.99)", "weight_decay=0.0", "eps=1e-8"],
+        learning_rate=2e-4,
+        lr_scheduler="constant",
+        max_grad_norm=0.0,
+    )
+
+    optimizer_name, optimizer_args, optimizer, _train_fn, _eval_fn = trainer.get_optimizer(args, params)
+
+    assert optimizer.__class__.__module__.startswith("optimi")
+    assert optimizer.__class__.__name__ == "AdamW"
+    assert optimizer.defaults["lr"] == 2e-4
+    assert (optimizer.defaults["beta1"], optimizer.defaults["beta2"]) == (0.9, 0.99)
+    assert optimizer.defaults["weight_decay"] == 0.0
+    assert not trainer.is_schedulefree_optimizer(optimizer, args)
+
+    params[0].square().mean().backward()
+    optimizer.step()
+    assert torch.isfinite(params[0]).all()

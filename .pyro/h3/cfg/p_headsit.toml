@@ -8,17 +8,17 @@ sample_solver = "euler"  # AB2 extrapolation explodes at 4-step schedules
 # Video also works
 width = 640
 height = 480
-frame_count = 154
+frame_count = 156
 
 # Bare trigger prompt: measures raw trigger binding, comparable with all
 # earlier previews (same seed 42 lineage).
 [[prompt.subset]]
-prompt = "professional sports video of a woman lying on her chest on a yoga mat and bending her legs over her and dropping her butt on her head minimalistic yoga studio"
+prompt = "professional sports video of a woman lying on her chest on a yoga mat and bending her legs over her and doing a headsit pose in a minimalistic yoga studio"
 seed = 42
 
 
 [[prompt.subset]]
-prompt = "tik tok reel. slightly from the side. a young but pretty gothic girl lying on her chin with her butt on her head in her kitchen"
+prompt = "tik tok reel. slightly from the side. a young but pretty gothic girl lying on her chin doing a headsit pose and bouncing her butt up and down on her head in her kitchen"
 seed = 43
 
 
