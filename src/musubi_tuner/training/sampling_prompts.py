@@ -109,7 +109,8 @@ def load_prompts(prompt_file: str) -> list[Dict]:
     elif prompt_file.endswith(".toml"):
         with open(prompt_file, "r", encoding="utf-8") as f:
             data = toml.load(f)
-        prompts = [dict(**data["prompt"], **subset) for subset in data["prompt"]["subset"]]
+        defaults = {key: value for key, value in data["prompt"].items() if key != "subset"}
+        prompts = [{**defaults, **subset} for subset in data["prompt"]["subset"]]
     elif prompt_file.endswith(".json"):
         with open(prompt_file, "r", encoding="utf-8") as f:
             prompts = json.load(f)

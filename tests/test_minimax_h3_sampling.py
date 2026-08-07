@@ -691,3 +691,29 @@ def test_h3_do_inference_overlay_toggle():
     probes.clear()
     run({**sample, "sample_lora_overlay": 0})
     torch.testing.assert_close(probes[-1], torch.ones(1, 4))
+
+
+def test_h3_prompt_subset_overrides_prompt_defaults(tmp_path):
+    from musubi_tuner.training.sampling_prompts import load_prompts
+
+    prompt_file = tmp_path / "p.toml"
+    prompt_file.write_text(
+        """
+[prompt]
+width = 768
+sample_steps = 4
+
+[[prompt.subset]]
+prompt = "a"
+
+[[prompt.subset]]
+prompt = "b"
+sample_steps = 20
+sample_lora_overlay = 0
+""",
+        encoding="utf-8",
+    )
+    prompts = load_prompts(str(prompt_file))
+    assert [p["sample_steps"] for p in prompts] == [4, 20]
+    assert prompts[1]["sample_lora_overlay"] == 0
+    assert all("subset" not in p for p in prompts)
