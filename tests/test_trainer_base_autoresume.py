@@ -72,3 +72,30 @@ def test_autoresume_prodigy_states_without_scheduler(tmp_path):
     assert args.resume == str(tmp_path / "run-step00000100-state")
     assert accelerator.loaded == str(tmp_path / "run-step00000100-state")
     assert recovered_step == 100
+
+
+def test_network_delta_w_norm_matches_materialized():
+    class FakeLora(torch.nn.Module):
+        def __init__(self, in_f, rank, out_f, alpha):
+            super().__init__()
+            self.lora_down = torch.nn.Linear(in_f, rank, bias=False)
+            self.lora_up = torch.nn.Linear(rank, out_f, bias=False)
+            self.scale = alpha / rank
+
+    torch.manual_seed(0)
+    class FakeNetwork:
+        unet_loras = [FakeLora(16, 4, 24, 2.0), FakeLora(8, 2, 8, 2.0)]
+        text_encoder_loras = []
+
+    expected = sum(
+        l.scale * torch.linalg.matrix_norm(l.lora_up.weight.float() @ l.lora_down.weight.float()).item()
+        for l in FakeNetwork.unet_loras
+    )
+    got = NetworkTrainer._network_delta_w_norm(FakeNetwork())
+    assert abs(got - expected) < 1e-4, (got, expected)
+
+    class NotLora:
+        unet_loras = [object()]
+
+    assert NetworkTrainer._network_delta_w_norm(NotLora()) is None
+    assert NetworkTrainer._network_delta_w_norm(object()) is None

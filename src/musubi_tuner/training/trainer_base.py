@@ -114,6 +114,32 @@ class NetworkTrainer:
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
 
+    @staticmethod
+    @torch.no_grad()
+    def _network_delta_w_norm(network) -> Optional[float]:
+        """Sum of per-module ``||(alpha/rank) * up @ down||_F`` for kohya-style LoRA
+        networks, computed via the Gram-matrix identity ``||UD||_F^2 =
+        sum((U^T U) * (D D^T))`` so the deltas are never materialized. Returns None
+        for network types without plain up/down Linear pairs (LoHa/LoKr/etc.)."""
+        loras = list(getattr(network, "unet_loras", None) or [])
+        if not loras:
+            return None
+        total = None
+        for lora in loras:
+            up = getattr(lora, "lora_up", None)
+            down = getattr(lora, "lora_down", None)
+            scale = getattr(lora, "scale", None)
+            if up is None or down is None or scale is None:
+                return None
+            u, d = up.weight, down.weight
+            if u.ndim != 2 or d.ndim != 2:
+                return None
+            uu = u.transpose(0, 1).float() @ u.float()
+            dd = d.float() @ d.transpose(0, 1).float()
+            norm = float(scale) * (uu * dd).sum().clamp_min(0.0).sqrt()
+            total = norm if total is None else total + norm
+        return float(total.item())
+
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
         self,
@@ -2256,6 +2282,9 @@ class NetworkTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                delta_w = self._network_delta_w_norm(accelerator.unwrap_model(network))
+                if delta_w is not None:
+                    logs["dw"] = round(delta_w, 1)
                 step_logs = None
                 if args.optimizer_type.lower().endswith("prodigyplusschedulefree"):
                     step_logs = self.generate_step_logs(
@@ -2278,6 +2307,8 @@ class NetworkTrainer:
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
                     )
                     logs.update(loss_metrics)
+                    if delta_w is not None:
+                        logs["network/delta_w"] = delta_w
                     logs.update(self.extra_step_logs(args, logs))
                     accelerator.log(logs, step=global_step)
 
