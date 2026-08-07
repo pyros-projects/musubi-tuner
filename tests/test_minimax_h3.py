@@ -880,3 +880,47 @@ def test_h3_on_post_save_writes_comfy_twin(tmp_path):
     args.no_convert_to_comfy = True
     trainer.on_post_save(args, accelerator, None, None, "other-step00000020.safetensors", torch.bfloat16, {}, False)
     assert not (tmp_path / "other-step00000020.comfy.safetensors").exists()
+
+
+def test_h3_diffusers_lora_comfy_conversion_fuses_qkv(tmp_path):
+    from musubi_tuner.minimax_h3.convert_lora_to_comfy import convert_diffusers_lora_to_comfy
+    from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
+
+    torch.manual_seed(5)
+    r, hidden, inner, ffn = 2, 6, 4, 3
+    sd = {}
+    parts = {}
+    for name in ("to_q", "to_k", "to_v"):
+        a, b = torch.randn(r, hidden), torch.randn(inner, r)
+        sd[f"transformer_blocks.0.attn.{name}.lora_A.default.weight"] = a
+        sd[f"transformer_blocks.0.attn.{name}.lora_B.default.weight"] = b
+        parts[name] = (a, b)
+    ff_a, ff_b = torch.randn(r, hidden), torch.randn(2 * ffn, r)
+    sd["transformer_blocks.0.ff.net.0.proj.lora_A.default.weight"] = ff_a
+    sd["transformer_blocks.0.ff.net.0.proj.lora_B.default.weight"] = ff_b
+
+    src, dst = tmp_path / "peft.safetensors", tmp_path / "comfy.safetensors"
+    save_file(sd, str(src))
+    assert convert_diffusers_lora_to_comfy(str(src), str(dst)) == 2
+
+    with MemoryEfficientSafeOpen(str(dst)) as f:
+        out = {k: f.get_tensor(k) for k in f.keys()}
+    assert sorted(out) == [
+        "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight",
+        "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight",
+        "diffusion_model.blocks.0.mlp.fc1.lora_A.weight",
+        "diffusion_model.blocks.0.mlp.fc1.lora_B.weight",
+    ]
+
+    scale = 8.0 / r
+    # fused qkv delta must equal the per-projection deltas stacked on their slices
+    fused = out["diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight"].float() @ out[
+        "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight"
+    ].float()
+    assert fused.shape == (3 * inner, hidden)
+    for i, name in enumerate(("to_q", "to_k", "to_v")):
+        a, b = parts[name]
+        torch.testing.assert_close(fused[i * inner : (i + 1) * inner], scale * (b.float() @ a.float()), rtol=2e-2, atol=2e-2)
+    # fc1 halves un-swapped (diffusers [value; gate] -> ours [gate; value]) and scaled
+    fc1_up = out["diffusion_model.blocks.0.mlp.fc1.lora_B.weight"].float()
+    torch.testing.assert_close(fc1_up, scale * torch.cat([ff_b[ffn:], ff_b[:ffn]], dim=0).float(), rtol=2e-2, atol=2e-2)

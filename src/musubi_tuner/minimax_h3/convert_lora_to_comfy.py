@@ -92,16 +92,66 @@ def convert_lora_to_comfy(src_path: str, dst_path: str) -> int:
     return len(modules)
 
 
+def convert_diffusers_lora_to_comfy(src_path: str, dst_path: str) -> int:
+    """Convert a diffusers-PEFT H3 LoRA (e.g. lightx2v turbo) to ComfyUI format.
+
+    Split to_q/to_k/to_v adapters are fused into one block-diagonal pair on
+    qkv_proj (rank = sum of the parts), the diffusers SwiGLU half-swap on fc1 is
+    undone, and the external reference alpha (8) is folded into lora_B so the
+    file behaves correctly at strength 1.0 in any stock loader.
+    """
+    from musubi_tuner.minimax_h3 import sampling_lora_overlay
+
+    with safetensors_utils.MemoryEfficientSafeOpen(src_path) as f:
+        metadata = f.metadata() or {}
+        sd = {k: f.get_tensor(k) for k in f.keys()}
+
+    modules = sampling_lora_overlay.normalize_overlay_state_dict(sd)
+    out_sd: dict[str, torch.Tensor] = {}
+    for path, entries in sorted(modules.items()):
+        entries = sorted(entries, key=lambda e: e["offset"] or 0)
+        scaled = []
+        for e in entries:
+            scale = (e["alpha"] / e["down"].shape[0]) if e["alpha"] is not None else 1.0
+            up = (e["up"].float() * scale).to(e["up"].dtype)
+            scaled.append((e["down"], up, e["offset"] or 0))
+        if len(scaled) == 1 and entries[0]["offset"] is None:
+            down, up = scaled[0][0], scaled[0][1]
+        else:
+            out_features = max(off + up.shape[0] for _, up, off in scaled)
+            total_rank = sum(d.shape[0] for d, _, _ in scaled)
+            down = torch.cat([d for d, _, _ in scaled], dim=0)
+            up = torch.zeros(out_features, total_rank, dtype=scaled[0][1].dtype)
+            col = 0
+            for d, u, off in scaled:
+                up[off : off + u.shape[0], col : col + d.shape[0]] = u
+                col += d.shape[0]
+        comfy_module = f"diffusion_model.{path}"
+        out_sd[f"{comfy_module}.lora_A.weight"] = down
+        out_sd[f"{comfy_module}.lora_B.weight"] = up
+
+    metadata = dict(metadata)
+    metadata["ss_comfy_converted"] = "minimax_h3_diffusers"
+    save_file(out_sd, dst_path, metadata=metadata)
+    return len(modules)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Convert a MiniMax H3 musubi LoRA to ComfyUI format")
-    parser.add_argument("input", help="musubi-format LoRA .safetensors")
+    parser = argparse.ArgumentParser(description="Convert a MiniMax H3 LoRA (musubi or diffusers-PEFT) to ComfyUI format")
+    parser.add_argument("input", help="LoRA .safetensors (musubi/kohya or diffusers-PEFT keys, auto-detected)")
     parser.add_argument("output", nargs="?", default=None, help="output path (default: <input>.comfy.safetensors)")
     args = parser.parse_args()
 
     output = args.output
     if output is None:
         output = re.sub(r"\.safetensors$", "", args.input) + ".comfy.safetensors"
-    count = convert_lora_to_comfy(args.input, output)
+
+    with safetensors_utils.MemoryEfficientSafeOpen(args.input) as f:
+        is_diffusers = any(key.endswith(".default.weight") for key in f.keys())
+    if is_diffusers:
+        count = convert_diffusers_lora_to_comfy(args.input, output)
+    else:
+        count = convert_lora_to_comfy(args.input, output)
     print(f"Converted {count} LoRA modules -> {output}")
 
 
