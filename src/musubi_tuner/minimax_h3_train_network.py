@@ -10,7 +10,7 @@ from accelerate import Accelerator
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_MINIMAX_H3, ARCHITECTURE_MINIMAX_H3_FULL
 from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file, setup_parser_common
-from musubi_tuner.minimax_h3 import minimax_h3_utils
+from musubi_tuner.minimax_h3 import minimax_h3_utils, sampling_lora_overlay
 from musubi_tuner.minimax_h3.convert_lora_to_comfy import convert_lora_to_comfy
 from musubi_tuner.utils import huggingface_utils
 from musubi_tuner.minimax_h3.model import MiniMaxH3Model, time_shift_sigma
@@ -117,6 +117,7 @@ def sample_h3_image_latents(
     for index in range(sample_steps):
         video_step = (sigmas[index] - sigmas[index + 1]).item()
         audio_step = (audio_sigmas[index] - audio_sigmas[index + 1]).item()
+        sampling_lora_overlay.update_time_state(transformer, sigmas[index])
         pred_video, pred_audio = transformer(
             latents.to(dtype),
             audio.to(dtype),
@@ -284,22 +285,38 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if audio_mode == "auto":
             audio_mode = getattr(args, "image_audio_mode", "none")
         audio_latent_frames = _silent_audio_latent_length(latent_frames) if audio_mode == "silent" else 0
-        latents = sample_h3_image_latents(
-            transformer,
-            sample_parameter["h3_text_embed"],
-            sample_parameter["h3_token_tags"],
-            height=height,
-            width=width,
-            sample_steps=sample_steps,
-            video_flow_shift=discrete_flow_shift,
-            device=accelerator.device,
-            dtype=dit_dtype,
-            generator=generator,
-            audio_flow_shift=args.audio_flow_shift,
-            latent_frames=latent_frames,
-            audio_latent_frames=audio_latent_frames,
-            solver=sample_parameter.get("sample_solver", getattr(args, "sample_solver", "ab2")),
-        ).cpu()
+        overlays = getattr(self, "_sampling_overlays", None) or []
+        overlay_enabled = bool(overlays) and str(sample_parameter.get("sample_lora_overlay", 1)).lower() in ("1", "true", "yes", "on")
+        try:
+            if overlay_enabled:
+                stats = sampling_lora_overlay.attach_sampling_lora_overlays(
+                    transformer, overlays, temb_grid=getattr(self, "_sampling_overlay_grid", None)
+                )
+                if not getattr(self, "_sampling_overlay_logged", False):
+                    self._sampling_overlay_logged = True
+                    accelerator.print(
+                        f"Sampling LoRA overlay active: {stats['backbone']} backbone, "
+                        f"{stats['adaln_grid']} adaln-grid, {len(stats['skipped'])} skipped modules"
+                    )
+            latents = sample_h3_image_latents(
+                transformer,
+                sample_parameter["h3_text_embed"],
+                sample_parameter["h3_token_tags"],
+                height=height,
+                width=width,
+                sample_steps=sample_steps,
+                video_flow_shift=discrete_flow_shift,
+                device=accelerator.device,
+                dtype=dit_dtype,
+                generator=generator,
+                audio_flow_shift=args.audio_flow_shift,
+                latent_frames=latent_frames,
+                audio_latent_frames=audio_latent_frames,
+                solver=sample_parameter.get("sample_solver", getattr(args, "sample_solver", "ab2")),
+            ).cpu()
+        finally:
+            if overlay_enabled:
+                sampling_lora_overlay.clear_sampling_lora_overlays(transformer)
 
         parked = False
         try:
@@ -330,11 +347,35 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             disable_numpy_memmap=args.disable_numpy_memmap,
         )
 
+    def _load_sampling_overlays(self, args, accelerator) -> None:
+        if hasattr(self, "_sampling_overlays"):
+            return
+        self._sampling_overlays = []
+        self._sampling_overlay_grid = None
+        for spec in getattr(args, "sample_lora_overlay", None) or []:
+            path, _, tail = spec.rpartition(":")
+            try:
+                strength = float(tail) if path else 1.0
+            except ValueError:
+                path, strength = spec, 1.0
+            if not path:
+                path = spec
+            modules = sampling_lora_overlay.normalize_overlay_state_dict(sampling_lora_overlay.load_overlay_file(path))
+            self._sampling_overlays.append((modules, strength))
+            accelerator.print(f"Loaded sampling LoRA overlay: {path} ({len(modules)} modules, strength {strength})")
+        grid_path = getattr(args, "sample_lora_overlay_temb_grid", None)
+        if self._sampling_overlays and grid_path:
+            self._sampling_overlay_grid = sampling_lora_overlay.load_temb_grid(grid_path)
+
     def on_before_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
         self._sample_network_was_training = network.training
         network.eval()
+        self._load_sampling_overlays(args, accelerator)
 
     def on_after_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
+        # Defensive: per-prompt attach/clear in do_inference already restores forwards.
+        if getattr(self, "_sampling_overlays", None):
+            sampling_lora_overlay.clear_sampling_lora_overlays(accelerator.unwrap_model(transformer))
         network.train(getattr(self, "_sample_network_was_training", True))
 
     def load_transformer(
@@ -516,6 +557,19 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         "--no_convert_to_comfy",
         action="store_true",
         help="skip writing the ComfyUI-format .comfy.safetensors twin next to each saved LoRA",
+    )
+    parser.add_argument(
+        "--sample_lora_overlay",
+        action="append",
+        metavar="PATH[:STRENGTH]",
+        help="frozen LoRA applied only during preview sampling as a runtime overlay (repeatable); "
+        "e.g. the MiniMax-H3 Turbo LoRA for 4-step previews. Accepts musubi, ComfyUI, and bare turbo key formats",
+    )
+    parser.add_argument(
+        "--sample_lora_overlay_temb_grid",
+        default=None,
+        help="silu(t_emb) grid safetensors (from the ComfyUI-MiniMax-H3-Turbo node) enabling adaln overlay "
+        "modules on pruned curve-table bases; without it adaln modules are skipped with a warning",
     )
     parser.set_defaults(timestep_sampling="shift", discrete_flow_shift=12.0, mixed_precision="bf16")
     return parser

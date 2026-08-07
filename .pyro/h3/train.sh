@@ -40,6 +40,10 @@ SAMPLE_LATENT_FRAMES="${SAMPLE_LATENT_FRAMES:-2}"
 SAMPLE_AUDIO_MODE="${SAMPLE_AUDIO_MODE:-auto}"
 SAMPLE_SOLVER="${SAMPLE_SOLVER:-ab2}"
 SAMPLE_FRAME_SELECT="${SAMPLE_FRAME_SELECT:-dup_last}"
+# Optional frozen LoRA stacked on previews only (path[:strength]), e.g. the
+# community Turbo LoRA for 4-step previews. Empty = off (unchanged behavior).
+SAMPLE_LORA_OVERLAY="${SAMPLE_LORA_OVERLAY:-}"
+SAMPLE_LORA_TEMB_GRID="${SAMPLE_LORA_TEMB_GRID:-$COMFYUI_DIR/custom_nodes/comfyui-minimax-h3-turbo/h3_silu_temb_grid.safetensors}"
 
 if [[ ! "$H3_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "H3_NAME may only contain letters, numbers, dot, underscore, and dash: $H3_NAME" >&2
@@ -206,6 +210,12 @@ if (( SAMPLE_EVERY > 0 )); then
     )
     if [[ "$SAMPLE_BLOCKS_TO_SWAP" != "inherit" ]]; then
         SAMPLE_ARGS+=(--sample_blocks_to_swap "$SAMPLE_BLOCKS_TO_SWAP")
+    fi
+    if [[ -n "$SAMPLE_LORA_OVERLAY" ]]; then
+        SAMPLE_ARGS+=(--sample_lora_overlay "$SAMPLE_LORA_OVERLAY")
+        if [[ -f "$SAMPLE_LORA_TEMB_GRID" ]]; then
+            SAMPLE_ARGS+=(--sample_lora_overlay_temb_grid "$SAMPLE_LORA_TEMB_GRID")
+        fi
     fi
 fi
 

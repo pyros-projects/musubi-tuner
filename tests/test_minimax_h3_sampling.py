@@ -497,3 +497,197 @@ def test_h3_prompt_level_sampling_overrides_are_validated(tmp_path):
 
     with pytest.raises(ValueError, match="sample_solver"):
         MiniMaxH3NetworkTrainer().process_sample_prompts(SimpleNamespace(), None, str(prompt_path))
+
+
+def _bare_overlay_sd(scale_up=1.0):
+    return {
+        "blocks.0.mlp.fc1.lora_A.weight": torch.ones(1, 4),
+        "blocks.0.mlp.fc1.lora_B.weight": torch.full((4, 1), float(scale_up)),
+    }
+
+
+def test_h3_overlay_normalize_formats_equivalent():
+    from musubi_tuner.minimax_h3 import sampling_lora_overlay as slo
+
+    down, up = torch.randn(2, 4), torch.randn(4, 2)
+    bare = {"blocks.3.attn.qkv_proj.lora_A.weight": down, "blocks.3.attn.qkv_proj.lora_B.weight": up}
+    comfy = {
+        "diffusion_model.blocks.3.attn.qkv_proj.lora_A.weight": down,
+        "diffusion_model.blocks.3.attn.qkv_proj.lora_B.weight": up,
+    }
+    kohya = {
+        "lora_unet_blocks_3_attn_qkv_proj.lora_down.weight": down,
+        "lora_unet_blocks_3_attn_qkv_proj.lora_up.weight": up,
+        "lora_unet_blocks_3_attn_qkv_proj.alpha": torch.tensor(1.0),
+    }
+    n_bare = slo.normalize_overlay_state_dict(bare)
+    n_comfy = slo.normalize_overlay_state_dict(comfy)
+    n_kohya = slo.normalize_overlay_state_dict(kohya)
+    assert list(n_bare) == list(n_comfy) == list(n_kohya) == ["blocks.3.attn.qkv_proj"]
+    assert n_bare["blocks.3.attn.qkv_proj"]["alpha"] is None
+    assert n_kohya["blocks.3.attn.qkv_proj"]["alpha"] == 1.0
+    with pytest.raises(ValueError):
+        slo.normalize_overlay_state_dict({"totally.unknown.key": down})
+
+
+def test_h3_overlay_linear_math_and_clear():
+    from musubi_tuner.minimax_h3 import sampling_lora_overlay as slo
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            block = torch.nn.Module()
+            block.mlp = torch.nn.Module()
+            block.mlp.fc1 = torch.nn.Linear(4, 4, bias=False)
+            self.blocks = torch.nn.ModuleList([block])
+
+    model = Tiny()
+    torch.nn.init.eye_(model.blocks[0].mlp.fc1.weight)
+    x = torch.ones(1, 4)
+
+    # kohya alpha=rank/2 must halve the delta on top of the 0.5 strength
+    sd = {
+        "lora_unet_blocks_0_mlp_fc1.lora_down.weight": torch.ones(2, 4),
+        "lora_unet_blocks_0_mlp_fc1.lora_up.weight": torch.ones(4, 2),
+        "lora_unet_blocks_0_mlp_fc1.alpha": torch.tensor(1.0),  # rank 2 -> scale 0.5
+    }
+    modules = slo.normalize_overlay_state_dict(sd)
+    stats = slo.attach_sampling_lora_overlays(model, [(modules, 0.5)])
+    assert stats == {"backbone": 1, "adaln_grid": 0, "skipped": []}
+    # delta = up @ down @ x = 8 per element; scaled by 0.5 (strength) * 0.5 (alpha/rank)
+    torch.testing.assert_close(model.blocks[0].mlp.fc1(x), torch.ones(1, 4) + 2.0)
+
+    assert slo.clear_sampling_lora_overlays(model) == 1
+    torch.testing.assert_close(model.blocks[0].mlp.fc1(x), torch.ones(1, 4))
+    assert not hasattr(model.blocks[0].mlp.fc1, "_h3_sampling_overlay_orig_forward")
+
+
+def _tiny_curve_model():
+    from musubi_tuner.minimax_h3.model import AdalnProj
+
+    class TinyCurve(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            block = torch.nn.Module()
+            block.adaln_proj = AdalnProj(time_dim=8, hidden=2, expand=6, modalities=3, apply_silu=False)
+            self.blocks = torch.nn.ModuleList([block])
+            self.use_adaln_curves = True
+            self.sigma_shift_video = 12.0
+            self.sigma_shift_audio = 3.0
+
+    return TinyCurve()
+
+
+def test_h3_overlay_adaln_grid_injection():
+    from musubi_tuner.minimax_h3 import sampling_lora_overlay as slo
+
+    model = _tiny_curve_model()
+    adaln = model.blocks[0].adaln_proj
+    full_dim, out_dim = 16, 6 * 2 * 3
+    grid = torch.linspace(0.0, 1.0, 5).unsqueeze(1).repeat(1, full_dim)  # row value == t
+    sd = {
+        "blocks.0.adaln_proj.linear.lora_A.weight": torch.ones(1, full_dim),
+        "blocks.0.adaln_proj.linear.lora_B.weight": torch.ones(out_dim, 1),
+    }
+    coeffs = torch.zeros(2, 8)
+    base = torch.cat(adaln(coeffs), dim=-1)
+
+    stats = slo.attach_sampling_lora_overlays(model, [(slo.normalize_overlay_state_dict(sd), 1.0)], temb_grid=grid)
+    assert stats == {"backbone": 0, "adaln_grid": 1, "skipped": []}
+
+    # Before update_time_state the overlay must be inert.
+    torch.testing.assert_close(torch.cat(adaln(coeffs), dim=-1), base)
+
+    slo.update_time_state(model, torch.tensor(0.5))
+    # t_video=0.5, sigma_audio=time_shift(0.5,12,3)=0.2 -> t_audio=0.8; rows sorted [0.5, 0.8]
+    out = torch.cat(adaln(coeffs), dim=-1).view(2, 3, 2 * 6)  # [times, modalities, expand*hidden]
+    base_v = base.view(2, 3, 2 * 6)
+    torch.testing.assert_close(out[0] - base_v[0], torch.full((3, 12), 16 * 0.5))
+    torch.testing.assert_close(out[1] - base_v[1], torch.full((3, 12), 16 * 0.8))
+
+    assert slo.clear_sampling_lora_overlays(model) >= 1
+    torch.testing.assert_close(torch.cat(adaln(coeffs), dim=-1), base)
+
+
+def test_h3_overlay_adaln_skipped_without_grid():
+    from musubi_tuner.minimax_h3 import sampling_lora_overlay as slo
+
+    model = _tiny_curve_model()
+    sd = {
+        "blocks.0.adaln_proj.linear.lora_A.weight": torch.ones(1, 16),
+        "blocks.0.adaln_proj.linear.lora_B.weight": torch.ones(36, 1),
+    }
+    stats = slo.attach_sampling_lora_overlays(model, [(slo.normalize_overlay_state_dict(sd), 1.0)], temb_grid=None)
+    assert stats["adaln_grid"] == 0 and stats["skipped"] == ["blocks.0.adaln_proj.linear"]
+    assert not hasattr(model.blocks[0].adaln_proj, "_h3_sampling_overlay_orig_forward")
+    slo.update_time_state(model, torch.tensor(0.5))  # no shared state -> no-op
+
+
+def test_h3_do_inference_overlay_toggle():
+    from musubi_tuner.minimax_h3 import sampling_lora_overlay as slo
+
+    probes = []
+
+    class TinyTransformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            block = torch.nn.Module()
+            block.mlp = torch.nn.Module()
+            block.mlp.fc1 = torch.nn.Linear(4, 4, bias=False)
+            self.blocks = torch.nn.ModuleList([block])
+            torch.nn.init.eye_(self.blocks[0].mlp.fc1.weight)
+
+        def forward(self, video, audio, sigma, context, tags):
+            probes.append(self.blocks[0].mlp.fc1(torch.ones(1, 4)).detach().clone())
+            return torch.zeros_like(video), torch.empty_like(audio)
+
+        def park_main_block_weights_for_decode(self):
+            pass
+
+        def restore_main_block_weights_after_decode(self):
+            pass
+
+    class FakeVae:
+        def to(self, device):
+            return self
+
+        def decode_video(self, latents):
+            return torch.zeros(1, 3, 22, 6, 4)
+
+    args = SimpleNamespace(
+        video_flow_shift=12.0,
+        audio_flow_shift=3.0,
+        sample_latent_frames=2,
+        sample_audio_mode="none",
+        sample_solver="euler",
+        sample_frame_select="dup_last",
+        image_audio_mode="none",
+    )
+    sample = {
+        "h3_text_embed": torch.zeros(3, 8),
+        "h3_token_tags": torch.ones(3, dtype=torch.long),
+        "frame_count": 22,
+    }
+
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._sampling_overlays = [(slo.normalize_overlay_state_dict(_bare_overlay_sd()), 1.0)]
+    trainer._sampling_overlay_grid = None
+    transformer = TinyTransformer()
+
+    def run(sample_parameter):
+        return trainer.do_inference(
+            SimpleNamespace(device=torch.device("cpu"), print=lambda *a, **k: None),
+            args, sample_parameter, FakeVae(), torch.float32, transformer,
+            12.0, 1, 64, 96, 18, torch.Generator().manual_seed(1), False, 1.0, None,
+        )
+
+    run(sample)
+    # overlay active during sampling: delta = 4 on top of identity ones
+    torch.testing.assert_close(probes[-1], torch.full((1, 4), 5.0))
+    # and detached afterwards
+    assert not hasattr(transformer.blocks[0].mlp.fc1, "_h3_sampling_overlay_orig_forward")
+    torch.testing.assert_close(transformer.blocks[0].mlp.fc1(torch.ones(1, 4)), torch.ones(1, 4))
+
+    probes.clear()
+    run({**sample, "sample_lora_overlay": 0})
+    torch.testing.assert_close(probes[-1], torch.ones(1, 4))

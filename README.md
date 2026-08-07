@@ -69,6 +69,7 @@ Checkpoints land in `OUTPUT_DIR` every 100 steps as regular LoRA `.safetensors` 
 - **Judge results with EasyCache off.** Cache reuse adds background wobble that is not your LoRA's fault and dampens real motion. It scammed us for a day.
 - With the default Prodigy optimizer, 500–1000 steps is usually plenty at rank 32.
 - Tight on VRAM? Raise `BLOCKS_TO_SWAP` (default 6) — slower but smaller.
+- Slow previews? Point `SAMPLE_LORA_OVERLAY` at the community [Turbo LoRA](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora) and set `sample_steps = 4` in your prompt file — ~5× faster preview ticks, applied only during sampling, never trained into your LoRA. Keep one clean 20-step prompt (`sample_lora_overlay = 0`) for judging.
 - Before publishing weights, read the MiniMax H3 community license — it has jurisdiction restrictions.
 
 ---
