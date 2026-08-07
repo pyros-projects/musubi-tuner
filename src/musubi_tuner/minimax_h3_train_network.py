@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import time
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from tqdm import tqdm
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_MINIMAX_H3, ARCHITECTURE_MINIMAX_H3_FULL
 from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file, setup_parser_common
@@ -124,7 +126,13 @@ def sample_h3_image_latents(
 
     previous_video = previous_audio = None
     previous_step = previous_audio_step = None
-    for index in range(sample_steps):
+    step_bar = tqdm(
+        range(sample_steps),
+        desc=f"H3 preview {width}x{height} lat={latent_frames} {solver}",
+        leave=False,
+        dynamic_ncols=True,
+    )
+    for index in step_bar:
         video_step = (sigmas[index] - sigmas[index + 1]).item()
         audio_step = (audio_sigmas[index] - audio_sigmas[index + 1]).item()
         sampling_lora_overlay.update_time_state(transformer, sigmas[index])
@@ -297,6 +305,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         audio_latent_frames = _silent_audio_latent_length(latent_frames) if audio_mode == "silent" else 0
         overlays = getattr(self, "_sampling_overlays", None) or []
         overlay_enabled = bool(overlays) and str(sample_parameter.get("sample_lora_overlay", 1)).lower() in ("1", "true", "yes", "on")
+        solver = resolve_preview_solver(sample_parameter.get("sample_solver", getattr(args, "sample_solver", "ab2")), sample_steps)
+        sample_started = time.perf_counter()
         try:
             if overlay_enabled:
                 stats = sampling_lora_overlay.attach_sampling_lora_overlays(
@@ -322,13 +332,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 audio_flow_shift=args.audio_flow_shift,
                 latent_frames=latent_frames,
                 audio_latent_frames=audio_latent_frames,
-                solver=resolve_preview_solver(
-                    sample_parameter.get("sample_solver", getattr(args, "sample_solver", "ab2")), sample_steps
-                ),
+                solver=solver,
             ).cpu()
         finally:
             if overlay_enabled:
                 sampling_lora_overlay.clear_sampling_lora_overlays(transformer)
+        sample_done = time.perf_counter()
 
         parked = False
         try:
@@ -341,7 +350,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             else:
                 # Sampled audio latents are discarded; video previews save as silent mp4.
                 pixels = vae.decode_video(latents.to(accelerator.device))
-            return ((pixels.float() + 1.0) * 0.5).clamp_(0.0, 1.0).cpu()
+            pixels = ((pixels.float() + 1.0) * 0.5).clamp_(0.0, 1.0).cpu()
+            sample_seconds = sample_done - sample_started
+            decode_seconds = time.perf_counter() - sample_done
+            logger.info(
+                "H3 preview done: %dx%d frames=%d latents=%d steps=%d solver=%s overlay=%s | sample %.1fs + decode %.1fs = %.1fs",
+                width, height, frame_count, latent_frames, sample_steps, solver,
+                "on" if overlay_enabled else "off", sample_seconds, decode_seconds, sample_seconds + decode_seconds,
+            )
+            return pixels
         finally:
             vae.to("cpu")
             if accelerator.device.type == "cuda":

@@ -31,7 +31,7 @@ LORA_PRESET="${LORA_PRESET:-no_packed_attn}" # attn, attn_mlp, no_packed_attn, o
 OPTIMIZER="${OPTIMIZER:-prodigy}"  # adamw8bit | adafactor | prodigy
 LEARNING_RATE="${LEARNING_RATE:-}"   # empty = optimizer-specific default
 BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-6}"
-SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-0}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
+SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-6}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
 CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-8}"
 CACHE_TEXT_BATCH_SIZE="${CACHE_TEXT_BATCH_SIZE:-1}"
 IMAGE_FRAME_COUNT="${IMAGE_FRAME_COUNT:-1}"

@@ -727,3 +727,42 @@ def test_h3_preview_solver_guard():
     assert resolve_preview_solver("ab2", 8) == "ab2"
     assert resolve_preview_solver("ab2", 20) == "ab2"
     assert resolve_preview_solver("euler", 4) == "euler"
+
+
+def test_h3_preview_summary_logged(caplog):
+    import logging as _logging
+
+    class FakeTransformer:
+        def __call__(self, video, audio, sigma, context, tags):
+            return torch.zeros_like(video), torch.empty_like(audio)
+
+        def park_main_block_weights_for_decode(self):
+            pass
+
+        def restore_main_block_weights_after_decode(self):
+            pass
+
+    class FakeVae:
+        def to(self, device):
+            return self
+
+        def decode_video(self, latents):
+            return torch.zeros(1, 3, 22, 6, 4)
+
+    args = SimpleNamespace(
+        video_flow_shift=12.0, audio_flow_shift=3.0, sample_latent_frames=2,
+        sample_audio_mode="none", sample_solver="ab2", sample_frame_select="dup_last",
+        image_audio_mode="none",
+    )
+    sample = {"h3_text_embed": torch.zeros(3, 8), "h3_token_tags": torch.ones(3, dtype=torch.long), "frame_count": 22}
+    with caplog.at_level(_logging.INFO, logger="musubi_tuner.minimax_h3_train_network"):
+        MiniMaxH3NetworkTrainer().do_inference(
+            SimpleNamespace(device=torch.device("cpu"), print=lambda *a, **k: None),
+            args, sample, FakeVae(), torch.float32, FakeTransformer(),
+            12.0, 4, 64, 96, 18, torch.Generator().manual_seed(1), False, 1.0, None,
+        )
+    summary = [r.message for r in caplog.records if "H3 preview done" in r.message]
+    assert len(summary) == 1
+    # 4-step ab2 must have been guarded down to euler, and timings must be present
+    assert "solver=euler" in summary[0] and "steps=4" in summary[0] and "frames=22" in summary[0]
+    assert "sample " in summary[0] and "decode " in summary[0]

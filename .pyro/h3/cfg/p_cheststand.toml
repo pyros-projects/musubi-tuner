@@ -16,6 +16,12 @@ frame_count = 73
 prompt = "a woman lying on her chest with her legs bend over her"
 seed = 42
 
+
+[[prompt.subset]]
+prompt = "tik tok reel of a young but pretty gothic girl lying on a table on her chest with her legs bend over her in her kitchen"
+seed = 43
+
+
 # Still-image wrapper (ComfyUI H3 Image Studio style): measures quality the
 # way users will actually prompt at inference.
 # [[prompt.subset]]
