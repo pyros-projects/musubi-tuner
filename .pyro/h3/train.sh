@@ -18,7 +18,7 @@ TEXT_ENCODER="${TEXT_ENCODER:-/home/pyro/models/comfy/text_encoders/qwen3vl_32b_
 VAE="${VAE:-/home/pyro/models/comfy/vae/minimax_h3_video_vae_fp16.safetensors}"
 AUDIO_VAE="${AUDIO_VAE:-/home/pyro/models/comfy/vae/minimax_h3_audio_vae_fp32.safetensors}"
 
-H3_NAME="${H3_NAME:-cheststand}"
+H3_NAME="${H3_NAME:-headsit}"
 CACHE_DATASET="${CACHE_DATASET:-1}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
@@ -38,11 +38,15 @@ IMAGE_FRAME_COUNT="${IMAGE_FRAME_COUNT:-1}"
 IMAGE_AUDIO_MODE="${IMAGE_AUDIO_MODE:-none}"
 AUDIO_LOSS_WEIGHT="${AUDIO_LOSS_WEIGHT:-0}"  # set 1 for video datasets with real audio
 TIMESTEP_PRESET="${TIMESTEP_PRESET:-image}"
-# Bounds LoRA delta growth (prodigy only). 0.0 = old unbounded behavior: measured
-# ~linear ||dW|| growth long after concept convergence (dataset-look absorption).
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
-# Timestep floor for the image preset. 0 = full range; 50-100 skips the low-sigma
-# tail where the LoRA learns texture/grain sharpening (compounds with turbo).
+# Bounds LoRA delta growth (prodigy only). Applied with weight_decay_by_lr=False,
+# so this is the per-step relative shrink and the dw plateau lands near
+# (dw growth per step)/WEIGHT_DECAY — 0.005 targets dw ~140 at the measured
+# ~0.7/step push. The optimizer's default by_lr=True multiplies decay by the
+# adaptive lr (~1e-6) and is a no-op at any sane setting. 0.0 disables.
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.005}"
+# Timestep floor for the image preset. Weak lever under krea2_shift: its sigmoid
+# distribution has ~1-2% mass below t=0.075, ~10% below t=0.3 — needs 200-300 to
+# meaningfully bite. 0 = full range.
 MIN_TIMESTEP="${MIN_TIMESTEP:-0}"
 SAMPLE_LATENT_FRAMES="${SAMPLE_LATENT_FRAMES:-2}"
 SAMPLE_AUDIO_MODE="${SAMPLE_AUDIO_MODE:-auto}"
@@ -140,7 +144,7 @@ case "$OPTIMIZER" in
         LEARNING_RATE="${LEARNING_RATE:-1.0}"
         OPT_ARGS=(
             --optimizer_type ProdigyPlusScheduleFree
-            --optimizer_args "betas=(0.9,0.99)" "weight_decay=${WEIGHT_DECAY}"
+            --optimizer_args "betas=(0.9,0.99)" "weight_decay=${WEIGHT_DECAY}" "weight_decay_by_lr=False"
             --learning_rate "$LEARNING_RATE"
             --max_grad_norm 0
         )
@@ -189,7 +193,7 @@ AB_SUFFIX=""
 if [[ "$MIN_TIMESTEP" != 0 ]]; then
     AB_SUFFIX+="-mint${MIN_TIMESTEP}"
 fi
-if [[ "$OPTIMIZER" == prodigy && "$WEIGHT_DECAY" != 0.01 ]]; then
+if [[ "$OPTIMIZER" == prodigy && "$WEIGHT_DECAY" != 0.005 ]]; then
     AB_SUFFIX+="-wd${WEIGHT_DECAY}"
 fi
 RUN_NAME="${H3_NAME}${FRAME_SUFFIX}${AUDIO_SUFFIX}${TIMESTEP_SUFFIX}${AB_SUFFIX}-${LORA_TAG}-r${NETWORK_DIM}-${TIMESTEP_PRESET}-${IMAGE_AUDIO_MODE}-${OPTIMIZER}"
