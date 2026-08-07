@@ -766,3 +766,60 @@ def test_h3_preview_summary_logged(caplog):
     # 4-step ab2 must have been guarded down to euler, and timings must be present
     assert "solver=euler" in summary[0] and "steps=4" in summary[0] and "frames=22" in summary[0]
     assert "sample " in summary[0] and "decode " in summary[0]
+
+
+def test_h3_do_inference_overlay_prompt_strength():
+    from musubi_tuner.minimax_h3 import sampling_lora_overlay as slo
+
+    probes = []
+
+    class TinyTransformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            block = torch.nn.Module()
+            block.mlp = torch.nn.Module()
+            block.mlp.fc1 = torch.nn.Linear(4, 4, bias=False)
+            self.blocks = torch.nn.ModuleList([block])
+            torch.nn.init.eye_(self.blocks[0].mlp.fc1.weight)
+
+        def forward(self, video, audio, sigma, context, tags):
+            probes.append(self.blocks[0].mlp.fc1(torch.ones(1, 4)).detach().clone())
+            return torch.zeros_like(video), torch.empty_like(audio)
+
+        def park_main_block_weights_for_decode(self):
+            pass
+
+        def restore_main_block_weights_after_decode(self):
+            pass
+
+    class FakeVae:
+        def to(self, device):
+            return self
+
+        def decode_video(self, latents):
+            return torch.zeros(1, 3, 22, 6, 4)
+
+    args = SimpleNamespace(
+        video_flow_shift=12.0, audio_flow_shift=3.0, sample_latent_frames=2,
+        sample_audio_mode="none", sample_solver="euler", sample_frame_select="dup_last",
+        image_audio_mode="none",
+    )
+    base = {"h3_text_embed": torch.zeros(3, 8), "h3_token_tags": torch.ones(3, dtype=torch.long), "frame_count": 22}
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._sampling_overlays = [(slo.normalize_overlay_state_dict(_bare_overlay_sd()), 1.0)]
+    trainer._sampling_overlay_grid = None
+    transformer = TinyTransformer()
+
+    def run(extra):
+        probes.clear()
+        trainer.do_inference(
+            SimpleNamespace(device=torch.device("cpu"), print=lambda *a, **k: None),
+            args, {**base, **extra}, FakeVae(), torch.float32, transformer,
+            12.0, 1, 64, 96, 18, torch.Generator().manual_seed(1), False, 1.0, None,
+        )
+        return probes[-1]
+
+    # delta at full strength is +4; per-prompt 0.5 halves it, 0 disables
+    torch.testing.assert_close(run({"sample_lora_overlay": 0.5}), torch.full((1, 4), 3.0))
+    torch.testing.assert_close(run({"sample_lora_overlay": 0}), torch.ones(1, 4))
+    torch.testing.assert_close(run({"sample_lora_overlay": "true"}), torch.full((1, 4), 5.0))

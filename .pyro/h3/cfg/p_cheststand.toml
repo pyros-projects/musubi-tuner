@@ -6,9 +6,9 @@ sample_steps = 4
 sample_solver = "euler"  # AB2 extrapolation explodes at 4-step schedules
 
 # Video also works
-width = 480
-height = 320
-frame_count = 121
+width = 640
+height = 480
+frame_count = 161
 
 # Bare trigger prompt: measures raw trigger binding, comparable with all
 # earlier previews (same seed 42 lineage).

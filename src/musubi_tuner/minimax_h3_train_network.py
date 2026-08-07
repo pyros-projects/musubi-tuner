@@ -304,13 +304,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             audio_mode = getattr(args, "image_audio_mode", "none")
         audio_latent_frames = _silent_audio_latent_length(latent_frames) if audio_mode == "silent" else 0
         overlays = getattr(self, "_sampling_overlays", None) or []
-        overlay_enabled = bool(overlays) and str(sample_parameter.get("sample_lora_overlay", 1)).lower() in ("1", "true", "yes", "on")
+        # Per-prompt overlay control: floats scale the configured strength (0 = off);
+        # bools/strings keep the legacy on/off semantics.
+        raw_overlay = sample_parameter.get("sample_lora_overlay", 1)
+        try:
+            overlay_scale = float(raw_overlay)
+        except (TypeError, ValueError):
+            overlay_scale = 1.0 if str(raw_overlay).lower() in ("true", "yes", "on") else 0.0
+        overlay_enabled = bool(overlays) and overlay_scale > 0.0
         solver = resolve_preview_solver(sample_parameter.get("sample_solver", getattr(args, "sample_solver", "ab2")), sample_steps)
         sample_started = time.perf_counter()
         try:
             if overlay_enabled:
                 stats = sampling_lora_overlay.attach_sampling_lora_overlays(
-                    transformer, overlays, temb_grid=getattr(self, "_sampling_overlay_grid", None)
+                    transformer,
+                    [(modules, strength * overlay_scale) for modules, strength in overlays],
+                    temb_grid=getattr(self, "_sampling_overlay_grid", None),
                 )
                 if not getattr(self, "_sampling_overlay_logged", False):
                     self._sampling_overlay_logged = True
@@ -353,10 +362,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             pixels = ((pixels.float() + 1.0) * 0.5).clamp_(0.0, 1.0).cpu()
             sample_seconds = sample_done - sample_started
             decode_seconds = time.perf_counter() - sample_done
+            overlay_desc = f"{overlays[0][1] * overlay_scale:.2f}" if overlay_enabled else "off"
             logger.info(
                 "H3 preview done: %dx%d frames=%d latents=%d steps=%d solver=%s overlay=%s | sample %.1fs + decode %.1fs = %.1fs",
                 width, height, frame_count, latent_frames, sample_steps, solver,
-                "on" if overlay_enabled else "off", sample_seconds, decode_seconds, sample_seconds + decode_seconds,
+                overlay_desc, sample_seconds, decode_seconds, sample_seconds + decode_seconds,
             )
             return pixels
         finally:

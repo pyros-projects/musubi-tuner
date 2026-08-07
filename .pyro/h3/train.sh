@@ -31,7 +31,7 @@ LORA_PRESET="${LORA_PRESET:-no_packed_attn}" # attn, attn_mlp, no_packed_attn, o
 OPTIMIZER="${OPTIMIZER:-prodigy}"  # adamw8bit | adafactor | prodigy
 LEARNING_RATE="${LEARNING_RATE:-}"   # empty = optimizer-specific default
 BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-6}"
-SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-6}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
+SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-15}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
 CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-8}"
 CACHE_TEXT_BATCH_SIZE="${CACHE_TEXT_BATCH_SIZE:-1}"
 IMAGE_FRAME_COUNT="${IMAGE_FRAME_COUNT:-1}"
@@ -45,6 +45,10 @@ SAMPLE_FRAME_SELECT="${SAMPLE_FRAME_SELECT:-dup_last}"
 # Optional frozen LoRA stacked on previews only (path[:strength]), e.g. the
 # community Turbo LoRA for 4-step previews. Empty = off (unchanged behavior).
 SAMPLE_LORA_OVERLAY="${SAMPLE_LORA_OVERLAY:-/home/pyro/models/comfy/loras/minimax/minimax_h3_turbo_4step_ckpt850.safetensors}"
+# Overlay strength (turbo card: 1.0 default, 0.8-0.95 against artifacts, 1.05-1.2
+# against blur). Ignored when SAMPLE_LORA_OVERLAY already carries :strength.
+# Per prompt, sample_lora_overlay = <float> scales it further (0 = off).
+SAMPLE_LORA_OVERLAY_STRENGTH="${SAMPLE_LORA_OVERLAY_STRENGTH:-1.0}"
 SAMPLE_LORA_TEMB_GRID="${SAMPLE_LORA_TEMB_GRID:-$COMFYUI_DIR/custom_nodes/comfyui-minimax-h3-turbo/h3_silu_temb_grid.safetensors}"
 
 if [[ ! "$H3_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -214,7 +218,11 @@ if (( SAMPLE_EVERY > 0 )); then
         SAMPLE_ARGS+=(--sample_blocks_to_swap "$SAMPLE_BLOCKS_TO_SWAP")
     fi
     if [[ -n "$SAMPLE_LORA_OVERLAY" ]]; then
-        SAMPLE_ARGS+=(--sample_lora_overlay "$SAMPLE_LORA_OVERLAY")
+        OVERLAY_SPEC="$SAMPLE_LORA_OVERLAY"
+        if [[ ! "$OVERLAY_SPEC" =~ :[0-9.]+$ ]]; then
+            OVERLAY_SPEC="${OVERLAY_SPEC}:${SAMPLE_LORA_OVERLAY_STRENGTH}"
+        fi
+        SAMPLE_ARGS+=(--sample_lora_overlay "$OVERLAY_SPEC")
         if [[ -f "$SAMPLE_LORA_TEMB_GRID" ]]; then
             SAMPLE_ARGS+=(--sample_lora_overlay_temb_grid "$SAMPLE_LORA_TEMB_GRID")
         fi
