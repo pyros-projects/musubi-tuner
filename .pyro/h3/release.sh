@@ -25,8 +25,9 @@ while IFS= read -r cfg; do
     esac
 done < <(git ls-tree -r --name-only HEAD .pyro/h3/cfg/)
 
-export GIT_INDEX_FILE="$(mktemp)"
-trap 'rm -f "$GIT_INDEX_FILE"' EXIT
+tmpidx="$(mktemp)"
+export GIT_INDEX_FILE="$tmpidx"
+trap 'rm -f "$tmpidx"' EXIT
 git read-tree HEAD
 git rm -r --cached -q --ignore-unmatch "${EXCLUDE[@]}"
 
