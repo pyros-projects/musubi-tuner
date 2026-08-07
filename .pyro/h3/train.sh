@@ -38,6 +38,12 @@ IMAGE_FRAME_COUNT="${IMAGE_FRAME_COUNT:-1}"
 IMAGE_AUDIO_MODE="${IMAGE_AUDIO_MODE:-none}"
 AUDIO_LOSS_WEIGHT="${AUDIO_LOSS_WEIGHT:-0}"  # set 1 for video datasets with real audio
 TIMESTEP_PRESET="${TIMESTEP_PRESET:-image}"
+# Bounds LoRA delta growth (prodigy only). 0.0 = old unbounded behavior: measured
+# ~linear ||dW|| growth long after concept convergence (dataset-look absorption).
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+# Timestep floor for the image preset. 0 = full range; 50-100 skips the low-sigma
+# tail where the LoRA learns texture/grain sharpening (compounds with turbo).
+MIN_TIMESTEP="${MIN_TIMESTEP:-0}"
 SAMPLE_LATENT_FRAMES="${SAMPLE_LATENT_FRAMES:-2}"
 SAMPLE_AUDIO_MODE="${SAMPLE_AUDIO_MODE:-auto}"
 SAMPLE_SOLVER="${SAMPLE_SOLVER:-ab2}"
@@ -101,7 +107,7 @@ case "$TIMESTEP_PRESET" in
             --timestep_sampling krea2_shift
             --discrete_flow_shift 12
             --preserve_distribution_shape
-            --min_timestep 0
+            --min_timestep "$MIN_TIMESTEP"
             --max_timestep 875
         )
         ;;
@@ -134,7 +140,7 @@ case "$OPTIMIZER" in
         LEARNING_RATE="${LEARNING_RATE:-1.0}"
         OPT_ARGS=(
             --optimizer_type ProdigyPlusScheduleFree
-            --optimizer_args "betas=(0.9,0.99)" "weight_decay=0.0"
+            --optimizer_args "betas=(0.9,0.99)" "weight_decay=${WEIGHT_DECAY}"
             --learning_rate "$LEARNING_RATE"
             --max_grad_norm 0
         )
@@ -179,7 +185,14 @@ LORA_TAG="$LORA_PRESET"
 if [[ "$LORA_PRESET" == full ]]; then
     LORA_TAG="all"
 fi
-RUN_NAME="${H3_NAME}${FRAME_SUFFIX}${AUDIO_SUFFIX}${TIMESTEP_SUFFIX}-${LORA_TAG}-r${NETWORK_DIM}-${TIMESTEP_PRESET}-${IMAGE_AUDIO_MODE}-${OPTIMIZER}"
+AB_SUFFIX=""
+if [[ "$MIN_TIMESTEP" != 0 ]]; then
+    AB_SUFFIX+="-mint${MIN_TIMESTEP}"
+fi
+if [[ "$OPTIMIZER" == prodigy && "$WEIGHT_DECAY" != 0.01 ]]; then
+    AB_SUFFIX+="-wd${WEIGHT_DECAY}"
+fi
+RUN_NAME="${H3_NAME}${FRAME_SUFFIX}${AUDIO_SUFFIX}${TIMESTEP_SUFFIX}${AB_SUFFIX}-${LORA_TAG}-r${NETWORK_DIM}-${TIMESTEP_PRESET}-${IMAGE_AUDIO_MODE}-${OPTIMIZER}"
 OUTPUT_DIR="${OUTPUT_DIR:-/home/pyro/models/_out/h3/$RUN_NAME}"
 
 for path in "$PYTHON" "$ACCELERATE"; do
