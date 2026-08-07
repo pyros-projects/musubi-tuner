@@ -717,3 +717,13 @@ sample_lora_overlay = 0
     assert [p["sample_steps"] for p in prompts] == [4, 20]
     assert prompts[1]["sample_lora_overlay"] == 0
     assert all("subset" not in p for p in prompts)
+
+
+def test_h3_preview_solver_guard():
+    from musubi_tuner.minimax_h3_train_network import resolve_preview_solver
+
+    assert resolve_preview_solver("ab2", 4) == "euler"
+    assert resolve_preview_solver("ab2", 7) == "euler"
+    assert resolve_preview_solver("ab2", 8) == "ab2"
+    assert resolve_preview_solver("ab2", 20) == "ab2"
+    assert resolve_preview_solver("euler", 4) == "euler"

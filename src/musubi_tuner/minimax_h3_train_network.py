@@ -60,6 +60,16 @@ def build_h3_sigma_schedule(sample_steps: int, shift: float, device: torch.devic
     return time_shift_sigma(base, 1.0, shift)
 
 
+def resolve_preview_solver(solver: str, sample_steps: int) -> str:
+    """AB2's multistep extrapolation overshoots on few-step schedules (step ratios
+    approach 2.0 under shift-12), frying the latents — observed with the 4-step
+    Turbo overlay. Fall back to euler below 8 steps."""
+    if solver == "ab2" and sample_steps < 8:
+        logger.warning("sample_solver=ab2 is unstable at %d steps; using euler for this preview", sample_steps)
+        return "euler"
+    return solver
+
+
 def _silent_audio_latent_length(video_latent_frames: int) -> int:
     if video_latent_frames == 1:
         source_frames = 1
@@ -312,7 +322,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 audio_flow_shift=args.audio_flow_shift,
                 latent_frames=latent_frames,
                 audio_latent_frames=audio_latent_frames,
-                solver=sample_parameter.get("sample_solver", getattr(args, "sample_solver", "ab2")),
+                solver=resolve_preview_solver(
+                    sample_parameter.get("sample_solver", getattr(args, "sample_solver", "ab2")), sample_steps
+                ),
             ).cpu()
         finally:
             if overlay_enabled:

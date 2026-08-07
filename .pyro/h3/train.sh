@@ -18,7 +18,7 @@ TEXT_ENCODER="${TEXT_ENCODER:-/home/pyro/models/comfy/text_encoders/qwen3vl_32b_
 VAE="${VAE:-/home/pyro/models/comfy/vae/minimax_h3_video_vae_fp16.safetensors}"
 AUDIO_VAE="${AUDIO_VAE:-/home/pyro/models/comfy/vae/minimax_h3_audio_vae_fp32.safetensors}"
 
-H3_NAME="${H3_NAME:-lucy_v2}"
+H3_NAME="${H3_NAME:-cheststand}"
 CACHE_DATASET="${CACHE_DATASET:-1}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
@@ -44,7 +44,7 @@ SAMPLE_SOLVER="${SAMPLE_SOLVER:-ab2}"
 SAMPLE_FRAME_SELECT="${SAMPLE_FRAME_SELECT:-dup_last}"
 # Optional frozen LoRA stacked on previews only (path[:strength]), e.g. the
 # community Turbo LoRA for 4-step previews. Empty = off (unchanged behavior).
-SAMPLE_LORA_OVERLAY="${SAMPLE_LORA_OVERLAY:-}"
+SAMPLE_LORA_OVERLAY="${SAMPLE_LORA_OVERLAY:-/home/pyro/models/comfy/loras/minimax/minimax_h3_turbo_4step_ckpt850.safetensors}"
 SAMPLE_LORA_TEMB_GRID="${SAMPLE_LORA_TEMB_GRID:-$COMFYUI_DIR/custom_nodes/comfyui-minimax-h3-turbo/h3_silu_temb_grid.safetensors}"
 
 if [[ ! "$H3_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
