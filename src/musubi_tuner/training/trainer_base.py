@@ -506,6 +506,13 @@ class NetworkTrainer:
 
     @staticmethod
     def _recover_global_step(state_dir: str) -> int:
+        # Checkpoint state dirs carry the exact step in their name; prefer it since
+        # schedule-free optimizers (e.g. ProdigyPlusScheduleFree) save no scheduler.bin.
+        step_match = re.search(r"-step(\d+)-state$", os.path.basename(os.path.normpath(state_dir)))
+        if step_match:
+            global_step = int(step_match.group(1))
+            logger.info(f"recovered global_step={global_step} from state dir name {state_dir}")
+            return global_step
         scheduler_path = os.path.join(state_dir, "scheduler.bin")
         try:
             scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
@@ -525,19 +532,30 @@ class NetworkTrainer:
         best_path = None
         for entry in os.listdir(args.output_dir):
             full_path = os.path.join(args.output_dir, entry)
+            if not os.path.isdir(full_path) or not entry.endswith("-state"):
+                continue
+            # Accept any accelerate state layout: schedule-free optimizers (e.g.
+            # ProdigyPlusScheduleFree) save no scheduler.bin, only optimizer/RNG state.
             scheduler_path = os.path.join(full_path, "scheduler.bin")
-            if not os.path.isdir(full_path) or not entry.endswith("-state") or not os.path.exists(scheduler_path):
+            if not any(
+                os.path.exists(os.path.join(full_path, marker))
+                for marker in ("scheduler.bin", "optimizer.bin", "random_states_0.pkl")
+            ):
                 continue
 
             step_match = re.search(r"-step(\d+)-state$", entry)
             if step_match:
                 step = int(step_match.group(1))
-            else:
+            elif os.path.exists(scheduler_path):
                 try:
                     scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
                     step = int(scheduler_state["last_epoch"])
                 except Exception:
                     continue
+            else:
+                # end-of-run state without a step in the name or a scheduler:
+                # eligible, but ranks below any explicit step checkpoint
+                step = 0
 
             if step > best_step:
                 best_step = step
