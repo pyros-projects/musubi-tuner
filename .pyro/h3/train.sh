@@ -54,11 +54,12 @@ SAMPLE_SOLVER="${SAMPLE_SOLVER:-ab2}"
 SAMPLE_FRAME_SELECT="${SAMPLE_FRAME_SELECT:-dup_last}"
 # Optional frozen LoRA stacked on previews only (path[:strength]), e.g. the
 # community Turbo LoRA for 4-step previews. Empty = off (unchanged behavior).
-SAMPLE_LORA_OVERLAY="${SAMPLE_LORA_OVERLAY:-/home/pyro/models/comfy/loras/minimax/minimax_h3_turbo_4step_ckpt850.safetensors}"
+SAMPLE_LORA_OVERLAY="${SAMPLE_LORA_OVERLAY:-/home/pyro/models/comfy/loras/minimax/turbo/minimax_h3_fl2v_turbo_4step_v0.1.safetensors}"
+# SAMPLE_LORA_OVERLAY="${SAMPLE_LORA_OVERLAY:-/home/pyro/models/comfy/loras/minimax/minimax_h3_turbo_4step_ckpt850.safetensors}"
 # Overlay strength (turbo card: 1.0 default, 0.8-0.95 against artifacts, 1.05-1.2
 # against blur). Ignored when SAMPLE_LORA_OVERLAY already carries :strength.
 # Per prompt, sample_lora_overlay = <float> scales it further (0 = off).
-SAMPLE_LORA_OVERLAY_STRENGTH="${SAMPLE_LORA_OVERLAY_STRENGTH:-0.85}"
+SAMPLE_LORA_OVERLAY_STRENGTH="${SAMPLE_LORA_OVERLAY_STRENGTH:-1.0}"
 SAMPLE_LORA_TEMB_GRID="${SAMPLE_LORA_TEMB_GRID:-$COMFYUI_DIR/custom_nodes/comfyui-minimax-h3-turbo/h3_silu_temb_grid.safetensors}"
 
 if [[ ! "$H3_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
