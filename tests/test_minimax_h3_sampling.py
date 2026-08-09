@@ -1181,3 +1181,54 @@ def test_h3_uncond_cache_roundtrip(tmp_path):
     empty_toml.write_text(f'[[datasets]]\nimage_directory = "{tmp_path}"\ncache_directory = "{tmp_path / "nope"}"\n')
     with pytest.raises(ValueError, match="precache_uncond"):
         trainer2._get_uncond_context(SimpleNamespace(dataset_config=str(empty_toml)), accelerator, torch.float32)
+
+
+def test_h3_guidance_drift_gauge(tmp_path):
+    from contextlib import nullcontext
+
+    from musubi_tuner.minimax_h3.model import MiniMaxH3Model
+    from musubi_tuner.minimax_h3_cache_text_encoder_outputs import _precache_uncond
+    from musubi_tuner.networks import lora
+
+    cache_dir = tmp_path / "cache"
+    dataset_toml = tmp_path / "ds.toml"
+    dataset_toml.write_text(f'[[datasets]]\nimage_directory = "{tmp_path}"\ncache_directory = "{cache_dir}"\n')
+    te = tmp_path / "te.safetensors"
+    te.write_bytes(b"stub")
+    _precache_uncond(
+        SimpleNamespace(dataset_config=str(dataset_toml), text_encoder=str(te), max_token_length=1024),
+        None,
+        lambda prompts: ([torch.randn(3, 8)], [torch.ones(3, dtype=torch.long)]),
+    )
+
+    torch.manual_seed(0)
+    model = MiniMaxH3Model(
+        hidden_size=12, num_layers=2, token_refiner_num_layers=1, num_attention_heads=2,
+        attention_head_dim=6, ffn_hidden_size=16, latents_dim=2, audio_latents_dim=3,
+        text_dim=8, timestep_input_dim=8, time_embed_hidden_size=12, time_embed_dim=6, rope_inv_freq_len=1,
+    ).float().eval()
+    network = lora.create_arch_network(1.0, 4, 4.0, None, None, model)
+    network.apply_to(None, model, apply_text_encoder=False, apply_unet=True)
+
+    trainer = MiniMaxH3NetworkTrainer()
+    accelerator = SimpleNamespace(
+        device="cpu", print=lambda *a, **k: None, unwrap_model=lambda m: m, autocast=nullcontext
+    )
+    args = SimpleNamespace(dataset_config=str(dataset_toml))
+    video = torch.randn(2, 2, 1, 4, 6)
+    audio = torch.randn(2, 3, 2, 2)
+    sigma = torch.tensor([0.6, 0.3])
+    contexts = [torch.randn(1, 5, 8), torch.randn(1, 4, 8)]
+    tags = [torch.ones(5, dtype=torch.long), torch.ones(4, dtype=torch.long)]
+
+    # zero-initialized LoRA -> LoRA'd model == base -> drift exactly 1.0
+    drift = trainer._measure_guidance_drift(args, accelerator, model, network, video, audio, sigma, contexts, tags)
+    assert drift == pytest.approx(1.0, abs=1e-5)
+    assert network.unet_loras[0].multiplier == 1.0  # restored after the base forwards
+
+    with torch.no_grad():
+        for module in network.unet_loras:
+            module.lora_up.weight.normal_(0, 1.0)
+    drift_perturbed = trainer._measure_guidance_drift(args, accelerator, model, network, video, audio, sigma, contexts, tags)
+    assert drift_perturbed != pytest.approx(1.0, abs=1e-4)
+    assert 0.0 < drift_perturbed < 10.0

@@ -25,10 +25,10 @@ SAMPLE_VAE="${SAMPLE_VAE:-/home/pyro/models/comfy/vae/minimax_h3_video_vae_int8_
 H3_NAME="${H3_NAME:-bb}"
 CACHE_DATASET="${CACHE_DATASET:-1}"
 MAX_STEPS="${MAX_STEPS:-2000}"
-SAVE_EVERY="${SAVE_EVERY:-50}"
-SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
+SAVE_EVERY="${SAVE_EVERY:-100}"
+SAMPLE_EVERY="${SAMPLE_EVERY:-100}"
 SAMPLE_PROMPTS="${SAMPLE_PROMPTS:-.pyro/h3/cfg/p_${H3_NAME}.toml}"
-GRAD_ACCUM="${GRAD_ACCUM:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-1}"
 NETWORK_DIM="${NETWORK_DIM:-32}"
 NETWORK_ALPHA="${NETWORK_ALPHA:-$NETWORK_DIM}"
 LORA_PRESET="${LORA_PRESET:-no_packed_attn}" # attn, attn_mlp, no_packed_attn, mlp (style: no text refiner), or full
@@ -76,6 +76,11 @@ TRAIN_LORA_OVERLAY="${TRAIN_LORA_OVERLAY:-}"
 # 4 = recommended. Gradients scale by 1/s, so dw grows ~s-times slower.
 # Mutually exclusive with TRAIN_LORA_OVERLAY. Tags runs -cfgaugN.
 CFG_AUGMENTED_SCALE="${CFG_AUGMENTED_SCALE:-0}"
+# Guidance-drift gauge: every N steps measure ||cond-uncond|| of the LoRA'd
+# model vs the frozen base (gd= in the postfix; 1.0 = distillation intact,
+# drifts toward 1/cfg as standard training un-distills). ~4 no-grad forwards
+# per measurement. 0 = off. 100 is a good cadence for cfg1-vs-cfg4 A/Bs.
+GUIDANCE_DRIFT_EVERY="${GUIDANCE_DRIFT_EVERY:-0}"
 
 if [[ ! "$H3_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "H3_NAME may only contain letters, numbers, dot, underscore, and dash: $H3_NAME" >&2
@@ -267,6 +272,13 @@ if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
     TRAIN_OVERLAY_ARGS=(--train_lora_overlay "$TRAIN_LORA_OVERLAY")
 fi
 
+GDRIFT_ARGS=()
+GDRIFT_ENABLED=0
+if [[ "$GUIDANCE_DRIFT_EVERY" =~ ^[0-9]+$ && "$GUIDANCE_DRIFT_EVERY" -gt 0 ]]; then
+    GDRIFT_ENABLED=1
+    GDRIFT_ARGS=(--guidance_drift_every "$GUIDANCE_DRIFT_EVERY")
+fi
+
 CFGAUG_ENABLED=0
 CFGAUG_ARGS=()
 if [[ -n "$CFG_AUGMENTED_SCALE" && "$CFG_AUGMENTED_SCALE" != 0 && "$CFG_AUGMENTED_SCALE" != 1 ]]; then
@@ -331,7 +343,7 @@ if truthy "$CACHE_DATASET"; then
     CACHE_DATASET_ENABLED=1
 fi
 
-if (( CACHE_DATASET_ENABLED || SAMPLE_EVERY > 0 || CFGAUG_ENABLED )); then
+if (( CACHE_DATASET_ENABLED || SAMPLE_EVERY > 0 || CFGAUG_ENABLED || GDRIFT_ENABLED )); then
     if [[ ! -x "$COMFY_PYTHON" ]]; then
         echo "Missing ComfyUI Python: $COMFY_PYTHON" >&2
         exit 1
@@ -342,7 +354,7 @@ if (( CACHE_DATASET_ENABLED || SAMPLE_EVERY > 0 || CFGAUG_ENABLED )); then
     fi
 
     TEXT_CACHE_ARGS=()
-    if (( CFGAUG_ENABLED )); then
+    if (( CFGAUG_ENABLED || GDRIFT_ENABLED )); then
         TEXT_CACHE_ARGS+=(--precache_uncond)
     fi
     if (( SAMPLE_EVERY > 0 )); then
@@ -405,6 +417,7 @@ exec "$ACCELERATE" launch \
     "${OPT_ARGS[@]}" \
     "${TRAIN_OVERLAY_ARGS[@]}" \
     "${CFGAUG_ARGS[@]}" \
+    "${GDRIFT_ARGS[@]}" \
     --gradient_accumulation_steps "$GRAD_ACCUM" \
     --max_train_steps "$MAX_STEPS" \
     --save_every_n_steps "$SAVE_EVERY" --save_state --save_last_n_steps_state 2 \

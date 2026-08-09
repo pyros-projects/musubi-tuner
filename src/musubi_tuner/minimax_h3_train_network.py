@@ -499,11 +499,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     def extra_postfix_logs(self, args, accelerator, network, transformer) -> dict:
         cosine = self._adapter_cosine(accelerator.unwrap_model(network), accelerator.unwrap_model(transformer))
         self._last_adapter_cos = cosine
-        return {} if cosine is None else {"acos": round(cosine, 4)}
+        logs = {} if cosine is None else {"acos": round(cosine, 4)}
+        drift = getattr(self, "_last_guidance_drift", None)
+        if drift is not None:
+            logs["gd"] = round(drift, 3)
+        return logs
 
     def extra_step_logs(self, args, logs) -> dict:
+        extra = {}
         cosine = getattr(self, "_last_adapter_cos", None)
-        return {} if cosine is None else {"network/adapter_cos": cosine}
+        if cosine is not None:
+            extra["network/adapter_cos"] = cosine
+        drift = getattr(self, "_last_guidance_drift", None)
+        if drift is not None:
+            extra["network/guidance_drift"] = drift
+        return extra
 
     def on_before_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
         self._detach_train_overlay(accelerator, transformer)
@@ -600,6 +610,37 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             accelerator.print(f"Loaded H3 uncond embedding for CFG-augmented training ({embed.shape[0]} tokens)")
         return cached
 
+    @torch.no_grad()
+    def _measure_guidance_drift(self, args, accelerator, transformer, network, noisy_video, noisy_audio, sigma_video, contexts, tags):
+        """Guidance-retention gauge: ``||cond - uncond||`` of the LoRA'd model over
+        the frozen base, on the current batch. 1.0 = distillation intact; standard
+        (non-CFG-augmented) training drifts it toward 1/s as the model un-distills.
+        """
+        uncond_embed, uncond_tags = self._get_uncond_context(args, accelerator, network_dtype=noisy_video.dtype)
+        uncond_contexts = [uncond_embed] * len(contexts)
+        uncond_tag_list = [uncond_tags] * len(contexts)
+        model = accelerator.unwrap_model(transformer)
+        raw_network = accelerator.unwrap_model(network)
+        offloader = getattr(model, "offloader", None) if getattr(model, "blocks_to_swap", 0) else None
+        if offloader is not None:
+            offloader.set_forward_only(True)
+        try:
+            with accelerator.autocast():
+                cond_lora, _ = transformer(noisy_video, noisy_audio, sigma_video, contexts, tags)
+                uncond_lora, _ = transformer(noisy_video, noisy_audio, sigma_video, uncond_contexts, uncond_tag_list)
+                raw_network.set_multiplier(0.0)
+                try:
+                    cond_base, _ = transformer(noisy_video, noisy_audio, sigma_video, contexts, tags)
+                    uncond_base, _ = transformer(noisy_video, noisy_audio, sigma_video, uncond_contexts, uncond_tag_list)
+                finally:
+                    raw_network.set_multiplier(1.0)
+        finally:
+            if offloader is not None:
+                offloader.set_forward_only(False)
+        separation_lora = (cond_lora.float() - uncond_lora.float()).norm()
+        separation_base = (cond_base.float() - uncond_base.float()).norm().clamp_min(1e-8)
+        return float((separation_lora / separation_base).item())
+
     @staticmethod
     def _weighted_mse(pred, target, sigma, weighting_scheme):
         loss = F.mse_loss(pred, target, reduction="none")
@@ -666,6 +707,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             noisy_audio.requires_grad_(True)
             for value in contexts:
                 value.requires_grad_(True)
+
+        drift_every = int(getattr(args, "guidance_drift_every", 0) or 0)
+        if drift_every > 0 and global_step > 0 and global_step % drift_every == 0 and not getattr(self, "_drift_measured_at", None) == global_step:
+            self._drift_measured_at = global_step
+            self._last_guidance_drift = self._measure_guidance_drift(
+                args, accelerator, transformer, network, noisy_video, noisy_audio, sigma_video, contexts, tags
+            )
 
         cfg_scale = float(getattr(args, "cfg_augmented_scale", 1.0) or 1.0)
         uncond_video = uncond_audio = None
@@ -777,6 +825,14 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         help="CFG-augmented training (diffusion-pipe): fit (pred + (s-1)*uncond)/s — the de-amplified raw velocity — "
         "with a no-grad empty-prompt forward so training preserves the model's guidance distillation. 1.0 = off; "
         "4.0 recommended. Needs the --precache_uncond cache; mutually exclusive with --train_lora_overlay",
+    )
+    parser.add_argument(
+        "--guidance_drift_every",
+        type=int,
+        default=0,
+        help="every N steps, measure ||cond-uncond|| of the LoRA'd model vs the frozen base (4 no-grad forwards) and "
+        "log gd= / network/guidance_drift. 1.0 = distillation intact, drifts toward 1/s as training un-distills. "
+        "Needs the --precache_uncond cache. 0 = off",
     )
     parser.add_argument(
         "--train_lora_overlay",
