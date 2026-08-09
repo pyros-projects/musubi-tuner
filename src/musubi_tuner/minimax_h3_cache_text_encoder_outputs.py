@@ -224,8 +224,8 @@ def main():
     parser = minimax_h3_setup_parser(cache_text_encoder_outputs.setup_parser_common())
     args = parser.parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    if args.cache_sample_prompts_only and not args.precache_sample_prompts:
-        raise ValueError("--cache_sample_prompts_only requires --precache_sample_prompts")
+    if args.cache_sample_prompts_only and not (args.precache_sample_prompts or args.precache_uncond):
+        raise ValueError("--cache_sample_prompts_only requires --precache_sample_prompts or --precache_uncond")
 
     datasets = []
     all_files = []
@@ -285,7 +285,8 @@ def main():
             encode_and_save_batch(current_tokenizer, current_text_encoder, batch, device, args.max_token_length)
 
     if args.cache_sample_prompts_only:
-        _precache_sample_prompts(args, datasets, encode_prompt_list)
+        if args.precache_sample_prompts:
+            _precache_sample_prompts(args, datasets, encode_prompt_list)
         if args.precache_uncond:
             _precache_uncond(args, datasets, encode_prompt_list)
         logger.info("H3 sample prompt cache warmup complete; exiting before training")

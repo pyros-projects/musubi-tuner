@@ -667,15 +667,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             for value in contexts:
                 value.requires_grad_(True)
 
-        with accelerator.autocast():
-            pred_video, pred_audio = transformer(noisy_video, noisy_audio, sigma_video, contexts, tags)
         cfg_scale = float(getattr(args, "cfg_augmented_scale", 1.0) or 1.0)
+        uncond_video = uncond_audio = None
         if cfg_scale > 1.0:
             uncond_embed, uncond_tags = self._get_uncond_context(args, accelerator, network_dtype)
+            # The training-mode block-swap offloader coordinates forward+backward, so
+            # the extra no-grad forward runs in forward-only swap mode BEFORE the grad
+            # forward — both residency switches happen while no backward is pending.
+            model = accelerator.unwrap_model(transformer)
+            model.switch_block_swap_for_inference()
             with torch.no_grad(), accelerator.autocast():
                 uncond_video, uncond_audio = transformer(
                     noisy_video, noisy_audio, sigma_video, [uncond_embed] * len(contexts), [uncond_tags] * len(contexts)
                 )
+            model.switch_block_swap_for_training()
+
+        with accelerator.autocast():
+            pred_video, pred_audio = transformer(noisy_video, noisy_audio, sigma_video, contexts, tags)
+        if uncond_video is not None:
             pred_video = self._apply_cfg_augmentation(pred_video, uncond_video, cfg_scale)
             pred_audio = self._apply_cfg_augmentation(pred_audio, uncond_audio, cfg_scale)
         target_video = clean_video - noise_video
