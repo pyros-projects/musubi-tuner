@@ -127,13 +127,21 @@ def _video_grid(length: int, frame_grid: torch.Tensor, cursor: float) -> torch.T
 
 
 def apply_split_half_rope(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
-    """Apply H3's split-half partial RoPE to ``[B,S,H,D]`` tensors."""
+    """Apply H3's split-half partial RoPE to ``[B,S,H,D]`` tensors.
+
+    ``angles`` is ``[S, D]`` (shared across the batch) or ``[B, S, D]``
+    (per-item positions, used by the batched ragged-text path).
+    """
 
     half = angles.shape[-1] // 2
     rot = half * 2
     angle = angles[..., :half].to(device=x.device, dtype=torch.float32)
-    cos = angle.cos().to(x.dtype)[None, :, None, :]
-    sin = angle.sin().to(x.dtype)[None, :, None, :]
+    if angles.ndim == 2:
+        cos = angle.cos().to(x.dtype)[None, :, None, :]
+        sin = angle.sin().to(x.dtype)[None, :, None, :]
+    else:
+        cos = angle.cos().to(x.dtype)[:, :, None, :]
+        sin = angle.sin().to(x.dtype)[:, :, None, :]
     first, second = x[..., :half], x[..., half:rot]
     rotated = torch.cat([first * cos - second * sin, second * cos + first * sin], dim=-1)
     return torch.cat([rotated, x[..., rot:]], dim=-1)
@@ -188,7 +196,9 @@ class Attention(nn.Module):
         self.k_norm = nn.RMSNorm(head_dim, eps=eps)
         self.out_proj = nn.Linear(inner, hidden, bias=False)
 
-    def forward(self, x: torch.Tensor, rope_angles: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, rope_angles: torch.Tensor | None = None, attn_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         batch, sequence, _ = x.shape
         q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
         q = self.q_norm(q.reshape(batch, sequence, self.heads, self.head_dim))
@@ -197,6 +207,12 @@ class Attention(nn.Module):
         if rope_angles is not None:
             q = apply_split_half_rope(q, rope_angles)
             k = apply_split_half_rope(k, rope_angles)
+        if attn_mask is not None:
+            # batched ragged-text path: key-padding mask [B,1,1,S], True = attend
+            out = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=attn_mask
+            )
+            return self.out_proj(out.transpose(1, 2).reshape(batch, sequence, self.heads * self.head_dim))
         return self.out_proj(common_attention([q, k, v], attn_params=self.attn_params))
 
 
@@ -294,20 +310,29 @@ class DiTBlock(nn.Module):
         self.adaln_proj = AdalnProj(time_dim, hidden, expand=6, modalities=3, apply_silu=apply_silu)
 
     def forward(
-        self, x: torch.Tensor, time_embedding: torch.Tensor, modulation_rows: torch.Tensor, rope_angles: torch.Tensor
+        self,
+        x: torch.Tensor,
+        time_embedding: torch.Tensor,
+        modulation_rows: torch.Tensor,
+        rope_angles: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(time_embedding)
-        shift_msa = shift_msa[modulation_rows][None].to(x.dtype)
-        scale_msa = scale_msa[modulation_rows][None].to(x.dtype)
-        gate_msa = gate_msa[modulation_rows][None].to(x.dtype)
-        hidden = self.norm1(x) * (1.0 + scale_msa) + shift_msa
-        x = x + self.attn(hidden, rope_angles) * gate_msa
+        # Batched path: time_embedding [B,T,dim] flattens so the adaln table is
+        # [B*T*modalities, hidden]; modulation_rows [B,L] then carry per-item
+        # flat offsets. Serial path ([T,dim] + rows [L]) is byte-identical.
+        adaln_input = time_embedding if time_embedding.ndim == 2 else time_embedding.reshape(-1, time_embedding.shape[-1])
+        batched_rows = modulation_rows.ndim == 2
 
-        shift_mlp = shift_mlp[modulation_rows][None].to(x.dtype)
-        scale_mlp = scale_mlp[modulation_rows][None].to(x.dtype)
-        gate_mlp = gate_mlp[modulation_rows][None].to(x.dtype)
-        hidden = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
-        return x + self.mlp(hidden) * gate_mlp
+        def select(table: torch.Tensor) -> torch.Tensor:
+            selected = table[modulation_rows]
+            return (selected if batched_rows else selected[None]).to(x.dtype)
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(adaln_input)
+        hidden = self.norm1(x) * (1.0 + select(scale_msa)) + select(shift_msa)
+        x = x + self.attn(hidden, rope_angles, attn_mask) * select(gate_msa)
+
+        hidden = self.norm2(x) * (1.0 + select(scale_mlp)) + select(shift_mlp)
+        return x + self.mlp(hidden) * select(gate_mlp)
 
 
 class FinalLayer(nn.Module):
@@ -324,15 +349,21 @@ class FinalLayer(nn.Module):
         time_embedding: torch.Tensor,
         video_slice: tuple[int, int],
         audio_slice: tuple[int, int],
-        video_time_row: int,
-        audio_time_row: int,
+        video_time_row: int | torch.Tensor,
+        audio_time_row: int | torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        shift, scale = self.adaln_proj(time_embedding)
+        adaln_input = time_embedding if time_embedding.ndim == 2 else time_embedding.reshape(-1, time_embedding.shape[-1])
+        shift, scale = self.adaln_proj(adaln_input)
         normalized = self.norm(x)
         video = normalized[:, video_slice[0] : video_slice[1]]
         audio = normalized[:, audio_slice[0] : audio_slice[1]]
-        video = video * (1.0 + scale[video_time_row].to(video.dtype)) + shift[video_time_row].to(video.dtype)
-        audio = audio * (1.0 + scale[audio_time_row].to(audio.dtype)) + shift[audio_time_row].to(audio.dtype)
+        if isinstance(video_time_row, torch.Tensor):
+            # batched: per-item flat rows [B] into the [B*T, hidden] table
+            video = video * (1.0 + scale[video_time_row][:, None].to(video.dtype)) + shift[video_time_row][:, None].to(video.dtype)
+            audio = audio * (1.0 + scale[audio_time_row][:, None].to(audio.dtype)) + shift[audio_time_row][:, None].to(audio.dtype)
+        else:
+            video = video * (1.0 + scale[video_time_row].to(video.dtype)) + shift[video_time_row].to(video.dtype)
+            audio = audio * (1.0 + scale[audio_time_row].to(audio.dtype)) + shift[audio_time_row].to(audio.dtype)
         return self.video_out(video.float()), self.audio_out(audio.float())
 
 
@@ -537,8 +568,8 @@ class MiniMaxH3Model(nn.Module):
     def rope_angles(self, position_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
         positions = position_ids.to(device=device, dtype=torch.float32)
         inv_freq = self.rope.inv_freq.to(device=device)
-        per_axis = positions.unsqueeze(-1) * inv_freq.view(1, 1, -1)
-        temporal, height, width = per_axis.unbind(dim=1)
+        per_axis = positions.unsqueeze(-1) * inv_freq.view(*([1] * (positions.ndim - 1)), -1)
+        temporal, height, width = per_axis.unbind(dim=-2)
         half = torch.cat([temporal, height, width], dim=-1)
         return torch.cat([half, half], dim=-1)
 
@@ -629,6 +660,137 @@ class MiniMaxH3Model(nn.Module):
         )
         return video_out.to(video.dtype), unpack_audio(audio_rows).to(audio.dtype)
 
+    def _forward_batched(
+        self,
+        video: torch.Tensor,
+        audio: torch.Tensor,
+        sigma_video: torch.Tensor,
+        context: torch.Tensor | list[torch.Tensor],
+        text_token_tags: torch.Tensor | list[torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One packed forward for a bucket batch (uniform video/audio shapes).
+
+        Text is refined per item at its true length, then right-padded to the
+        batch max inside the text segment: the physical layout is uniform, but
+        every token keeps its serial-equivalent RoPE position (audio/video
+        cursors start at the item's true text length) and padded text slots are
+        masked out on the attention key side. Per-item sigmas use a fixed
+        two-row time convention (row 0 = video, row 1 = audio) instead of the
+        serial path's sorted dedup — same selected values, batchable indexing.
+        """
+
+        batch = video.shape[0]
+        if video.shape[-2] % self.patch_size[1] or video.shape[-1] % self.patch_size[2]:
+            raise ValueError("H3 video latent height and width must be divisible by the spatial patch size")
+        latent_t, latent_h, latent_w = video.shape[-3:]
+        audio_t = audio.shape[-1]
+
+        refined: list[torch.Tensor] = []
+        tags_per_item: list[torch.Tensor] = []
+        lengths: list[int] = []
+        for index in range(batch):
+            context_i = context[index]
+            if context_i.ndim == 2:
+                context_i = context_i.unsqueeze(0)
+            text_len = context_i.shape[1]
+            tags_i = text_token_tags[index] if text_token_tags is not None else None
+            if tags_i is None:
+                tags_i = torch.ones(text_len, device=video.device, dtype=torch.long)
+            else:
+                tags_i = tags_i.reshape(-1).to(device=video.device, dtype=torch.long)
+                if tags_i.shape[0] != text_len:
+                    raise ValueError("text_token_tags length must match the text context length")
+            if context_i.shape[-1] != self.hidden_size:
+                context_i = self.token_refiner(self.condition_proj(context_i), self.gradient_checkpointing)
+            refined.append(context_i)
+            tags_per_item.append(tags_i)
+            lengths.append(text_len)
+
+        compute_dtype = refined[0].dtype
+        text_max = max(lengths)
+        layout = PackedLayout(text_max, latent_t, latent_h, latent_w, audio_t)
+
+        text_embed = refined[0].new_zeros((batch, text_max, self.hidden_size))
+        tags_padded = torch.ones(batch, text_max, device=video.device, dtype=torch.long)
+        text_valid = torch.zeros(batch, text_max, device=video.device, dtype=torch.bool)
+        position_ids = torch.zeros(batch, layout.seq_len, 3, dtype=torch.float64)
+        for index in range(batch):
+            length = lengths[index]
+            text_embed[index, :length] = refined[index][0]
+            tags_padded[index, :length] = tags_per_item[index]
+            text_valid[index, :length] = True
+            layout_i = PackedLayout(length, latent_t, latent_h, latent_w, audio_t)
+            position_ids[index, :length] = layout_i.position_ids[: layout_i.text_slice[1]]
+            position_ids[index, layout.audio_slice[0] : layout.audio_slice[1]] = layout_i.position_ids[
+                layout_i.audio_slice[0] : layout_i.audio_slice[1]
+            ]
+            position_ids[index, layout.video_slice[0] : layout.video_slice[1]] = layout_i.position_ids[
+                layout_i.video_slice[0] : layout_i.video_slice[1]
+            ]
+
+        sigma_v = sigma_video.reshape(-1).float().clamp(1e-6, 1.0)
+        sigma_a = time_shift_sigma(sigma_v, self.sigma_shift_video, self.sigma_shift_audio)
+        time_values = torch.stack([1.0 - sigma_v, 1.0 - sigma_a], dim=1)  # [B, 2]: row 0 video, row 1 audio
+        n_times = time_values.shape[1]
+
+        base_rows = torch.empty(batch, layout.seq_len, device=video.device, dtype=torch.long)
+        base_rows[:, :text_max] = tags_padded  # video-time row (0) * 3 + tag
+        base_rows[:, layout.audio_slice[0] : layout.audio_slice[1]] = 1 * 3 + 2
+        base_rows[:, layout.video_slice[0] : layout.video_slice[1]] = 0
+        modulation_rows = base_rows + torch.arange(batch, device=video.device)[:, None] * (n_times * 3)
+
+        video_embed = self.video_patch_proj(patchify_video(video.float(), self.patch_size)).to(compute_dtype)
+        audio_embed = self.audio_patch_proj(pack_audio(audio.float())).to(compute_dtype)
+        hidden = torch.cat([text_embed, audio_embed, video_embed], dim=1)
+
+        flat_times = time_values.reshape(-1)
+        if self.use_adaln_curves:
+            table = self.adaln_t_table.to(device=video.device)
+            position = flat_times.clamp(0.0, 1.0) * (table.shape[0] - 1)
+            lower = position.floor().long().clamp(max=table.shape[0] - 2)
+            time_embedding = torch.lerp(table[lower], table[lower + 1], (position - lower).unsqueeze(1))
+        else:
+            time_embedding = self.time_embedder(flat_times).to(compute_dtype)
+        time_embedding = time_embedding.reshape(batch, n_times, -1)
+
+        rope_angles = self.rope_angles(position_ids, video.device)
+        attn_mask = None
+        if not bool(text_valid.all()):
+            key_mask = torch.ones(batch, layout.seq_len, device=video.device, dtype=torch.bool)
+            key_mask[:, :text_max] = text_valid
+            attn_mask = key_mask[:, None, None, :]
+
+        for index, block in enumerate(self.blocks):
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(index)
+            if self.gradient_checkpointing and self.training:
+                hidden = torch.utils.checkpoint.checkpoint(
+                    block, hidden, time_embedding, modulation_rows, rope_angles, attn_mask, use_reentrant=False
+                )
+            else:
+                hidden = block(hidden, time_embedding, modulation_rows, rope_angles, attn_mask)
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.blocks, index)
+
+        item_offsets = torch.arange(batch, device=video.device, dtype=torch.long) * n_times
+        video_rows, audio_rows = self.final_layer(
+            hidden,
+            time_embedding,
+            layout.video_slice,
+            layout.audio_slice,
+            item_offsets,  # row 0 per item = video time
+            item_offsets + 1,  # row 1 per item = audio time
+        )
+        video_out = unpatchify_video(
+            video_rows,
+            latent_t,
+            latent_h // self.patch_size[1],
+            latent_w // self.patch_size[2],
+            self.latents_dim,
+            self.patch_size,
+        )
+        return video_out.to(video.dtype), unpack_audio(audio_rows).to(audio.dtype)
+
     def forward(
         self,
         video: torch.Tensor,
@@ -639,10 +801,12 @@ class MiniMaxH3Model(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return raw checkpoint predictions (``clean - noise``) for both streams.
 
-        H3's packed sequence has shape-dependent length and the released full
-        attention implementation is batch-one.  Larger loader batches are
-        evaluated serially while preserving one accumulated autograd graph.
+        Bucket batches (uniform video/audio shapes, ragged text) run as one
+        packed forward; batch-one calls keep the original serial path.
         """
+
+        if video.shape[0] > 1:
+            return self._forward_batched(video, audio, sigma_video, context, text_token_tags)
 
         outputs_video: list[torch.Tensor] = []
         outputs_audio: list[torch.Tensor] = []

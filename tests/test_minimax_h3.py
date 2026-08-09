@@ -932,3 +932,68 @@ def test_h3_diffusers_lora_comfy_conversion_fuses_qkv(tmp_path):
     # fc1 halves un-swapped (diffusers [value; gate] -> ours [gate; value]) and scaled
     fc1_up = out["diffusion_model.blocks.0.mlp.fc1.lora_B.weight"].float()
     torch.testing.assert_close(fc1_up, scale * torch.cat([ff_b[ffn:], ff_b[:ffn]], dim=0).float(), rtol=2e-2, atol=2e-2)
+
+
+def _tiny_h3_model():
+    return MiniMaxH3Model(
+        hidden_size=12,
+        num_layers=2,
+        token_refiner_num_layers=1,
+        num_attention_heads=2,
+        attention_head_dim=6,
+        ffn_hidden_size=16,
+        latents_dim=2,
+        audio_latents_dim=3,
+        text_dim=8,
+        timestep_input_dim=8,
+        time_embed_hidden_size=12,
+        time_embed_dim=6,
+        rope_inv_freq_len=1,
+    ).float().eval()
+
+
+@pytest.mark.parametrize("audio_t", [2, 0])
+def test_h3_batched_forward_matches_serial(audio_t):
+    torch.manual_seed(0)
+    model = _tiny_h3_model()
+    batch = 3
+    video = torch.randn(batch, 2, 1, 4, 6)
+    audio = torch.randn(batch, 3, 2, audio_t)
+    sigma = torch.tensor([0.9, 0.5, 0.2])
+    contexts = [torch.randn(1, n, 8) for n in (5, 3, 7)]  # ragged text
+    tags = [torch.ones(5, dtype=torch.long), torch.tensor([1, 2, 1]), torch.ones(7, dtype=torch.long)]
+
+    with torch.no_grad():
+        serial = [
+            model._forward_single(video[i : i + 1], audio[i : i + 1], sigma[i : i + 1], contexts[i], tags[i])
+            for i in range(batch)
+        ]
+        batched_video, batched_audio = model(video, audio, sigma, contexts, tags)
+
+    torch.testing.assert_close(batched_video, torch.cat([v for v, _ in serial]), rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(batched_audio, torch.cat([a for _, a in serial]), rtol=1e-4, atol=1e-5)
+
+
+def test_h3_batched_forward_uniform_lengths_and_grads():
+    torch.manual_seed(1)
+    model = _tiny_h3_model()
+    video = torch.randn(2, 2, 1, 4, 6)
+    audio = torch.randn(2, 3, 2, 2)
+    sigma = torch.tensor([0.7, 0.7])
+    contexts = [torch.randn(1, 4, 8) for _ in range(2)]  # uniform -> no attention mask path
+    tags = [torch.ones(4, dtype=torch.long)] * 2
+
+    with torch.no_grad():
+        serial = [
+            model._forward_single(video[i : i + 1], audio[i : i + 1], sigma[i : i + 1], contexts[i], tags[i])
+            for i in range(2)
+        ]
+        batched_video, _ = model(video, audio, sigma, contexts, tags)
+    torch.testing.assert_close(batched_video, torch.cat([v for v, _ in serial]), rtol=1e-4, atol=1e-5)
+
+    # gradients flow through the batched path
+    model.train()
+    video_grad = video.clone().requires_grad_(True)
+    out_video, out_audio = model(video_grad, audio, sigma, contexts, tags)
+    (out_video.square().mean() + out_audio.square().mean()).backward()
+    assert video_grad.grad is not None and torch.isfinite(video_grad.grad).all()
