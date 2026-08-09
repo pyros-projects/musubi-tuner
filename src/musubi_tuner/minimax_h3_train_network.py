@@ -232,6 +232,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     "Positive --sample_blocks_to_swap requires positive --blocks_to_swap to initialize MiniMax H3's "
                     "classic block-swap offloader"
                 )
+        cfg_scale = float(getattr(args, "cfg_augmented_scale", 1.0) or 1.0)
+        if cfg_scale < 1.0:
+            raise ValueError(f"--cfg_augmented_scale must be >= 1.0 (1.0 = off): {cfg_scale}")
+        if cfg_scale > 1.0 and getattr(args, "train_lora_overlay", None):
+            raise ValueError("--cfg_augmented_scale and --train_lora_overlay both counter distillation loss; use one")
         train_overlay = getattr(args, "train_lora_overlay", None)
         if train_overlay:
             overlay_path, overlay_strength = _parse_overlay_spec(train_overlay)
@@ -563,6 +568,39 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         raise RuntimeError("MiniMax H3 uses its joint audio/video process_batch implementation")
 
     @staticmethod
+    def _apply_cfg_augmentation(pred: torch.Tensor, uncond: torch.Tensor, scale: float) -> torch.Tensor:
+        """Compose the fitted quantity in CFG space (diffusion-pipe technique).
+
+        The loss fits ``uncond + scale * (pred - uncond)`` against the ordinary
+        flow target while the uncond branch carries no gradient, so the raw
+        conditional output stays in the base model's distilled convention —
+        training never un-distills the guidance.
+        """
+        return uncond + scale * (pred - uncond)
+
+    def _get_uncond_context(self, args, accelerator, network_dtype):
+        cached = getattr(self, "_cfg_uncond_context", None)
+        if cached is None:
+            from musubi_tuner.minimax_h3_cache_text_encoder_outputs import (
+                DEFAULT_UNCOND_CACHE,
+                load_sample_prompt_cache,
+                resolve_sample_prompts_cache_path,
+            )
+
+            cache_path = resolve_sample_prompts_cache_path(args.dataset_config, filename=DEFAULT_UNCOND_CACHE)
+            entries = load_sample_prompt_cache(cache_path, [{"prompt": ""}])
+            if entries is None:
+                raise ValueError(
+                    f"--cfg_augmented_scale needs the uncond embedding cache at {cache_path}; "
+                    "re-run the H3 text-encoder cache step with --precache_uncond"
+                )
+            embed = entries[0]["h3_text_embed"].to(accelerator.device, dtype=network_dtype)
+            tags = entries[0]["h3_token_tags"].to(accelerator.device, dtype=torch.long)
+            cached = self._cfg_uncond_context = (embed, tags)
+            accelerator.print(f"Loaded H3 uncond embedding for CFG-augmented training ({embed.shape[0]} tokens)")
+        return cached
+
+    @staticmethod
     def _weighted_mse(pred, target, sigma, weighting_scheme):
         loss = F.mse_loss(pred, target, reduction="none")
         if weighting_scheme == "sigma_sqrt":
@@ -631,6 +669,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         with accelerator.autocast():
             pred_video, pred_audio = transformer(noisy_video, noisy_audio, sigma_video, contexts, tags)
+        cfg_scale = float(getattr(args, "cfg_augmented_scale", 1.0) or 1.0)
+        if cfg_scale > 1.0:
+            uncond_embed, uncond_tags = self._get_uncond_context(args, accelerator, network_dtype)
+            with torch.no_grad(), accelerator.autocast():
+                uncond_video, uncond_audio = transformer(
+                    noisy_video, noisy_audio, sigma_video, [uncond_embed] * len(contexts), [uncond_tags] * len(contexts)
+                )
+            pred_video = self._apply_cfg_augmentation(pred_video, uncond_video, cfg_scale)
+            pred_audio = self._apply_cfg_augmentation(pred_audio, uncond_audio, cfg_scale)
         target_video = clean_video - noise_video
         target_audio = clean_audio - noise_audio
         video_loss = self._weighted_mse(pred_video.to(network_dtype), target_video, sigma_video, args.weighting_scheme)
@@ -707,6 +754,14 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         default=None,
         help="silu(t_emb) grid safetensors (from the ComfyUI-MiniMax-H3-Turbo node) enabling adaln overlay "
         "modules on pruned curve-table bases; without it adaln modules are skipped with a warning",
+    )
+    parser.add_argument(
+        "--cfg_augmented_scale",
+        type=float,
+        default=1.0,
+        help="CFG-augmented training (diffusion-pipe): fit uncond + s*(pred - uncond) with a no-grad empty-prompt "
+        "forward so training preserves the model's guidance distillation. 1.0 = off; 4.0 recommended. "
+        "Needs the --precache_uncond cache; mutually exclusive with --train_lora_overlay",
     )
     parser.add_argument(
         "--train_lora_overlay",

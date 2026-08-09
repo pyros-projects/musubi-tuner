@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 DEFAULT_SAMPLE_PROMPTS_CACHE = "minimax_h3_sample_prompts_cache.pt"
+DEFAULT_UNCOND_CACHE = "minimax_h3_uncond_cache.pt"
 
 
 @torch.no_grad()
@@ -56,7 +57,7 @@ def encode_and_save_batch_comfy(clip, batch: list[ItemInfo], cache: dict[str, tu
         save_text_encoder_output_cache_minimax_h3(item, embed, token_tags)
 
 
-def resolve_sample_prompts_cache_path(dataset_config: str, datasets=None) -> str:
+def resolve_sample_prompts_cache_path(dataset_config: str, datasets=None, filename: str = DEFAULT_SAMPLE_PROMPTS_CACHE) -> str:
     cache_dir = getattr(datasets[0], "cache_directory", None) if datasets else None
     if not cache_dir:
         if not dataset_config:
@@ -67,7 +68,7 @@ def resolve_sample_prompts_cache_path(dataset_config: str, datasets=None) -> str
         cache_dir = declared_datasets[0].get("cache_directory")
     if not cache_dir:
         raise ValueError("First dataset has no cache_directory; set it in the dataset config")
-    return os.path.join(os.path.abspath(os.path.expanduser(cache_dir)), DEFAULT_SAMPLE_PROMPTS_CACHE)
+    return os.path.join(os.path.abspath(os.path.expanduser(cache_dir)), filename)
 
 
 def _text_encoder_cache_metadata(args: argparse.Namespace) -> dict:
@@ -149,6 +150,35 @@ def _precache_sample_prompts(args: argparse.Namespace, datasets, encode_prompt_l
     logger.info("Saved H3 sample prompt cache: %s", cache_path)
 
 
+def _precache_uncond(args: argparse.Namespace, datasets, encode_prompt_list) -> None:
+    """Cache the empty-prompt (unconditional) embedding for CFG-augmented training."""
+    uncond_prompts = [{"prompt": ""}]
+    cache_path = resolve_sample_prompts_cache_path(args.dataset_config, datasets, filename=DEFAULT_UNCOND_CACHE)
+    metadata = _text_encoder_cache_metadata(args)
+    if load_sample_prompt_cache(cache_path, uncond_prompts, metadata) is not None:
+        logger.info("H3 uncond cache is current: %s", cache_path)
+        return
+    embeds, tags = encode_prompt_list([""])
+    entries = [
+        {
+            "prompt": "",
+            "h3_text_embed": embeds[0].detach().cpu().contiguous(),
+            "h3_token_tags": tags[0].detach().cpu().contiguous(),
+        }
+    ]
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    torch.save(
+        {
+            "version": 1,
+            "architecture": ARCHITECTURE_MINIMAX_H3_FULL,
+            **metadata,
+            "prompt_cache": entries,
+        },
+        cache_path,
+    )
+    logger.info("Saved H3 uncond cache: %s", cache_path)
+
+
 def load_comfy_clip(comfyui_path: str, text_encoder_path: str, device: torch.device):
     comfyui_path = os.path.abspath(comfyui_path)
     if not os.path.isfile(os.path.join(comfyui_path, "comfy", "sd.py")):
@@ -175,6 +205,11 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--max_token_length", type=int, default=1024, help="maximum raw prompt token length")
     parser.add_argument("--comfyui_path", type=str, help="use ComfyUI's MiniMax loader, including INT8 text encoders")
     parser.add_argument("--precache_sample_prompts", action="store_true", help="cache H3 training preview prompts")
+    parser.add_argument(
+        "--precache_uncond",
+        action="store_true",
+        help="cache the empty-prompt embedding for --cfg_augmented_scale training",
+    )
     parser.add_argument("--sample_prompts", type=str, help="sample prompt file to cache")
     parser.add_argument(
         "--cache_sample_prompts_only",
@@ -251,6 +286,8 @@ def main():
 
     if args.cache_sample_prompts_only:
         _precache_sample_prompts(args, datasets, encode_prompt_list)
+        if args.precache_uncond:
+            _precache_uncond(args, datasets, encode_prompt_list)
         logger.info("H3 sample prompt cache warmup complete; exiting before training")
         return
 
@@ -266,6 +303,8 @@ def main():
     cache_text_encoder_outputs.post_process_cache_files(datasets, all_files, all_paths, args.keep_cache)
     if args.precache_sample_prompts:
         _precache_sample_prompts(args, datasets, encode_prompt_list)
+    if args.precache_uncond:
+        _precache_uncond(args, datasets, encode_prompt_list)
     logger.info("H3 text cache process complete; text encoder memory will be released on process exit")
 
 

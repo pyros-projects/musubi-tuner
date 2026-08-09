@@ -20,7 +20,7 @@ AUDIO_VAE="${AUDIO_VAE:-/home/pyro/models/comfy/vae/minimax_h3_audio_vae_fp32.sa
 # Preview-decode VAE (previews only — caching always uses $VAE). Point at
 # kijai's minimax_h3_video_vae_int8_convrot.safetensors for faster/leaner
 # preview decodes when speed matters more than preview fidelity.
-SAMPLE_VAE="${SAMPLE_VAE:-$VAE}"
+SAMPLE_VAE="${SAMPLE_VAE:-/home/pyro/models/comfy/vae/minimax_h3_video_vae_int8_convrot.safetensors}"
 
 H3_NAME="${H3_NAME:-bb}"
 CACHE_DATASET="${CACHE_DATASET:-1}"
@@ -28,13 +28,13 @@ MAX_STEPS="${MAX_STEPS:-2000}"
 SAVE_EVERY="${SAVE_EVERY:-50}"
 SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
 SAMPLE_PROMPTS="${SAMPLE_PROMPTS:-.pyro/h3/cfg/p_${H3_NAME}.toml}"
-GRAD_ACCUM="${GRAD_ACCUM:-2}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"
 NETWORK_DIM="${NETWORK_DIM:-32}"
 NETWORK_ALPHA="${NETWORK_ALPHA:-$NETWORK_DIM}"
 LORA_PRESET="${LORA_PRESET:-no_packed_attn}" # attn, attn_mlp, no_packed_attn, mlp (style: no text refiner), or full
 OPTIMIZER="${OPTIMIZER:-adamw_optimi}"  # adamw8bit | adafactor | prodigy | adamw_optimi
 LEARNING_RATE="${LEARNING_RATE:-}"   # empty = optimizer-specific default
-BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-6}"
+BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-4}"
 SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-25}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
 CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-8}"
 CACHE_TEXT_BATCH_SIZE="${CACHE_TEXT_BATCH_SIZE:-1}"
@@ -70,6 +70,11 @@ SAMPLE_LORA_TEMB_GRID="${SAMPLE_LORA_TEMB_GRID:-$COMFYUI_DIR/custom_nodes/comfyu
 # minimax_h3_training_adapter). Detached for previews, never merged into saves.
 # Empty = off (training unchanged). PATH or PATH:strength. Tags runs -dedistill.
 TRAIN_LORA_OVERLAY="${TRAIN_LORA_OVERLAY:-}"
+# CFG-augmented training (diffusion-pipe technique): fits uncond + s*(pred-uncond)
+# with a no-grad empty-prompt forward each step, preserving the model's guidance
+# distillation by construction. 0/1 = off, 4 = recommended. ~+1/3 step time.
+# Mutually exclusive with TRAIN_LORA_OVERLAY. Tags runs -cfgaugN.
+CFG_AUGMENTED_SCALE="${CFG_AUGMENTED_SCALE:-0}"
 
 if [[ ! "$H3_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "H3_NAME may only contain letters, numbers, dot, underscore, and dash: $H3_NAME" >&2
@@ -125,6 +130,14 @@ case "$TIMESTEP_PRESET" in
             --max_timestep 875
         )
         ;;
+    image_uniform)
+        # diffusion-pipe image recipe: uniform sigma (shift=1). A/B lever vs krea2.
+        TIMESTEP_SUFFIX="-uni"
+        TIMESTEP_ARGS=(
+            --timestep_sampling shift
+            --discrete_flow_shift 1
+        )
+        ;;
     h3_video)
         TIMESTEP_SUFFIX="-h3shift12"
         TIMESTEP_ARGS=(
@@ -132,7 +145,7 @@ case "$TIMESTEP_PRESET" in
             --discrete_flow_shift 12
         )
         ;;
-    *) echo "TIMESTEP_PRESET must be image or h3_video: $TIMESTEP_PRESET" >&2; exit 1 ;;
+    *) echo "TIMESTEP_PRESET must be image, image_v0, image_uniform, or h3_video: $TIMESTEP_PRESET" >&2; exit 1 ;;
 esac
 
 case "$OPTIMIZER" in
@@ -220,6 +233,9 @@ fi
 if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
     AB_SUFFIX+="-dedistill"
 fi
+if [[ -n "$CFG_AUGMENTED_SCALE" && "$CFG_AUGMENTED_SCALE" != 0 && "$CFG_AUGMENTED_SCALE" != 1 ]]; then
+    AB_SUFFIX+="-cfgaug${CFG_AUGMENTED_SCALE}"
+fi
 RUN_NAME="${H3_NAME}${FRAME_SUFFIX}${AUDIO_SUFFIX}${TIMESTEP_SUFFIX}${AB_SUFFIX}-${LORA_TAG}-r${NETWORK_DIM}-${TIMESTEP_PRESET}-${IMAGE_AUDIO_MODE}-${OPTIMIZER}"
 OUTPUT_DIR="${OUTPUT_DIR:-/home/pyro/models/_out/h3/$RUN_NAME}"
 
@@ -248,6 +264,21 @@ if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
         exit 1
     fi
     TRAIN_OVERLAY_ARGS=(--train_lora_overlay "$TRAIN_LORA_OVERLAY")
+fi
+
+CFGAUG_ENABLED=0
+CFGAUG_ARGS=()
+if [[ -n "$CFG_AUGMENTED_SCALE" && "$CFG_AUGMENTED_SCALE" != 0 && "$CFG_AUGMENTED_SCALE" != 1 ]]; then
+    if [[ ! "$CFG_AUGMENTED_SCALE" =~ ^[0-9.]+$ ]]; then
+        echo "CFG_AUGMENTED_SCALE must be numeric: $CFG_AUGMENTED_SCALE" >&2
+        exit 1
+    fi
+    if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
+        echo "CFG_AUGMENTED_SCALE and TRAIN_LORA_OVERLAY are mutually exclusive de-distillation levers" >&2
+        exit 1
+    fi
+    CFGAUG_ENABLED=1
+    CFGAUG_ARGS=(--cfg_augmented_scale "$CFG_AUGMENTED_SCALE")
 fi
 
 SAMPLE_ARGS=()
@@ -299,7 +330,7 @@ if truthy "$CACHE_DATASET"; then
     CACHE_DATASET_ENABLED=1
 fi
 
-if (( CACHE_DATASET_ENABLED || SAMPLE_EVERY > 0 )); then
+if (( CACHE_DATASET_ENABLED || SAMPLE_EVERY > 0 || CFGAUG_ENABLED )); then
     if [[ ! -x "$COMFY_PYTHON" ]]; then
         echo "Missing ComfyUI Python: $COMFY_PYTHON" >&2
         exit 1
@@ -310,6 +341,9 @@ if (( CACHE_DATASET_ENABLED || SAMPLE_EVERY > 0 )); then
     fi
 
     TEXT_CACHE_ARGS=()
+    if (( CFGAUG_ENABLED )); then
+        TEXT_CACHE_ARGS+=(--precache_uncond)
+    fi
     if (( SAMPLE_EVERY > 0 )); then
         TEXT_CACHE_ARGS+=(--precache_sample_prompts --sample_prompts "$SAMPLE_PROMPTS")
     fi
@@ -369,6 +403,7 @@ exec "$ACCELERATE" launch \
     --lora_target_preset "$LORA_PRESET" \
     "${OPT_ARGS[@]}" \
     "${TRAIN_OVERLAY_ARGS[@]}" \
+    "${CFGAUG_ARGS[@]}" \
     --gradient_accumulation_steps "$GRAD_ACCUM" \
     --max_train_steps "$MAX_STEPS" \
     --save_every_n_steps "$SAVE_EVERY" --save_state --save_last_n_steps_state 2 \

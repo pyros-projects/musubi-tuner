@@ -1103,3 +1103,80 @@ def test_h3_vae_int8_decoder_loads_real_checkpoint():
     assert len(quantized) == 144
     assert all(m.weight.dtype == torch.int8 for m in quantized)
     assert all(m.weight_scale.dtype == torch.float32 for m in quantized)
+
+
+def test_h3_cfg_augmentation_math_and_gradients():
+    trainer = MiniMaxH3NetworkTrainer()
+    pred = torch.tensor([2.0, 4.0], requires_grad=True)
+    uncond = torch.tensor([1.0, 1.0])
+
+    out = trainer._apply_cfg_augmentation(pred, uncond, 4.0)
+
+    torch.testing.assert_close(out, torch.tensor([5.0, 13.0]))  # uncond + 4*(pred-uncond)
+    out.sum().backward()
+    torch.testing.assert_close(pred.grad, torch.full((2,), 4.0))  # cond branch scaled by s
+    assert not uncond.requires_grad
+
+
+def test_h3_cfg_augmented_scale_validation():
+    trainer = MiniMaxH3NetworkTrainer()
+
+    def make_args(**overrides):
+        base = dict(
+            fp8_base=False,
+            fp8_scaled=False,
+            mixed_precision="bf16",
+            video_flow_shift=12.0,
+            audio_flow_shift=3.0,
+            audio_loss_weight=0.0,
+            sample_blocks_to_swap=None,
+            sample_prompts=None,
+            block_swap_h2d_only=False,
+            train_lora_overlay=None,
+            cfg_augmented_scale=1.0,
+            lora_target_preset="attn_mlp",
+            network_args=None,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    trainer.handle_model_specific_args(make_args(cfg_augmented_scale=4.0))  # ok
+
+    with pytest.raises(ValueError, match="cfg_augmented_scale"):
+        trainer.handle_model_specific_args(make_args(cfg_augmented_scale=0.5))
+    with pytest.raises(ValueError, match="use one"):
+        trainer.handle_model_specific_args(make_args(cfg_augmented_scale=4.0, train_lora_overlay="x.safetensors"))
+
+
+def test_h3_uncond_cache_roundtrip(tmp_path):
+    from musubi_tuner.minimax_h3_cache_text_encoder_outputs import _precache_uncond
+
+    cache_dir = tmp_path / "cache"
+    dataset_toml = tmp_path / "ds.toml"
+    dataset_toml.write_text(
+        f'[[datasets]]\nimage_directory = "{tmp_path}"\ncache_directory = "{cache_dir}"\n'
+    )
+    te = tmp_path / "te.safetensors"
+    te.write_bytes(b"stub")
+
+    def encode_prompt_list(prompts):
+        assert prompts == [""]
+        return [torch.ones(5, 8)], [torch.ones(5, dtype=torch.long)]
+
+    args = SimpleNamespace(dataset_config=str(dataset_toml), text_encoder=str(te), max_token_length=1024)
+    _precache_uncond(args, None, encode_prompt_list)
+
+    trainer = MiniMaxH3NetworkTrainer()
+    accelerator = SimpleNamespace(device="cpu", print=lambda *a, **k: None)
+    embed, tags = trainer._get_uncond_context(
+        SimpleNamespace(dataset_config=str(dataset_toml)), accelerator, torch.float32
+    )
+    assert embed.shape == (5, 8) and tags.shape == (5,)
+    assert trainer._get_uncond_context(None, None, None) == (embed, tags)  # cached, args unused
+
+    # missing cache produces an actionable error
+    trainer2 = MiniMaxH3NetworkTrainer()
+    empty_toml = tmp_path / "ds2.toml"
+    empty_toml.write_text(f'[[datasets]]\nimage_directory = "{tmp_path}"\ncache_directory = "{tmp_path / "nope"}"\n')
+    with pytest.raises(ValueError, match="precache_uncond"):
+        trainer2._get_uncond_context(SimpleNamespace(dataset_config=str(empty_toml)), accelerator, torch.float32)
