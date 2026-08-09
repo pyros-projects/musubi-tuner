@@ -72,6 +72,18 @@ def resolve_preview_solver(solver: str, sample_steps: int) -> str:
     return solver
 
 
+def _parse_overlay_spec(spec: str) -> tuple[str, float]:
+    """Split an overlay spec ``PATH[:STRENGTH]`` (Windows drive colons survive)."""
+    path, _, tail = spec.rpartition(":")
+    try:
+        strength = float(tail) if path else 1.0
+    except ValueError:
+        path, strength = spec, 1.0
+    if not path:
+        path = spec
+    return path, strength
+
+
 def _silent_audio_latent_length(video_latent_frames: int) -> int:
     if video_latent_frames == 1:
         source_frames = 1
@@ -216,6 +228,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     "Positive --sample_blocks_to_swap requires positive --blocks_to_swap to initialize MiniMax H3's "
                     "classic block-swap offloader"
                 )
+        train_overlay = getattr(args, "train_lora_overlay", None)
+        if train_overlay:
+            overlay_path, overlay_strength = _parse_overlay_spec(train_overlay)
+            if not os.path.isfile(overlay_path):
+                raise ValueError(f"--train_lora_overlay file not found: {overlay_path}")
+            if overlay_strength <= 0:
+                raise ValueError(f"--train_lora_overlay strength must be positive: {train_overlay}")
         if getattr(args, "sample_prompts", None) and getattr(args, "block_swap_h2d_only", False):
             raise ValueError("H3 preview sampling currently requires classic block swap; omit --block_swap_h2d_only")
         _apply_h3_lora_target_preset(args)
@@ -392,13 +411,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._sampling_overlays = []
         self._sampling_overlay_grid = None
         for spec in getattr(args, "sample_lora_overlay", None) or []:
-            path, _, tail = spec.rpartition(":")
-            try:
-                strength = float(tail) if path else 1.0
-            except ValueError:
-                path, strength = spec, 1.0
-            if not path:
-                path = spec
+            path, strength = _parse_overlay_spec(spec)
             modules = sampling_lora_overlay.normalize_overlay_state_dict(sampling_lora_overlay.load_overlay_file(path))
             self._sampling_overlays.append((modules, strength))
             accelerator.print(f"Loaded sampling LoRA overlay: {path} ({len(modules)} modules, strength {strength})")
@@ -406,13 +419,47 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if self._sampling_overlays and grid_path:
             self._sampling_overlay_grid = sampling_lora_overlay.load_temb_grid(grid_path)
 
+    def _ensure_train_overlay(self, args, accelerator, transformer) -> None:
+        """Attach the frozen training-time assistant LoRA (e.g. the ostris
+        de-distillation adapter) so training forwards run on the assisted field.
+
+        Called from process_batch, so the attach always lands after the trainable
+        network has wrapped module forwards — clearing restores the trained-LoRA
+        wrapper, never the bare module. Previews detach it (inference must show
+        the un-assisted base the LoRA will actually be used on) and the next
+        training step lazily re-attaches.
+        """
+        spec = getattr(args, "train_lora_overlay", None)
+        if not spec or getattr(self, "_train_overlay_attached", False):
+            return
+        if not hasattr(self, "_train_overlay"):
+            path, strength = _parse_overlay_spec(spec)
+            modules = sampling_lora_overlay.normalize_overlay_state_dict(sampling_lora_overlay.load_overlay_file(path))
+            self._train_overlay = (modules, strength)
+            accelerator.print(f"Loaded training LoRA overlay: {path} ({len(modules)} modules, strength {strength})")
+        stats = sampling_lora_overlay.attach_sampling_lora_overlays(accelerator.unwrap_model(transformer), [self._train_overlay])
+        self._train_overlay_attached = True
+        if not getattr(self, "_train_overlay_logged", False):
+            self._train_overlay_logged = True
+            accelerator.print(
+                f"Training LoRA overlay active: {stats['backbone']} backbone, {len(stats['skipped'])} skipped modules "
+                "(detached for previews, never merged into saves)"
+            )
+
+    def _detach_train_overlay(self, accelerator, transformer) -> None:
+        if getattr(self, "_train_overlay_attached", False):
+            sampling_lora_overlay.clear_sampling_lora_overlays(accelerator.unwrap_model(transformer))
+            self._train_overlay_attached = False
+
     def on_before_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
+        self._detach_train_overlay(accelerator, transformer)
         self._sample_network_was_training = network.training
         network.eval()
         self._load_sampling_overlays(args, accelerator)
 
     def on_after_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
         # Defensive: per-prompt attach/clear in do_inference already restores forwards.
+        # The training overlay is NOT re-attached here — the next process_batch does it lazily.
         if getattr(self, "_sampling_overlays", None):
             sampling_lora_overlay.clear_sampling_lora_overlays(accelerator.unwrap_model(transformer))
         network.train(getattr(self, "_sample_network_was_training", True))
@@ -496,6 +543,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     ):
         if "latents_audio" not in batch or "h3_text_embed" not in batch:
             raise ValueError("H3 audio and text caches are missing; run both minimax_h3 cache commands first")
+        self._ensure_train_overlay(args, accelerator, transformer)
         sigma_video, _timesteps = self.get_noisy_model_input_and_timesteps(
             args,
             noise,
@@ -609,6 +657,14 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         default=None,
         help="silu(t_emb) grid safetensors (from the ComfyUI-MiniMax-H3-Turbo node) enabling adaln overlay "
         "modules on pruned curve-table bases; without it adaln modules are skipped with a warning",
+    )
+    parser.add_argument(
+        "--train_lora_overlay",
+        type=str,
+        default=None,
+        help="frozen assistant LoRA overlaid during TRAINING forwards, PATH[:STRENGTH] — e.g. the ostris "
+        "minimax_h3_training_adapter (de-distillation). Detached for previews and never merged into saves, "
+        "so saved LoRAs apply to the plain base at inference",
     )
     parser.set_defaults(timestep_sampling="shift", discrete_flow_shift=12.0, mixed_precision="bf16")
     return parser

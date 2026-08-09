@@ -18,20 +18,20 @@ TEXT_ENCODER="${TEXT_ENCODER:-/home/pyro/models/comfy/text_encoders/qwen3vl_32b_
 VAE="${VAE:-/home/pyro/models/comfy/vae/minimax_h3_video_vae_fp16.safetensors}"
 AUDIO_VAE="${AUDIO_VAE:-/home/pyro/models/comfy/vae/minimax_h3_audio_vae_fp32.safetensors}"
 
-H3_NAME="${H3_NAME:-headsit}"
+H3_NAME="${H3_NAME:-bb}"
 CACHE_DATASET="${CACHE_DATASET:-1}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 SAVE_EVERY="${SAVE_EVERY:-50}"
-SAMPLE_EVERY="${SAMPLE_EVERY:-25}"
+SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
 SAMPLE_PROMPTS="${SAMPLE_PROMPTS:-.pyro/h3/cfg/p_${H3_NAME}.toml}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
 NETWORK_DIM="${NETWORK_DIM:-32}"
 NETWORK_ALPHA="${NETWORK_ALPHA:-$NETWORK_DIM}"
 LORA_PRESET="${LORA_PRESET:-no_packed_attn}" # attn, attn_mlp, no_packed_attn, or full
-OPTIMIZER="${OPTIMIZER:-prodigy}"  # adamw8bit | adafactor | prodigy | adamw_optimi
+OPTIMIZER="${OPTIMIZER:-adamw_optimi}"  # adamw8bit | adafactor | prodigy | adamw_optimi
 LEARNING_RATE="${LEARNING_RATE:-}"   # empty = optimizer-specific default
-BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-4}"
-SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-25}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
+BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-6}"
+SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-28}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
 CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-8}"
 CACHE_TEXT_BATCH_SIZE="${CACHE_TEXT_BATCH_SIZE:-1}"
 IMAGE_FRAME_COUNT="${IMAGE_FRAME_COUNT:-1}"
@@ -54,13 +54,18 @@ SAMPLE_SOLVER="${SAMPLE_SOLVER:-ab2}"
 SAMPLE_FRAME_SELECT="${SAMPLE_FRAME_SELECT:-dup_last}"
 # Optional frozen LoRA stacked on previews only (path[:strength]), e.g. the
 # community Turbo LoRA for 4-step previews. Empty = off (unchanged behavior).
-SAMPLE_LORA_OVERLAY="${SAMPLE_LORA_OVERLAY:-/home/pyro/models/comfy/loras/minimax/turbo/minimax_h3_fl2v_turbo_4step_v0.1.safetensors}"
+#SAMPLE_LORA_OVERLAY="${SAMPLE_LORA_OVERLAY:-/home/pyro/models/comfy/loras/minimax/turbo/minimax_h3_fl2v_turbo_4step_v0.1.safetensors}"
+SAMPLE_LORA_OVERLAY="${SAMPLE_LORA_OVERLAY:-/home/pyro/models/comfy/loras/minimax/turbo/minimax_h3_turbo_v4_step600.safetensors}"
 # SAMPLE_LORA_OVERLAY="${SAMPLE_LORA_OVERLAY:-/home/pyro/models/comfy/loras/minimax/minimax_h3_turbo_4step_ckpt850.safetensors}"
 # Overlay strength (turbo card: 1.0 default, 0.8-0.95 against artifacts, 1.05-1.2
 # against blur). Ignored when SAMPLE_LORA_OVERLAY already carries :strength.
 # Per prompt, sample_lora_overlay = <float> scales it further (0 = off).
 SAMPLE_LORA_OVERLAY_STRENGTH="${SAMPLE_LORA_OVERLAY_STRENGTH:-1.0}"
 SAMPLE_LORA_TEMB_GRID="${SAMPLE_LORA_TEMB_GRID:-$COMFYUI_DIR/custom_nodes/comfyui-minimax-h3-turbo/h3_silu_temb_grid.safetensors}"
+# Frozen de-distillation assistant applied during TRAINING forwards only (ostris
+# minimax_h3_training_adapter). Detached for previews, never merged into saves.
+# Empty = off (training unchanged). PATH or PATH:strength. Tags runs -dedistill.
+TRAIN_LORA_OVERLAY="${TRAIN_LORA_OVERLAY:-}"
 
 if [[ ! "$H3_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "H3_NAME may only contain letters, numbers, dot, underscore, and dash: $H3_NAME" >&2
@@ -208,6 +213,9 @@ fi
 if [[ "$OPTIMIZER" == prodigy && "$WEIGHT_DECAY" != 0.005 ]]; then
     AB_SUFFIX+="-wd${WEIGHT_DECAY}"
 fi
+if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
+    AB_SUFFIX+="-dedistill"
+fi
 RUN_NAME="${H3_NAME}${FRAME_SUFFIX}${AUDIO_SUFFIX}${TIMESTEP_SUFFIX}${AB_SUFFIX}-${LORA_TAG}-r${NETWORK_DIM}-${TIMESTEP_PRESET}-${IMAGE_AUDIO_MODE}-${OPTIMIZER}"
 OUTPUT_DIR="${OUTPUT_DIR:-/home/pyro/models/_out/h3/$RUN_NAME}"
 
@@ -223,6 +231,20 @@ for path in "$DIT" "$DATASET_TOML"; do
         exit 1
     fi
 done
+
+TRAIN_OVERLAY_ARGS=()
+if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
+    if [[ "$TRAIN_LORA_OVERLAY" =~ ^(.+):[0-9.]+$ ]]; then
+        TRAIN_OVERLAY_PATH="${BASH_REMATCH[1]}"
+    else
+        TRAIN_OVERLAY_PATH="$TRAIN_LORA_OVERLAY"
+    fi
+    if [[ ! -f "$TRAIN_OVERLAY_PATH" ]]; then
+        echo "Missing TRAIN_LORA_OVERLAY file: $TRAIN_OVERLAY_PATH" >&2
+        exit 1
+    fi
+    TRAIN_OVERLAY_ARGS=(--train_lora_overlay "$TRAIN_LORA_OVERLAY")
+fi
 
 SAMPLE_ARGS=()
 if (( SAMPLE_EVERY > 0 )); then
@@ -343,6 +365,7 @@ exec "$ACCELERATE" launch \
     --network_alpha "$NETWORK_ALPHA" \
     --lora_target_preset "$LORA_PRESET" \
     "${OPT_ARGS[@]}" \
+    "${TRAIN_OVERLAY_ARGS[@]}" \
     --gradient_accumulation_steps "$GRAD_ACCUM" \
     --max_train_steps "$MAX_STEPS" \
     --save_every_n_steps "$SAVE_EVERY" --save_state --save_last_n_steps_state 2 \

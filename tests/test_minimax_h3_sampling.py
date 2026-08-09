@@ -893,3 +893,95 @@ def test_h3_overlay_split_qkv_matches_fused_delta():
     torch.testing.assert_close(got, expected)
     slo.clear_sampling_lora_overlays(model)
     torch.testing.assert_close(model.blocks[0].attn.qkv_proj(x), base)
+
+
+def test_h3_overlay_ai_toolkit_adapter_keys():
+    # The ostris minimax_h3_training_adapter format: diffusion_model. prefix,
+    # bare lora_A/lora_B suffixes (no .default.), fused qkv, no alpha keys.
+    from musubi_tuner.minimax_h3 import sampling_lora_overlay as slo
+
+    sd = {
+        "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight": torch.randn(2, 4),
+        "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight": torch.randn(12, 2),
+        "diffusion_model.token_refiner.blocks.1.mlp.fc1.lora_A.weight": torch.randn(2, 4),
+        "diffusion_model.token_refiner.blocks.1.mlp.fc1.lora_B.weight": torch.randn(16, 2),
+    }
+    modules = slo.normalize_overlay_state_dict(sd)
+
+    assert set(modules) == {"blocks.0.attn.qkv_proj", "token_refiner.blocks.1.mlp.fc1"}
+    entry = modules["blocks.0.attn.qkv_proj"][0]
+    assert entry["alpha"] is None and entry["offset"] is None
+    # alpha-less PEFT-style export => scale is the strength verbatim
+    assert slo._module_scale(entry, 0.7) == pytest.approx(0.7)
+
+
+def test_h3_train_overlay_lifecycle(tmp_path):
+    import safetensors.torch
+
+    from musubi_tuner.minimax_h3_train_network import _parse_overlay_spec
+
+    assert _parse_overlay_spec("/a/b.safetensors") == ("/a/b.safetensors", 1.0)
+    assert _parse_overlay_spec("/a/b.safetensors:0.5") == ("/a/b.safetensors", 0.5)
+
+    torch.manual_seed(0)
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            block = torch.nn.Module()
+            block.mlp = torch.nn.Module()
+            block.mlp.fc1 = torch.nn.Linear(4, 8, bias=False)
+            self.blocks = torch.nn.ModuleList([block])
+
+        def forward(self, x):
+            return self.blocks[0].mlp.fc1(x)
+
+    model = Tiny()
+    # Simulate the trainable network's forward wrapper (kohya LoRA apply_to).
+    fc1 = model.blocks[0].mlp.fc1
+    base_forward = fc1.forward
+    fc1.forward = lambda x: base_forward(x) + 1.0
+
+    down, up = torch.randn(2, 4), torch.randn(8, 2)
+    adapter_path = tmp_path / "adapter.safetensors"
+    safetensors.torch.save_file(
+        {
+            "diffusion_model.blocks.0.mlp.fc1.lora_A.weight": down.to(torch.bfloat16),
+            "diffusion_model.blocks.0.mlp.fc1.lora_B.weight": up.to(torch.bfloat16),
+        },
+        str(adapter_path),
+    )
+
+    trainer = MiniMaxH3NetworkTrainer()
+    accelerator = SimpleNamespace(print=lambda *a, **k: None, unwrap_model=lambda m: m)
+    args = SimpleNamespace(train_lora_overlay=f"{adapter_path}:0.5")
+
+    x = torch.randn(3, 4, requires_grad=True)
+    wrapped_out = model(x)
+
+    trainer._ensure_train_overlay(args, accelerator, model)
+    overlaid = model(x)
+    bf = torch.bfloat16
+    expected_delta = 0.5 * (x.to(bf) @ down.to(bf).T @ up.to(bf).T).to(overlaid.dtype)
+    torch.testing.assert_close(overlaid, wrapped_out + expected_delta, rtol=2e-2, atol=2e-2)
+    assert overlaid.grad_fn is not None  # frozen assistant must not block autograd
+
+    # Previews detach the assistant but must restore the TRAINED wrapper, not the bare module.
+    trainer._detach_train_overlay(accelerator, model)
+    torch.testing.assert_close(model(x), wrapped_out)
+    assert trainer._train_overlay_attached is False
+
+    # The next training step lazily re-attaches from the already-normalized tensors.
+    trainer._ensure_train_overlay(args, accelerator, model)
+    torch.testing.assert_close(model(x), overlaid)
+
+
+def test_h3_train_overlay_off_by_default():
+    trainer = MiniMaxH3NetworkTrainer()
+    accelerator = SimpleNamespace(print=lambda *a, **k: None, unwrap_model=lambda m: m)
+    model = torch.nn.Linear(2, 2)
+
+    trainer._ensure_train_overlay(SimpleNamespace(train_lora_overlay=None), accelerator, model)
+
+    assert not getattr(trainer, "_train_overlay_attached", False)
+    assert not hasattr(model, "_h3_sampling_overlay_orig_forward")
