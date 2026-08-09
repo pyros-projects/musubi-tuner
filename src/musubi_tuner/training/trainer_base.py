@@ -1476,6 +1476,14 @@ class NetworkTrainer:
         """
         return {}
 
+    def extra_postfix_logs(self, args: argparse.Namespace, accelerator, network, transformer) -> dict:
+        """Returns additional entries for the per-step progress-bar postfix.
+
+        Called after the optimizer step alongside the dw metrics. Keep entries
+        short — this renders on every step. Default: empty dict.
+        """
+        return {}
+
     # endregion extension seams
 
     def train(self, args):
@@ -2314,6 +2322,7 @@ class NetworkTrainer:
                     logs["dw"] = round(delta_w, 1)
                     if "hot_block" in delta_w_stats:
                         logs["dwhot"] = f"{delta_w_stats['hot_block']}x{delta_w_stats['hot_ratio']:.1f}"
+                logs.update(self.extra_postfix_logs(args, accelerator, network, transformer))
                 step_logs = None
                 if args.optimizer_type.lower().endswith("prodigyplusschedulefree"):
                     step_logs = self.generate_step_logs(

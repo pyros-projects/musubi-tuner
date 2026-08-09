@@ -451,6 +451,51 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             sampling_lora_overlay.clear_sampling_lora_overlays(accelerator.unwrap_model(transformer))
             self._train_overlay_attached = False
 
+    @torch.no_grad()
+    def _adapter_cosine(self, network, transformer) -> float | None:
+        """Global cosine between the trained LoRA delta and the attached training
+        adapter's delta (Gram cross-terms; deltas never materialized). Negative =
+        the LoRA is absorbing an anti-adapter component that corrupts the plain
+        base at inference — the de-distillation collapse fingerprint."""
+        if not getattr(self, "_train_overlay_attached", False):
+            return None
+        loras_by_name = {lora.lora_name: lora for lora in getattr(network, "unet_loras", None) or []}
+        if not loras_by_name:
+            return None
+        num = l2 = a2 = None
+        for path, module in transformer.named_modules():
+            entries = sampling_lora_overlay.get_module_adapters(module)
+            lora = loras_by_name.get("lora_unet_" + path.replace(".", "_")) if entries else None
+            if lora is None or getattr(lora, "lora_up", None) is None:
+                continue
+            ul, dl = lora.lora_up.weight.float(), lora.lora_down.weight.float()
+            if ul.ndim != 2 or dl.ndim != 2:
+                continue
+            for entry in entries:
+                ua, da = entry["up"], entry["down"]
+                if ua.device != ul.device or entry.get("offset") is not None:
+                    continue
+                uaf, daf = ua.float(), da.float()
+                inner = ((ul.T @ uaf) * (dl @ daf.T)).sum()
+                ln = ((ul.T @ ul) * (dl @ dl.T)).sum()
+                an = ((uaf.T @ uaf) * (daf @ daf.T)).sum()
+                num = inner if num is None else num + inner
+                l2 = ln if l2 is None else l2 + ln
+                a2 = an if a2 is None else a2 + an
+        if num is None:
+            return None
+        denominator = (l2 * a2).clamp_min(1e-24).sqrt()
+        return float((num / denominator).item())
+
+    def extra_postfix_logs(self, args, accelerator, network, transformer) -> dict:
+        cosine = self._adapter_cosine(accelerator.unwrap_model(network), accelerator.unwrap_model(transformer))
+        self._last_adapter_cos = cosine
+        return {} if cosine is None else {"acos": round(cosine, 4)}
+
+    def extra_step_logs(self, args, logs) -> dict:
+        cosine = getattr(self, "_last_adapter_cos", None)
+        return {} if cosine is None else {"network/adapter_cos": cosine}
+
     def on_before_sample_images(self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype):
         self._detach_train_overlay(accelerator, transformer)
         self._sample_network_was_training = network.training

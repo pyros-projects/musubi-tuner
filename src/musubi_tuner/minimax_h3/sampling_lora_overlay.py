@@ -308,6 +308,11 @@ def update_time_state(model: torch.nn.Module, sigma_video: torch.Tensor | float)
     shared["silu_temb"] = torch.stack(rows)
 
 
+def get_module_adapters(module: torch.nn.Module) -> list[dict] | None:
+    """Overlay adapters currently attached to a module (None when unpatched)."""
+    return getattr(module, _ADAPTERS_ATTR, None)
+
+
 def clear_sampling_lora_overlays(model: torch.nn.Module) -> int:
     cleared = 0
     for module in model.modules():

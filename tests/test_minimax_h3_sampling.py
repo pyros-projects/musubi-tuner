@@ -985,3 +985,53 @@ def test_h3_train_overlay_off_by_default():
 
     assert not getattr(trainer, "_train_overlay_attached", False)
     assert not hasattr(model, "_h3_sampling_overlay_orig_forward")
+
+
+def test_h3_adapter_cosine_flags_anti_adapter(tmp_path):
+    import safetensors.torch
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            block = torch.nn.Module()
+            block.mlp = torch.nn.Module()
+            block.mlp.fc1 = torch.nn.Linear(6, 8, bias=False)
+            self.blocks = torch.nn.ModuleList([block])
+
+    torch.manual_seed(0)
+    da, ua = torch.randn(3, 6), torch.randn(8, 3)
+    adapter_path = tmp_path / "adapter.safetensors"
+    safetensors.torch.save_file(
+        {
+            "diffusion_model.blocks.0.mlp.fc1.lora_A.weight": da,
+            "diffusion_model.blocks.0.mlp.fc1.lora_B.weight": ua,
+        },
+        str(adapter_path),
+    )
+
+    class FakeLora(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_name = "lora_unet_blocks_0_mlp_fc1"
+            self.lora_down = torch.nn.Linear(6, 3, bias=False)
+            self.lora_up = torch.nn.Linear(3, 8, bias=False)
+            with torch.no_grad():
+                self.lora_down.weight.copy_(da)
+                self.lora_up.weight.copy_(-ua)  # exact anti-adapter delta
+
+    class FakeNetwork:
+        unet_loras = [FakeLora()]
+
+    model = Tiny()
+    trainer = MiniMaxH3NetworkTrainer()
+    accelerator = SimpleNamespace(print=lambda *a, **k: None, unwrap_model=lambda m: m)
+    args = SimpleNamespace(train_lora_overlay=str(adapter_path))
+
+    assert trainer._adapter_cosine(FakeNetwork(), model) is None  # overlay not attached
+    assert trainer.extra_postfix_logs(args, accelerator, FakeNetwork(), model) == {}
+    assert trainer.extra_step_logs(args, {}) == {}
+
+    trainer._ensure_train_overlay(args, accelerator, model)
+    assert trainer._adapter_cosine(FakeNetwork(), model) == pytest.approx(-1.0, abs=1e-4)
+    assert trainer.extra_postfix_logs(args, accelerator, FakeNetwork(), model)["acos"] == pytest.approx(-1.0, abs=1e-3)
+    assert trainer.extra_step_logs(args, {})["network/adapter_cos"] == pytest.approx(-1.0, abs=1e-4)
