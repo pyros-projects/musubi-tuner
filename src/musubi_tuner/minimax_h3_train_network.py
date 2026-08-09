@@ -673,14 +673,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             uncond_embed, uncond_tags = self._get_uncond_context(args, accelerator, network_dtype)
             # The training-mode block-swap offloader coordinates forward+backward, so
             # the extra no-grad forward runs in forward-only swap mode BEFORE the grad
-            # forward — both residency switches happen while no backward is pending.
+            # forward. No prepare calls: post-backward residency already IS the
+            # pre-forward state, and a forward-only walk restores it on exit — the
+            # full prepare (device sync + empty_cache, twice per micro-batch) was the
+            # 4x slowdown. Only the cheap mode toggles remain.
             model = accelerator.unwrap_model(transformer)
-            model.switch_block_swap_for_inference()
+            offloader = getattr(model, "offloader", None) if getattr(model, "blocks_to_swap", 0) else None
+            if offloader is not None:
+                offloader.set_forward_only(True)
             with torch.no_grad(), accelerator.autocast():
                 uncond_video, uncond_audio = transformer(
                     noisy_video, noisy_audio, sigma_video, [uncond_embed] * len(contexts), [uncond_tags] * len(contexts)
                 )
-            model.switch_block_swap_for_training()
+            if offloader is not None:
+                offloader.set_forward_only(False)
 
         with accelerator.autocast():
             pred_video, pred_audio = transformer(noisy_video, noisy_audio, sigma_video, contexts, tags)
