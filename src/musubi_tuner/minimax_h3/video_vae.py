@@ -10,6 +10,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from musubi_tuner.minimax_h3.minimax_h3_utils import load_selected_weights, resolve_safetensor_files
+from musubi_tuner.modules.int8_optimization_utils import Int8ConvRotConfig, apply_int8_convrot_monkey_patch
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
+
+import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Decoder architecture follows the Apache-2.0 MiniMax-H3 implementation from
 # Hugging Face Diffusers PR #14355 (commit abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc).
@@ -738,6 +745,41 @@ def load_video_vae(
     return model
 
 
+def inspect_vae_int8_layers(files, *, scope: str = "decoder.") -> dict[str, Int8ConvRotConfig]:
+    """Scan comfy_quant markers in a VAE checkpoint (kijai INT8 ConvRot layout).
+
+    Only ``scope``-prefixed 2-D Linears are returned; anything else quantized
+    is rejected so a partially-supported file fails loudly, not silently.
+    """
+    layers: dict[str, Int8ConvRotConfig] = {}
+    for filename in files:
+        with MemoryEfficientSafeOpen(str(filename)) as reader:
+            for marker_key in (key for key in reader.keys() if key.endswith(".comfy_quant")):
+                module_name = marker_key[: -len(".comfy_quant")]
+                if not module_name.startswith(scope):
+                    continue
+                try:
+                    marker = reader.get_tensor(marker_key, device=torch.device("cpu"))
+                    config = json.loads(marker.numpy().tobytes())
+                except Exception as exc:
+                    raise ValueError(f"Invalid Comfy quantization marker {marker_key} in {filename}") from exc
+                params = config.get("params", {}) if isinstance(config.get("params", {}), dict) else {}
+                if config.get("format") != "int8_tensorwise" or not config.get("convrot", params.get("convrot", False)):
+                    raise ValueError(
+                        f"H3 VAE INT8 support covers only INT8 ConvRot layers; {module_name} uses {config.get('format')!r}"
+                    )
+                weight_key, scale_key = f"{module_name}.weight", f"{module_name}.weight_scale"
+                if reader.header.get(weight_key, {}).get("dtype") != "I8" or scale_key not in reader.header:
+                    raise ValueError(f"INT8 ConvRot VAE layer {module_name} is missing I8 weight or weight_scale")
+                if len(reader.header[weight_key]["shape"]) != 2:
+                    raise ValueError(f"INT8 ConvRot VAE layer {module_name} must have a 2-D weight")
+                layers[module_name] = Int8ConvRotConfig(
+                    group_size=int(config.get("convrot_groupsize", params.get("convrot_groupsize", 256))),
+                    scale_shape=tuple(reader.header[scale_key]["shape"]),
+                )
+    return layers
+
+
 def load_video_vae_decoder(
     path: str,
     *,
@@ -748,15 +790,36 @@ def load_video_vae_decoder(
     tiling: bool = True,
     disable_numpy_memmap: bool = False,
 ) -> MiniMaxH3VideoDecoder:
-    """Load only the decoder half needed for scheduled training previews."""
+    """Load only the decoder half needed for scheduled training previews.
 
+    Accepts the fp16/fp32 checkpoint or kijai's INT8 ConvRot quantization
+    (auto-detected). INT8 halves the decoder transformer's resident weights
+    and runs its Linears through comfy-kitchen — a speed/memory-over-quality
+    trade intended for previews, never for latent caching.
+    """
+
+    files = resolve_safetensor_files(path, "video_vae")
+    int8_layers = inspect_vae_int8_layers(files)
     with torch.device("meta"):
         model = MiniMaxH3VideoDecoder(tile_size, tile_overlap, tiling)
+    if int8_layers:
+        apply_int8_convrot_monkey_patch(model, int8_layers)
+        logger.info("Loading INT8 ConvRot H3 video decoder (%d quantized Linears)", len(int8_layers))
+    int8_weight_keys = {f"{name}.weight" for name in int8_layers}
+    int8_scale_keys = {f"{name}.weight_scale" for name in int8_layers}
+
+    def target_dtype(key: str) -> torch.dtype:
+        if key in int8_weight_keys:
+            return torch.int8
+        if key in int8_scale_keys:
+            return torch.float32
+        return dtype
+
     load_selected_weights(
         model,
-        resolve_safetensor_files(path, "video_vae"),
+        files,
         device=device,
-        dtype=dtype,
+        dtype=target_dtype if int8_layers else dtype,
         disable_numpy_memmap=disable_numpy_memmap,
     )
     model.pixel_mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1, 1)

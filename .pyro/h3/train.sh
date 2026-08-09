@@ -17,6 +17,10 @@ DIT="${DIT:-/home/pyro/models/comfy/diffusion_models/minimax_h3_fl2va_pruned_int
 TEXT_ENCODER="${TEXT_ENCODER:-/home/pyro/models/comfy/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors}"
 VAE="${VAE:-/home/pyro/models/comfy/vae/minimax_h3_video_vae_fp16.safetensors}"
 AUDIO_VAE="${AUDIO_VAE:-/home/pyro/models/comfy/vae/minimax_h3_audio_vae_fp32.safetensors}"
+# Preview-decode VAE (previews only — caching always uses $VAE). Point at
+# kijai's minimax_h3_video_vae_int8_convrot.safetensors for faster/leaner
+# preview decodes when speed matters more than preview fidelity.
+SAMPLE_VAE="${SAMPLE_VAE:-$VAE}"
 
 H3_NAME="${H3_NAME:-bb}"
 CACHE_DATASET="${CACHE_DATASET:-1}"
@@ -24,14 +28,14 @@ MAX_STEPS="${MAX_STEPS:-2000}"
 SAVE_EVERY="${SAVE_EVERY:-50}"
 SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
 SAMPLE_PROMPTS="${SAMPLE_PROMPTS:-.pyro/h3/cfg/p_${H3_NAME}.toml}"
-GRAD_ACCUM="${GRAD_ACCUM:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-2}"
 NETWORK_DIM="${NETWORK_DIM:-32}"
 NETWORK_ALPHA="${NETWORK_ALPHA:-$NETWORK_DIM}"
 LORA_PRESET="${LORA_PRESET:-no_packed_attn}" # attn, attn_mlp, no_packed_attn, or full
 OPTIMIZER="${OPTIMIZER:-adamw_optimi}"  # adamw8bit | adafactor | prodigy | adamw_optimi
 LEARNING_RATE="${LEARNING_RATE:-}"   # empty = optimizer-specific default
 BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-6}"
-SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-28}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
+SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-25}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
 CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-8}"
 CACHE_TEXT_BATCH_SIZE="${CACHE_TEXT_BATCH_SIZE:-1}"
 IMAGE_FRAME_COUNT="${IMAGE_FRAME_COUNT:-1}"
@@ -161,7 +165,7 @@ case "$OPTIMIZER" in
         LEARNING_RATE="${LEARNING_RATE:-2e-4}"
         OPT_ARGS=(
             --optimizer_type optimi.AdamW
-            --optimizer_args "betas=(0.9,0.99)" "weight_decay=0.0" "eps=1e-8"
+            --optimizer_args "betas=(0.9,0.99)" "weight_decay=0.001" "eps=1e-8"
             --learning_rate "$LEARNING_RATE"
             --lr_scheduler constant
         )
@@ -248,15 +252,14 @@ fi
 
 SAMPLE_ARGS=()
 if (( SAMPLE_EVERY > 0 )); then
-    for path in "$VAE" "$SAMPLE_PROMPTS"; do
+    for path in "$SAMPLE_VAE" "$SAMPLE_PROMPTS"; do
         if [[ ! -f "$path" ]]; then
             echo "Missing H3 preview file: $path" >&2
             exit 1
         fi
     done
     SAMPLE_ARGS=(
-        --vae "$VAE"
-        --sample_at_first
+        --vae "$SAMPLE_VAE"
         --vae_dtype float16
         --sample_prompts "$SAMPLE_PROMPTS"
         --sample_every_n_steps "$SAMPLE_EVERY"

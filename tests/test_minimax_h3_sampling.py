@@ -1035,3 +1035,71 @@ def test_h3_adapter_cosine_flags_anti_adapter(tmp_path):
     assert trainer._adapter_cosine(FakeNetwork(), model) == pytest.approx(-1.0, abs=1e-4)
     assert trainer.extra_postfix_logs(args, accelerator, FakeNetwork(), model)["acos"] == pytest.approx(-1.0, abs=1e-3)
     assert trainer.extra_step_logs(args, {})["network/adapter_cos"] == pytest.approx(-1.0, abs=1e-4)
+
+
+def test_h3_vae_int8_marker_scan(tmp_path):
+    import safetensors.torch
+
+    from musubi_tuner.minimax_h3.video_vae import inspect_vae_int8_layers
+
+    def marker(payload):
+        import json as _json
+
+        return torch.frombuffer(bytearray(_json.dumps(payload).encode()), dtype=torch.uint8).clone()
+
+    path = tmp_path / "vae_int8.safetensors"
+    safetensors.torch.save_file(
+        {
+            "decoder.transformer_blocks.0.attn.to_out.comfy_quant": marker(
+                {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
+            ),
+            "decoder.transformer_blocks.0.attn.to_out.weight": torch.zeros(8, 256, dtype=torch.int8),
+            "decoder.transformer_blocks.0.attn.to_out.weight_scale": torch.ones(8, 1),
+            # encoder-side quantization must be ignored by the decoder loader
+            "encoder.blocks.0.proj.comfy_quant": marker(
+                {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
+            ),
+            "encoder.blocks.0.proj.weight": torch.zeros(4, 256, dtype=torch.int8),
+            "encoder.blocks.0.proj.weight_scale": torch.ones(4, 1),
+            "decoder.conv.weight": torch.zeros(2, 2, 1, 1, 1),
+        },
+        str(path),
+    )
+
+    layers = inspect_vae_int8_layers([path])
+
+    assert set(layers) == {"decoder.transformer_blocks.0.attn.to_out"}
+    config = layers["decoder.transformer_blocks.0.attn.to_out"]
+    assert config.group_size == 256
+    assert config.scale_shape == (8, 1)
+
+    # unsupported formats fail loudly instead of silently loading garbage
+    bad = tmp_path / "vae_bad.safetensors"
+    safetensors.torch.save_file(
+        {
+            "decoder.x.comfy_quant": marker({"format": "fp8_scaled"}),
+            "decoder.x.weight": torch.zeros(4, 256, dtype=torch.int8),
+            "decoder.x.weight_scale": torch.ones(4, 1),
+        },
+        str(bad),
+    )
+    with pytest.raises(ValueError, match="INT8 ConvRot"):
+        inspect_vae_int8_layers([bad])
+
+
+@pytest.mark.skipif(
+    not __import__("os").path.exists("/home/pyro/models/comfy/vae/minimax_h3_video_vae_int8_convrot.safetensors"),
+    reason="local kijai INT8 VAE not present",
+)
+def test_h3_vae_int8_decoder_loads_real_checkpoint():
+    from musubi_tuner.minimax_h3.video_vae import load_video_vae_decoder
+
+    model = load_video_vae_decoder(
+        "/home/pyro/models/comfy/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+        device="cpu",
+        dtype=torch.float16,
+    )
+    quantized = [m for m in model.modules() if getattr(m, "int8_convrot_group_size", None)]
+    assert len(quantized) == 144
+    assert all(m.weight.dtype == torch.int8 for m in quantized)
+    assert all(m.weight_scale.dtype == torch.float32 for m in quantized)
