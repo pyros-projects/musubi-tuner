@@ -569,14 +569,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     @staticmethod
     def _apply_cfg_augmentation(pred: torch.Tensor, uncond: torch.Tensor, scale: float) -> torch.Tensor:
-        """Compose the fitted quantity in CFG space (diffusion-pipe technique).
-
-        The loss fits ``uncond + scale * (pred - uncond)`` against the ordinary
-        flow target while the uncond branch carries no gradient, so the raw
-        conditional output stays in the base model's distilled convention —
-        training never un-distills the guidance.
+        """Recover the raw conditional velocity from the guidance-distilled output
+        (diffusion-pipe technique): fit ``(pred + (scale-1)*uncond) / scale`` — the
+        rearranged CFG equation — against the ordinary flow target, uncond carrying
+        no gradient. At convergence the raw output stays ``uncond + scale*(target -
+        uncond)``, i.e. the distilled convention is preserved. (The amplifying
+        direction is exactly wrong: it trains the model to strip its guidance.)
         """
-        return uncond + scale * (pred - uncond)
+        return (pred + (scale - 1.0) * uncond) / scale
 
     def _get_uncond_context(self, args, accelerator, network_dtype):
         cached = getattr(self, "_cfg_uncond_context", None)
@@ -774,9 +774,9 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         "--cfg_augmented_scale",
         type=float,
         default=1.0,
-        help="CFG-augmented training (diffusion-pipe): fit uncond + s*(pred - uncond) with a no-grad empty-prompt "
-        "forward so training preserves the model's guidance distillation. 1.0 = off; 4.0 recommended. "
-        "Needs the --precache_uncond cache; mutually exclusive with --train_lora_overlay",
+        help="CFG-augmented training (diffusion-pipe): fit (pred + (s-1)*uncond)/s — the de-amplified raw velocity — "
+        "with a no-grad empty-prompt forward so training preserves the model's guidance distillation. 1.0 = off; "
+        "4.0 recommended. Needs the --precache_uncond cache; mutually exclusive with --train_lora_overlay",
     )
     parser.add_argument(
         "--train_lora_overlay",

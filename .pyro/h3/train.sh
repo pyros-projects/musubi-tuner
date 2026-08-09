@@ -34,7 +34,7 @@ NETWORK_ALPHA="${NETWORK_ALPHA:-$NETWORK_DIM}"
 LORA_PRESET="${LORA_PRESET:-no_packed_attn}" # attn, attn_mlp, no_packed_attn, mlp (style: no text refiner), or full
 OPTIMIZER="${OPTIMIZER:-adamw_optimi}"  # adamw8bit | adafactor | prodigy | adamw_optimi
 LEARNING_RATE="${LEARNING_RATE:-}"   # empty = optimizer-specific default
-BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-4}"
+BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-6}"
 SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-25}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
 CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-8}"
 CACHE_TEXT_BATCH_SIZE="${CACHE_TEXT_BATCH_SIZE:-1}"
@@ -70,9 +70,10 @@ SAMPLE_LORA_TEMB_GRID="${SAMPLE_LORA_TEMB_GRID:-$COMFYUI_DIR/custom_nodes/comfyu
 # minimax_h3_training_adapter). Detached for previews, never merged into saves.
 # Empty = off (training unchanged). PATH or PATH:strength. Tags runs -dedistill.
 TRAIN_LORA_OVERLAY="${TRAIN_LORA_OVERLAY:-}"
-# CFG-augmented training (diffusion-pipe technique): fits uncond + s*(pred-uncond)
-# with a no-grad empty-prompt forward each step, preserving the model's guidance
-# distillation by construction. 0/1 = off, 4 = recommended. ~+1/3 step time.
+# CFG-augmented training (diffusion-pipe technique): fits the de-amplified raw
+# velocity (pred + (s-1)*uncond)/s with a no-grad empty-prompt forward each step,
+# preserving the model's guidance distillation by construction. 0/1 = off,
+# 4 = recommended. Gradients scale by 1/s, so dw grows ~s-times slower.
 # Mutually exclusive with TRAIN_LORA_OVERLAY. Tags runs -cfgaugN.
 CFG_AUGMENTED_SCALE="${CFG_AUGMENTED_SCALE:-0}"
 

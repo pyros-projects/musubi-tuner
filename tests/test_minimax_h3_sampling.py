@@ -1112,9 +1112,10 @@ def test_h3_cfg_augmentation_math_and_gradients():
 
     out = trainer._apply_cfg_augmentation(pred, uncond, 4.0)
 
-    torch.testing.assert_close(out, torch.tensor([5.0, 13.0]))  # uncond + 4*(pred-uncond)
+    # (pred + 3*uncond)/4 — the rearranged CFG equation (diffusion-pipe direction)
+    torch.testing.assert_close(out, torch.tensor([1.25, 1.75]))
     out.sum().backward()
-    torch.testing.assert_close(pred.grad, torch.full((2,), 4.0))  # cond branch scaled by s
+    torch.testing.assert_close(pred.grad, torch.full((2,), 0.25))  # cond branch scaled by 1/s
     assert not uncond.requires_grad
 
 
