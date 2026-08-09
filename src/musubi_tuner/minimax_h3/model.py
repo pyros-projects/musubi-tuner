@@ -10,6 +10,7 @@ layouts so either BF16 distribution can be loaded without a key conversion.
 
 from __future__ import annotations
 
+import contextlib
 from contextlib import contextmanager
 import math
 
@@ -455,6 +456,9 @@ class MiniMaxH3Model(nn.Module):
         self.gradient_checkpointing = False
         self.blocks_to_swap = 0
         self.offloader = None
+        self._offload_activations = False
+        self._offload_min_bytes = 1 << 20
+        self._pinned_pool: dict[tuple, list] = {}
 
     def enable_gradient_checkpointing(self, cpu_offload: bool = False):
         self.gradient_checkpointing = True
@@ -479,6 +483,40 @@ class MiniMaxH3Model(nn.Module):
     def prepare_block_swap_before_forward(self):
         if self.blocks_to_swap:
             self.offloader.prepare_block_devices_before_forward(self.blocks)
+
+    def enable_activation_offload(self) -> None:
+        """Offload gradient-checkpoint boundary activations to pinned CPU RAM
+        (Unsloth-style). Trades a little PCIe traffic for ~[blocks x hidden]
+        of resident VRAM — batch-size headroom on 24GB cards."""
+        self._offload_activations = True
+
+    def _activation_offload_ctx(self):
+        if not (self._offload_activations and self.gradient_checkpointing and self.training):
+            return contextlib.nullcontext()
+        pool = self._pinned_pool
+        min_bytes = self._offload_min_bytes
+
+        def pack(tensor: torch.Tensor):
+            if not tensor.is_cuda or tensor.numel() * tensor.element_size() < min_bytes or not tensor.is_floating_point():
+                return tensor
+            key = (tuple(tensor.shape), tensor.dtype)
+            bucket = pool.setdefault(key, [])
+            pinned = bucket.pop() if bucket else torch.empty_like(tensor, device="cpu", pin_memory=True)
+            pinned.copy_(tensor, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+            return (pinned, event, tensor.device, key)
+
+        def unpack(packed):
+            if isinstance(packed, torch.Tensor):
+                return packed
+            pinned, event, device, key = packed
+            event.synchronize()
+            restored = pinned.to(device, non_blocking=True)
+            pool.setdefault(key, []).append(pinned)
+            return restored
+
+        return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
 
     @contextmanager
     def override_block_swap_for_sampling(self, sample_blocks_to_swap: int | None, device: torch.device):
@@ -630,17 +668,18 @@ class MiniMaxH3Model(nn.Module):
             time_embedding = self.time_embedder(time_values).to(compute_dtype)
         rope_angles = self.rope_angles(layout.position_ids, video.device)
 
-        for index, block in enumerate(self.blocks):
-            if self.blocks_to_swap:
-                self.offloader.wait_for_block(index)
-            if self.gradient_checkpointing and self.training:
-                hidden = torch.utils.checkpoint.checkpoint(
-                    block, hidden, time_embedding, modulation_rows, rope_angles, use_reentrant=False
-                )
-            else:
-                hidden = block(hidden, time_embedding, modulation_rows, rope_angles)
-            if self.blocks_to_swap:
-                self.offloader.submit_move_blocks_forward(self.blocks, index)
+        with self._activation_offload_ctx():
+            for index, block in enumerate(self.blocks):
+                if self.blocks_to_swap:
+                    self.offloader.wait_for_block(index)
+                if self.gradient_checkpointing and self.training:
+                    hidden = torch.utils.checkpoint.checkpoint(
+                        block, hidden, time_embedding, modulation_rows, rope_angles, use_reentrant=False
+                    )
+                else:
+                    hidden = block(hidden, time_embedding, modulation_rows, rope_angles)
+                if self.blocks_to_swap:
+                    self.offloader.submit_move_blocks_forward(self.blocks, index)
 
         video_rows, audio_rows = self.final_layer(
             hidden,
@@ -681,18 +720,19 @@ class MiniMaxH3Model(nn.Module):
 
         prep = self._prepare_packed_batch(video, audio, sigma_video, context, text_token_tags)
         hidden = prep["hidden"]
-        for index, block in enumerate(self.blocks):
-            if self.blocks_to_swap:
-                self.offloader.wait_for_block(index)
-            if self.gradient_checkpointing and self.training:
-                hidden = torch.utils.checkpoint.checkpoint(
-                    block, hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"],
-                    use_reentrant=False,
-                )
-            else:
-                hidden = block(hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"])
-            if self.blocks_to_swap:
-                self.offloader.submit_move_blocks_forward(self.blocks, index)
+        with self._activation_offload_ctx():
+            for index, block in enumerate(self.blocks):
+                if self.blocks_to_swap:
+                    self.offloader.wait_for_block(index)
+                if self.gradient_checkpointing and self.training:
+                    hidden = torch.utils.checkpoint.checkpoint(
+                        block, hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"],
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden = block(hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"])
+                if self.blocks_to_swap:
+                    self.offloader.submit_move_blocks_forward(self.blocks, index)
         return self._finalize_packed(hidden, prep, video.dtype, audio.dtype)
 
     def forward_with_uncond(
@@ -721,26 +761,27 @@ class MiniMaxH3Model(nn.Module):
 
         hidden = prep["hidden"]
         uncond_hidden = uncond_prep["hidden"]
-        for index, block in enumerate(self.blocks):
-            if self.blocks_to_swap:
-                self.offloader.wait_for_block(index)
-            if self.gradient_checkpointing and self.training:
-                hidden = torch.utils.checkpoint.checkpoint(
-                    block, hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"],
-                    use_reentrant=False,
-                )
-            else:
-                hidden = block(hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"])
-            with torch.no_grad():
-                uncond_hidden = block(
-                    uncond_hidden,
-                    uncond_prep["time_embedding"],
-                    uncond_prep["modulation_rows"],
-                    uncond_prep["rope_angles"],
-                    uncond_prep["attn_mask"],
-                )
-            if self.blocks_to_swap:
-                self.offloader.submit_move_blocks_forward(self.blocks, index)
+        with self._activation_offload_ctx():
+            for index, block in enumerate(self.blocks):
+                if self.blocks_to_swap:
+                    self.offloader.wait_for_block(index)
+                if self.gradient_checkpointing and self.training:
+                    hidden = torch.utils.checkpoint.checkpoint(
+                        block, hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"],
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden = block(hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"])
+                with torch.no_grad():
+                    uncond_hidden = block(
+                        uncond_hidden,
+                        uncond_prep["time_embedding"],
+                        uncond_prep["modulation_rows"],
+                        uncond_prep["rope_angles"],
+                        uncond_prep["attn_mask"],
+                    )
+                if self.blocks_to_swap:
+                    self.offloader.submit_move_blocks_forward(self.blocks, index)
 
         cond_video, cond_audio = self._finalize_packed(hidden, prep, video.dtype, audio.dtype)
         with torch.no_grad():

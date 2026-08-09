@@ -1061,3 +1061,57 @@ def test_h3_fused_uncond_walk_matches_separate_forwards(batch):
     assert cv.grad_fn is not None and uv.grad_fn is None
     (cv.square().mean() + ca.square().mean()).backward()
     assert video_grad.grad is not None and torch.isfinite(video_grad.grad).all()
+
+
+def _grad_sum(model, video, audio, sigma, contexts, tags):
+    model.zero_grad(set_to_none=True)
+    out_v, out_a = model(video, audio, sigma, contexts, tags)
+    (out_v.square().mean() + out_a.square().mean()).backward()
+    return sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
+
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+def test_h3_activation_offload_preserves_gradients(device):
+    torch.manual_seed(3)
+    model = _tiny_h3_model().to(device).train()
+    model.gradient_checkpointing = True
+    video = torch.randn(2, 2, 1, 4, 6, device=device)
+    audio = torch.randn(2, 3, 2, 2, device=device)
+    sigma = torch.tensor([0.4, 0.7], device=device)
+    contexts = [torch.randn(1, 4, 8, device=device), torch.randn(1, 6, 8, device=device)]
+    tags = [torch.ones(4, dtype=torch.long, device=device), torch.ones(6, dtype=torch.long, device=device)]
+
+    baseline = _grad_sum(model, video, audio, sigma, contexts, tags)
+    model.enable_activation_offload()
+    model._offload_min_bytes = 0  # tiny-model activations are far below the production 1MB threshold
+    offloaded = _grad_sum(model, video, audio, sigma, contexts, tags)
+
+    assert offloaded == pytest.approx(baseline, rel=1e-4)
+    if device == "cuda":
+        assert model._pinned_pool  # boundary activations actually took the offload path
+
+
+def test_h3_upstream_compile_matches_eager_on_batched_path():
+    torch.manual_seed(4)
+    model = _tiny_h3_model()
+    video = torch.randn(2, 2, 1, 4, 6)
+    audio = torch.randn(2, 3, 2, 2)
+    sigma = torch.tensor([0.3, 0.6])
+    contexts = [torch.randn(1, 5, 8), torch.randn(1, 3, 8)]
+    tags = [torch.ones(5, dtype=torch.long), torch.ones(3, dtype=torch.long)]
+
+    with torch.no_grad():
+        eager_v, eager_a = model(video, audio, sigma, contexts, tags)
+
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.blocks_to_swap = 0
+    args = SimpleNamespace(
+        compile_backend="eager", compile_mode=None, compile_dynamic=None, compile_fullgraph=False,
+        compile_cache_size_limit=None,
+    )
+    trainer.compile_transformer(args, model)
+
+    with torch.no_grad():
+        compiled_v, compiled_a = model(video, audio, sigma, contexts, tags)
+    torch.testing.assert_close(compiled_v, eager_v, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(compiled_a, eager_a, rtol=1e-4, atol=1e-5)

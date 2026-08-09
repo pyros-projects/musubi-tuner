@@ -81,6 +81,14 @@ CFG_AUGMENTED_SCALE="${CFG_AUGMENTED_SCALE:-0}"
 # drifts toward 1/cfg as standard training un-distills). ~4 no-grad forwards
 # per measurement. 0 = off. 100 is a good cadence for cfg1-vs-cfg4 A/Bs.
 GUIDANCE_DRIFT_EVERY="${GUIDANCE_DRIFT_EVERY:-0}"
+# torch.compile the DiT blocks (upstream musubi infra; experimental). Biggest
+# gains on BF16 bases; INT8 layers graph-break around the kitchen kernels.
+# Note: preview overlay hooks trigger recompiles — best with SAMPLE_EVERY=0
+# draft runs. 0 = off.
+COMPILE="${COMPILE:-0}"
+# Unsloth-style checkpoint-activation offload to pinned CPU RAM: frees ~2.6GB
+# at batch 4 for batch-size headroom, costs a little PCIe traffic. 0 = off.
+OFFLOAD_ACTIVATIONS="${OFFLOAD_ACTIVATIONS:-0}"
 
 if [[ ! "$H3_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "H3_NAME may only contain letters, numbers, dot, underscore, and dash: $H3_NAME" >&2
@@ -272,6 +280,14 @@ if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
     TRAIN_OVERLAY_ARGS=(--train_lora_overlay "$TRAIN_LORA_OVERLAY")
 fi
 
+PERF_ARGS=()
+if [[ "$COMPILE" == 1 ]]; then
+    PERF_ARGS+=(--compile)
+fi
+if [[ "$OFFLOAD_ACTIVATIONS" == 1 ]]; then
+    PERF_ARGS+=(--offload_checkpoint_activations)
+fi
+
 GDRIFT_ARGS=()
 GDRIFT_ENABLED=0
 if [[ "$GUIDANCE_DRIFT_EVERY" =~ ^[0-9]+$ && "$GUIDANCE_DRIFT_EVERY" -gt 0 ]]; then
@@ -418,6 +434,7 @@ exec "$ACCELERATE" launch \
     "${TRAIN_OVERLAY_ARGS[@]}" \
     "${CFGAUG_ARGS[@]}" \
     "${GDRIFT_ARGS[@]}" \
+    "${PERF_ARGS[@]}" \
     --gradient_accumulation_steps "$GRAD_ACCUM" \
     --max_train_steps "$MAX_STEPS" \
     --save_every_n_steps "$SAVE_EVERY" --save_state --save_last_n_steps_state 2 \

@@ -550,6 +550,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
         model.sigma_shift_video = args.video_flow_shift
         model.sigma_shift_audio = args.audio_flow_shift
+        if getattr(args, "offload_checkpoint_activations", False):
+            model.enable_activation_offload()
+            accelerator.print("Checkpoint activation offload to pinned CPU enabled (Unsloth-style)")
         return model
 
     def compile_transformer(self, args, transformer):
@@ -814,6 +817,12 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         help="CFG-augmented training (diffusion-pipe): fit (pred + (s-1)*uncond)/s — the de-amplified raw velocity — "
         "with a no-grad empty-prompt forward so training preserves the model's guidance distillation. 1.0 = off; "
         "4.0 recommended. Needs the --precache_uncond cache; mutually exclusive with --train_lora_overlay",
+    )
+    parser.add_argument(
+        "--offload_checkpoint_activations",
+        action="store_true",
+        help="offload gradient-checkpoint boundary activations to pinned CPU RAM (Unsloth-style): frees "
+        "~blocks x [B,L,hidden] of VRAM for batch-size headroom at a little PCIe traffic",
     )
     parser.add_argument(
         "--guidance_drift_every",
