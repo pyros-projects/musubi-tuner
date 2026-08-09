@@ -35,6 +35,10 @@ H3_LORA_TARGET_PRESETS: dict[str, list[str] | None] = {
         r"token_refiner\.blocks\.[0-9]+\.mlp\.(fc1|fc2)$",
         r"blocks\.[0-9]+\.mlp\.(fc1|fc2)$",
     ],
+    # Main-stream MLPs only — no token_refiner. For style/rendering concepts whose
+    # tag-soup captions otherwise drift the text path (fox->cup bleed at refiner
+    # heat ~2x median, mandalas 2026-08-09).
+    "mlp": [r"blocks\.[0-9]+\.mlp\.(fc1|fc2)$"],
     "full": None,
 }
 
@@ -657,7 +661,8 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         default="attn_mlp",
         help=(
             "LoRA targets: attn (104), attn_mlp (208, portable default), "
-            "no_packed_attn (108), or full (258, checkpoint-layout specific)"
+            "no_packed_attn (108), mlp (100, main-stream MLPs only — no text refiner), "
+            "or full (258, checkpoint-layout specific)"
         ),
     )
     parser.add_argument(

@@ -31,7 +31,7 @@ SAMPLE_PROMPTS="${SAMPLE_PROMPTS:-.pyro/h3/cfg/p_${H3_NAME}.toml}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
 NETWORK_DIM="${NETWORK_DIM:-32}"
 NETWORK_ALPHA="${NETWORK_ALPHA:-$NETWORK_DIM}"
-LORA_PRESET="${LORA_PRESET:-no_packed_attn}" # attn, attn_mlp, no_packed_attn, or full
+LORA_PRESET="${LORA_PRESET:-no_packed_attn}" # attn, attn_mlp, no_packed_attn, mlp (style: no text refiner), or full
 OPTIMIZER="${OPTIMIZER:-adamw_optimi}"  # adamw8bit | adafactor | prodigy | adamw_optimi
 LEARNING_RATE="${LEARNING_RATE:-}"   # empty = optimizer-specific default
 BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-6}"
@@ -104,8 +104,8 @@ case "$SAMPLE_FRAME_SELECT" in
     *) echo "SAMPLE_FRAME_SELECT must be dup_last, first, last, or sharpest: $SAMPLE_FRAME_SELECT" >&2; exit 1 ;;
 esac
 case "$LORA_PRESET" in
-    attn|attn_mlp|no_packed_attn|full) ;;
-    *) echo "LORA_PRESET must be attn, attn_mlp, no_packed_attn, or full: $LORA_PRESET" >&2; exit 1 ;;
+    attn|attn_mlp|no_packed_attn|mlp|full) ;;
+    *) echo "LORA_PRESET must be attn, attn_mlp, no_packed_attn, mlp, or full: $LORA_PRESET" >&2; exit 1 ;;
 esac
 case "$TIMESTEP_PRESET" in
     image_v0)
