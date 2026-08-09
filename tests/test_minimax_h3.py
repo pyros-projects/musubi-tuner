@@ -1029,3 +1029,35 @@ def test_h3_posthoc_ema_reproduces_identical_checkpoints(tmp_path):
         assert stats["energy_min"] > 0.999
         assert float(state_dict["lora_unet_blocks_0_mlp_fc1.alpha"]) == 2.0
         assert metadata["ss_base_model_version"] == "minimax_h3"
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+def test_h3_fused_uncond_walk_matches_separate_forwards(batch):
+    torch.manual_seed(2)
+    model = _tiny_h3_model()
+    video = torch.randn(batch, 2, 1, 4, 6)
+    audio = torch.randn(batch, 3, 2, 2)
+    sigma = torch.linspace(0.2, 0.8, batch)
+    contexts = [torch.randn(1, 4 + i, 8) for i in range(batch)]  # ragged
+    tags = [torch.ones(4 + i, dtype=torch.long) for i in range(batch)]
+    uncond_context = torch.randn(3, 8)
+    uncond_tags = torch.ones(3, dtype=torch.long)
+
+    with torch.no_grad():
+        fused_cv, fused_ca, fused_uv, fused_ua = model.forward_with_uncond(
+            video, audio, sigma, contexts, tags, uncond_context, uncond_tags
+        )
+        sep_cv, sep_ca = model._forward_batched(video, audio, sigma, contexts, tags)
+        sep_uv, sep_ua = model._forward_batched(video, audio, sigma, [uncond_context] * batch, [uncond_tags] * batch)
+
+    torch.testing.assert_close(fused_cv, sep_cv, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(fused_ca, sep_ca, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(fused_uv, sep_uv, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(fused_ua, sep_ua, rtol=1e-4, atol=1e-5)
+
+    # gradients: cond stream carries a graph, uncond never does
+    video_grad = video.clone().requires_grad_(True)
+    cv, ca, uv, ua = model.forward_with_uncond(video_grad, audio, sigma, contexts, tags, uncond_context, uncond_tags)
+    assert cv.grad_fn is not None and uv.grad_fn is None
+    (cv.square().mean() + ca.square().mean()).backward()
+    assert video_grad.grad is not None and torch.isfinite(video_grad.grad).all()

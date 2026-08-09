@@ -716,31 +716,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
 
         cfg_scale = float(getattr(args, "cfg_augmented_scale", 1.0) or 1.0)
-        uncond_video = uncond_audio = None
         if cfg_scale > 1.0:
+            # Fused walk: cond (grad, checkpointed) and empty-prompt (no-grad)
+            # streams share one pass through the swapped blocks — same math as
+            # two forwards at a single walk's swap cost, no residency toggles.
             uncond_embed, uncond_tags = self._get_uncond_context(args, accelerator, network_dtype)
-            # The training-mode block-swap offloader coordinates forward+backward, so
-            # the extra no-grad forward runs in forward-only swap mode BEFORE the grad
-            # forward. No prepare calls: post-backward residency already IS the
-            # pre-forward state, and a forward-only walk restores it on exit — the
-            # full prepare (device sync + empty_cache, twice per micro-batch) was the
-            # 4x slowdown. Only the cheap mode toggles remain.
-            model = accelerator.unwrap_model(transformer)
-            offloader = getattr(model, "offloader", None) if getattr(model, "blocks_to_swap", 0) else None
-            if offloader is not None:
-                offloader.set_forward_only(True)
-            with torch.no_grad(), accelerator.autocast():
-                uncond_video, uncond_audio = transformer(
-                    noisy_video, noisy_audio, sigma_video, [uncond_embed] * len(contexts), [uncond_tags] * len(contexts)
+            with accelerator.autocast():
+                pred_video, pred_audio, uncond_video, uncond_audio = accelerator.unwrap_model(transformer).forward_with_uncond(
+                    noisy_video, noisy_audio, sigma_video, contexts, tags, uncond_embed, uncond_tags
                 )
-            if offloader is not None:
-                offloader.set_forward_only(False)
-
-        with accelerator.autocast():
-            pred_video, pred_audio = transformer(noisy_video, noisy_audio, sigma_video, contexts, tags)
-        if uncond_video is not None:
             pred_video = self._apply_cfg_augmentation(pred_video, uncond_video, cfg_scale)
             pred_audio = self._apply_cfg_augmentation(pred_audio, uncond_audio, cfg_scale)
+        else:
+            with accelerator.autocast():
+                pred_video, pred_audio = transformer(noisy_video, noisy_audio, sigma_video, contexts, tags)
         target_video = clean_video - noise_video
         target_audio = clean_audio - noise_audio
         video_loss = self._weighted_mse(pred_video.to(network_dtype), target_video, sigma_video, args.weighting_scheme)

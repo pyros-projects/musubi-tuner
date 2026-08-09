@@ -679,6 +679,82 @@ class MiniMaxH3Model(nn.Module):
         serial path's sorted dedup — same selected values, batchable indexing.
         """
 
+        prep = self._prepare_packed_batch(video, audio, sigma_video, context, text_token_tags)
+        hidden = prep["hidden"]
+        for index, block in enumerate(self.blocks):
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(index)
+            if self.gradient_checkpointing and self.training:
+                hidden = torch.utils.checkpoint.checkpoint(
+                    block, hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"],
+                    use_reentrant=False,
+                )
+            else:
+                hidden = block(hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"])
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.blocks, index)
+        return self._finalize_packed(hidden, prep, video.dtype, audio.dtype)
+
+    def forward_with_uncond(
+        self,
+        video: torch.Tensor,
+        audio: torch.Tensor,
+        sigma_video: torch.Tensor,
+        context: torch.Tensor | list[torch.Tensor],
+        text_token_tags: torch.Tensor | list[torch.Tensor] | None,
+        uncond_context: torch.Tensor,
+        uncond_tags: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """CFG-augmented training forward: one block-swap walk carrying both the
+        conditional stream (gradient, checkpointed) and the empty-prompt stream
+        (no-grad) — identical math to two separate forwards at one walk's cost.
+
+        Returns ``(cond_video, cond_audio, uncond_video, uncond_audio)``.
+        """
+
+        batch = video.shape[0]
+        prep = self._prepare_packed_batch(video, audio, sigma_video, context, text_token_tags)
+        with torch.no_grad():
+            uncond_prep = self._prepare_packed_batch(
+                video, audio, sigma_video, [uncond_context] * batch, [uncond_tags] * batch
+            )
+
+        hidden = prep["hidden"]
+        uncond_hidden = uncond_prep["hidden"]
+        for index, block in enumerate(self.blocks):
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(index)
+            if self.gradient_checkpointing and self.training:
+                hidden = torch.utils.checkpoint.checkpoint(
+                    block, hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"],
+                    use_reentrant=False,
+                )
+            else:
+                hidden = block(hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"])
+            with torch.no_grad():
+                uncond_hidden = block(
+                    uncond_hidden,
+                    uncond_prep["time_embedding"],
+                    uncond_prep["modulation_rows"],
+                    uncond_prep["rope_angles"],
+                    uncond_prep["attn_mask"],
+                )
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.blocks, index)
+
+        cond_video, cond_audio = self._finalize_packed(hidden, prep, video.dtype, audio.dtype)
+        with torch.no_grad():
+            uncond_video, uncond_audio = self._finalize_packed(uncond_hidden, uncond_prep, video.dtype, audio.dtype)
+        return cond_video, cond_audio, uncond_video, uncond_audio
+
+    def _prepare_packed_batch(
+        self,
+        video: torch.Tensor,
+        audio: torch.Tensor,
+        sigma_video: torch.Tensor,
+        context: torch.Tensor | list[torch.Tensor],
+        text_token_tags: torch.Tensor | list[torch.Tensor] | None,
+    ) -> dict:
         batch = video.shape[0]
         if video.shape[-2] % self.patch_size[1] or video.shape[-1] % self.patch_size[2]:
             raise ValueError("H3 video latent height and width must be divisible by the spatial patch size")
@@ -760,22 +836,27 @@ class MiniMaxH3Model(nn.Module):
             key_mask[:, :text_max] = text_valid
             attn_mask = key_mask[:, None, None, :]
 
-        for index, block in enumerate(self.blocks):
-            if self.blocks_to_swap:
-                self.offloader.wait_for_block(index)
-            if self.gradient_checkpointing and self.training:
-                hidden = torch.utils.checkpoint.checkpoint(
-                    block, hidden, time_embedding, modulation_rows, rope_angles, attn_mask, use_reentrant=False
-                )
-            else:
-                hidden = block(hidden, time_embedding, modulation_rows, rope_angles, attn_mask)
-            if self.blocks_to_swap:
-                self.offloader.submit_move_blocks_forward(self.blocks, index)
+        return {
+            "hidden": hidden,
+            "time_embedding": time_embedding,
+            "modulation_rows": modulation_rows,
+            "rope_angles": rope_angles,
+            "attn_mask": attn_mask,
+            "layout": layout,
+            "n_times": n_times,
+            "latent_dims": (latent_t, latent_h, latent_w),
+        }
 
-        item_offsets = torch.arange(batch, device=video.device, dtype=torch.long) * n_times
+    def _finalize_packed(
+        self, hidden: torch.Tensor, prep: dict, video_dtype: torch.dtype, audio_dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        layout = prep["layout"]
+        latent_t, latent_h, latent_w = prep["latent_dims"]
+        batch = hidden.shape[0]
+        item_offsets = torch.arange(batch, device=hidden.device, dtype=torch.long) * prep["n_times"]
         video_rows, audio_rows = self.final_layer(
             hidden,
-            time_embedding,
+            prep["time_embedding"],
             layout.video_slice,
             layout.audio_slice,
             item_offsets,  # row 0 per item = video time
@@ -789,7 +870,7 @@ class MiniMaxH3Model(nn.Module):
             self.latents_dim,
             self.patch_size,
         )
-        return video_out.to(video.dtype), unpack_audio(audio_rows).to(audio.dtype)
+        return video_out.to(video_dtype), unpack_audio(audio_rows).to(audio_dtype)
 
     def forward(
         self,
