@@ -99,3 +99,35 @@ def test_network_delta_w_norm_matches_materialized():
 
     assert NetworkTrainer._network_delta_w_norm(NotLora()) is None
     assert NetworkTrainer._network_delta_w_norm(object()) is None
+
+
+def test_network_delta_w_stats_groups_blocks_and_flags_hot():
+    class FakeLora(torch.nn.Module):
+        def __init__(self, name, gain):
+            super().__init__()
+            self.lora_name = name
+            self.lora_down = torch.nn.Linear(4, 2, bias=False)
+            self.lora_up = torch.nn.Linear(2, 4, bias=False)
+            with torch.no_grad():
+                self.lora_down.weight.copy_(torch.eye(2, 4))
+                self.lora_up.weight.copy_(gain * torch.eye(4, 2))
+            self.scale = 1.0
+
+    # ||up @ down||_F = gain * sqrt(2) per module
+    class FakeNetwork:
+        unet_loras = [
+            FakeLora("lora_unet_blocks_0_mlp_fc1", 1.0),
+            FakeLora("lora_unet_blocks_0_mlp_fc2", 1.0),
+            FakeLora("lora_unet_blocks_1_mlp_fc1", 4.0),
+            FakeLora("lora_unet_token_refiner_blocks_0_attn_qkv_proj", 1.0),
+        ]
+        text_encoder_loras = []
+
+    stats = NetworkTrainer._network_delta_w_stats(FakeNetwork())
+
+    root2 = 2**0.5
+    assert abs(stats["total"] - 7 * root2) < 1e-4
+    # buckets: b0 = 2*sqrt(2), b1 = 4*sqrt(2), r0 = sqrt(2) -> median b0, hot b1
+    assert abs(stats["block_median"] - 2 * root2) < 1e-4
+    assert stats["hot_block"] == "b1"
+    assert abs(stats["hot_ratio"] - 2.0) < 1e-4

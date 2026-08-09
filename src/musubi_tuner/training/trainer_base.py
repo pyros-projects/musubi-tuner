@@ -116,15 +116,19 @@ class NetworkTrainer:
 
     @staticmethod
     @torch.no_grad()
-    def _network_delta_w_norm(network) -> Optional[float]:
-        """Sum of per-module ``||(alpha/rank) * up @ down||_F`` for kohya-style LoRA
+    def _network_delta_w_stats(network) -> Optional[dict]:
+        """Per-module ``||(alpha/rank) * up @ down||_F`` for kohya-style LoRA
         networks, computed via the Gram-matrix identity ``||UD||_F^2 =
-        sum((U^T U) * (D D^T))`` so the deltas are never materialized. Returns None
-        for network types without plain up/down Linear pairs (LoHa/LoKr/etc.)."""
+        sum((U^T U) * (D D^T))`` so the deltas are never materialized, then
+        aggregated per transformer block (Fizgig's caboose-effect metric —
+        also localizes which blocks a concept trains into). Returns None for
+        network types without plain up/down Linear pairs (LoHa/LoKr/etc.)."""
         loras = list(getattr(network, "unet_loras", None) or [])
         if not loras:
             return None
-        total = None
+        block_re = re.compile(r"(?:^|_)(token_refiner_blocks|blocks)_(\d+)_")
+        blocks: dict[str, float] = {}
+        total = 0.0
         for lora in loras:
             up = getattr(lora, "lora_up", None)
             down = getattr(lora, "lora_down", None)
@@ -136,9 +140,31 @@ class NetworkTrainer:
                 return None
             uu = u.transpose(0, 1).float() @ u.float()
             dd = d.float() @ d.transpose(0, 1).float()
-            norm = float(scale) * (uu * dd).sum().clamp_min(0.0).sqrt()
-            total = norm if total is None else total + norm
-        return float(total.item())
+            norm = float(float(scale) * (uu * dd).sum().clamp_min(0.0).sqrt().item())
+            total += norm
+            match = block_re.search(getattr(lora, "lora_name", "") or "")
+            if match:
+                label = ("r" if match.group(1).startswith("token_refiner") else "b") + match.group(2)
+            else:
+                label = "other"
+            blocks[label] = blocks.get(label, 0.0) + norm
+        stats = {"total": total}
+        if len(blocks) >= 2:
+            values = sorted(blocks.values())
+            median = values[len(values) // 2]
+            hot_block, block_max = max(blocks.items(), key=lambda kv: kv[1])
+            stats.update(
+                block_median=median,
+                block_max=block_max,
+                hot_block=hot_block,
+                hot_ratio=block_max / median if median > 0 else 0.0,
+            )
+        return stats
+
+    @staticmethod
+    def _network_delta_w_norm(network) -> Optional[float]:
+        stats = NetworkTrainer._network_delta_w_stats(network)
+        return None if stats is None else stats["total"]
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -2282,9 +2308,12 @@ class NetworkTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-                delta_w = self._network_delta_w_norm(accelerator.unwrap_model(network))
+                delta_w_stats = self._network_delta_w_stats(accelerator.unwrap_model(network))
+                delta_w = None if delta_w_stats is None else delta_w_stats["total"]
                 if delta_w is not None:
                     logs["dw"] = round(delta_w, 1)
+                    if "hot_block" in delta_w_stats:
+                        logs["dwhot"] = f"{delta_w_stats['hot_block']}x{delta_w_stats['hot_ratio']:.1f}"
                 step_logs = None
                 if args.optimizer_type.lower().endswith("prodigyplusschedulefree"):
                     step_logs = self.generate_step_logs(
@@ -2309,6 +2338,9 @@ class NetworkTrainer:
                     logs.update(loss_metrics)
                     if delta_w is not None:
                         logs["network/delta_w"] = delta_w
+                        if "hot_block" in delta_w_stats:
+                            logs["network/delta_w_block_median"] = delta_w_stats["block_median"]
+                            logs["network/delta_w_block_max"] = delta_w_stats["block_max"]
                     logs.update(self.extra_step_logs(args, logs))
                     accelerator.log(logs, step=global_step)
 
