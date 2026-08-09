@@ -997,3 +997,35 @@ def test_h3_batched_forward_uniform_lengths_and_grads():
     out_video, out_audio = model(video_grad, audio, sigma, contexts, tags)
     (out_video.square().mean() + out_audio.square().mean()).backward()
     assert video_grad.grad is not None and torch.isfinite(video_grad.grad).all()
+
+
+def test_h3_posthoc_ema_reproduces_identical_checkpoints(tmp_path):
+    from musubi_tuner.minimax_h3.posthoc_ema import compute_ema, ema_weights, find_step_checkpoints
+
+    torch.manual_seed(0)
+    down, up = torch.randn(4, 16), torch.randn(24, 4)
+    sd = {
+        "lora_unet_blocks_0_mlp_fc1.lora_down.weight": down.to(torch.bfloat16),
+        "lora_unet_blocks_0_mlp_fc1.lora_up.weight": up.to(torch.bfloat16),
+        "lora_unet_blocks_0_mlp_fc1.alpha": torch.tensor(2.0),
+    }
+    for step in (50, 100, 150):
+        save_file(sd, str(tmp_path / f"run-step{step:08d}.safetensors"), metadata={"ss_base_model_version": "minimax_h3"})
+    (tmp_path / "run-step00000100.comfy.safetensors").write_bytes(b"decoy")  # must be ignored
+
+    checkpoints = find_step_checkpoints(tmp_path)
+    assert len(checkpoints) == 3
+
+    for beta in (0.0, 0.9):
+        weights, _ = ema_weights(3, beta)
+        assert abs(sum(weights) - 1.0) < 1e-9
+        state_dict, metadata, tag, stats = compute_ema(checkpoints, beta)
+        # identical checkpoints -> the EMA is that checkpoint's delta, exactly rank-4
+        scale = 2.0 / 4.0
+        expected = scale * up.to(torch.bfloat16).float() @ down.to(torch.bfloat16).float()
+        got_down = state_dict["lora_unet_blocks_0_mlp_fc1.lora_down.weight"].float()
+        got_up = state_dict["lora_unet_blocks_0_mlp_fc1.lora_up.weight"].float()
+        torch.testing.assert_close(scale * got_up @ got_down, expected, rtol=2e-2, atol=2e-2)
+        assert stats["energy_min"] > 0.999
+        assert float(state_dict["lora_unet_blocks_0_mlp_fc1.alpha"]) == 2.0
+        assert metadata["ss_base_model_version"] == "minimax_h3"
