@@ -1,0 +1,31 @@
+[prompt]
+width = 1024
+height = 1024
+frame_count = 1
+sample_steps = 20
+
+# Video also works
+# width = 320
+# height = 480
+# frame_count = 73
+
+# Bare trigger prompt: measures raw trigger binding, comparable with all
+# earlier previews (same seed 42 lineage).
+[[prompt.subset]]
+prompt = "lucy the cat"
+seed = 42
+
+# Still-image wrapper (ComfyUI H3 Image Studio style): measures quality the
+# way users will actually prompt at inference.
+[[prompt.subset]]
+prompt = """Image task: produce one finished, high-definition still composition. Internally, keep that completed image visually unchanged across the generated frame packet: locked camera, fixed composition, no cuts, no camera movement, no subject motion, no temporal progression, and no audio instructions. Preserve crisp fine texture, clean edges, coherent anatomy, and intentional focus where the description calls for them.
+
+Target image description: a photo of lucy the cat"""
+seed = 43
+
+# Legacy single-latent arm at the same seed and prompt as subset one, so every
+# preview grid carries a direct packet-vs-legacy comparison.
+[[prompt.subset]]
+prompt = "lucy the cat"
+seed = 42
+sample_latent_frames = 1

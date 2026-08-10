@@ -1,0 +1,951 @@
+"""MiniMax H3 joint audio/video diffusion transformer.
+
+H3 packs text, stereo-audio, and video tokens into one full-attention stream.
+The checkpoint predicts ``clean - noise`` for each target stream.  Video and
+audio share a base flow time but use different rational sigma shifts.
+
+The parameter names intentionally follow the official and ComfyUI checkpoint
+layouts so either BF16 distribution can be loaded without a key conversion.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from contextlib import contextmanager
+import math
+
+import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
+from torch import nn
+
+from musubi_tuner.modules.attention import AttentionParams
+from musubi_tuner.modules.attention import attention as common_attention
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, LoRAStreamOffloader, create_offloader
+
+FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
+FRAME_RESCALE = 5.0 / 3.0
+VIDEO_SIGMA_SHIFT = 12.0
+AUDIO_SIGMA_SHIFT = 3.0
+
+
+def time_shift_sigma(sigma: torch.Tensor, from_shift: float, to_shift: float) -> torch.Tensor:
+    """Map a shifted flow sigma to another shift on the same base grid."""
+
+    base = sigma / (from_shift + sigma * (1.0 - from_shift))
+    return to_shift * base / (1.0 + (to_shift - 1.0) * base)
+
+
+def time_shift_slope(sigma: torch.Tensor, from_shift: float, to_shift: float) -> torch.Tensor:
+    """Derivative of :func:`time_shift_sigma` with respect to ``sigma``."""
+
+    base = sigma / (from_shift + sigma * (1.0 - from_shift))
+    numerator = to_shift * (1.0 + (from_shift - 1.0) * base) ** 2
+    denominator = from_shift * (1.0 + (to_shift - 1.0) * base) ** 2
+    return numerator / denominator
+
+
+def patchify_video(latent: torch.Tensor, patch_size: tuple[int, int, int] = (1, 2, 2)) -> torch.Tensor:
+    """Convert ``[B,C,T,H,W]`` video latents to rows of flattened patches."""
+
+    b, c, t_full, h_full, w_full = latent.shape
+    pt, ph, pw = patch_size
+    if t_full % pt or h_full % ph or w_full % pw:
+        raise ValueError(f"latent shape {tuple(latent.shape)} is not divisible by patch size {patch_size}")
+    t, h, w = t_full // pt, h_full // ph, w_full // pw
+    x = latent.reshape(b, c, t, pt, h, ph, w, pw)
+    x = torch.einsum("nctrhpwq->nthwcrpq", x)
+    return x.reshape(b, t * h * w, c * pt * ph * pw)
+
+
+def unpatchify_video(
+    rows: torch.Tensor,
+    t: int,
+    h: int,
+    w: int,
+    channels: int,
+    patch_size: tuple[int, int, int] = (1, 2, 2),
+) -> torch.Tensor:
+    """Inverse of :func:`patchify_video`."""
+
+    pt, ph, pw = patch_size
+    x = rows.reshape(-1, t, h, w, channels, pt, ph, pw)
+    x = torch.einsum("nthwcrpq->nctrhpwq", x)
+    return x.reshape(-1, channels, t * pt, h * ph, w * pw)
+
+
+def pack_audio(latent: torch.Tensor) -> torch.Tensor:
+    """Pack ``[B,C,stereo,T]`` latents in channel-major stereo order."""
+
+    b, c, stereo, t = latent.shape
+    return latent.permute(0, 2, 3, 1).reshape(b, stereo * t, c)
+
+
+def unpack_audio(rows: torch.Tensor, stereo: int = 2) -> torch.Tensor:
+    """Inverse of :func:`pack_audio`."""
+
+    b, sequence, channels = rows.shape
+    t = sequence // stereo
+    return rows.reshape(b, stereo, t, channels).permute(0, 3, 1, 2)
+
+
+def _axis_from_sqrt_area(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
+    ratio = dim / sqrt_area
+    n = dim // patch
+    return (torch.arange(n, dtype=torch.float64) * (ratio / n) + (1.0 - ratio) / 2.0) * 32.0
+
+
+def _frame_grid(height: int, width: int) -> tuple[torch.Tensor, torch.Tensor]:
+    area = math.sqrt(height * width)
+    h_axis = _axis_from_sqrt_area(height, 2, area)
+    w_axis = _axis_from_sqrt_area(width, 2, area)
+    hh, ww = torch.meshgrid(h_axis, w_axis, indexing="ij")
+    return torch.stack([hh.reshape(-1), ww.reshape(-1)], dim=-1), w_axis
+
+
+def _video_t_spans(count: int) -> list[float]:
+    return [FRAME_RESCALE * FRAME_PER_TOKEN[index % len(FRAME_PER_TOKEN)] for index in range(count)]
+
+
+def _video_t_grid(count: int, origin: float) -> torch.Tensor:
+    spans = torch.tensor(_video_t_spans(count), dtype=torch.float64)
+    return float(origin) + torch.cat([torch.zeros(1, dtype=torch.float64), spans[:-1].cumsum(0)])
+
+
+def _audio_grid(cursor: float, length: int, width_low: float, width_high: float) -> torch.Tensor:
+    grid = torch.zeros(length * 2, 3, dtype=torch.float64)
+    grid[:, 0] = (cursor + torch.arange(length, dtype=torch.float64)).repeat(2)
+    grid[:length, 2] = width_low
+    grid[length:, 2] = width_high
+    return grid
+
+
+def _video_grid(length: int, frame_grid: torch.Tensor, cursor: float) -> torch.Tensor:
+    grid = torch.empty(length, frame_grid.shape[0], 3, dtype=torch.float64)
+    grid[:, :, 0] = _video_t_grid(length, cursor)[:, None]
+    grid[:, :, 1:] = frame_grid[None]
+    return grid.reshape(-1, 3)
+
+
+def apply_split_half_rope(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
+    """Apply H3's split-half partial RoPE to ``[B,S,H,D]`` tensors.
+
+    ``angles`` is ``[S, D]`` (shared across the batch) or ``[B, S, D]``
+    (per-item positions, used by the batched ragged-text path).
+    """
+
+    half = angles.shape[-1] // 2
+    rot = half * 2
+    angle = angles[..., :half].to(device=x.device, dtype=torch.float32)
+    if angles.ndim == 2:
+        cos = angle.cos().to(x.dtype)[None, :, None, :]
+        sin = angle.sin().to(x.dtype)[None, :, None, :]
+    else:
+        cos = angle.cos().to(x.dtype)[:, :, None, :]
+        sin = angle.sin().to(x.dtype)[:, :, None, :]
+    first, second = x[..., :half], x[..., half:rot]
+    rotated = torch.cat([first * cos - second * sin, second * cos + first * sin], dim=-1)
+    return torch.cat([rotated, x[..., rot:]], dim=-1)
+
+
+class PackedLayout:
+    """Packed ``[text | audio | video]`` layout for T2VA training."""
+
+    def __init__(self, text_len: int, latent_t: int, latent_h: int, latent_w: int, audio_t: int):
+        frame, width_grid = _frame_grid(latent_h, latent_w)
+        cursor = float(text_len)
+
+        text_pos = torch.zeros(text_len, 3, dtype=torch.float64)
+        text_pos[:, 0] = torch.arange(text_len, dtype=torch.float64)
+        audio_pos = _audio_grid(cursor, audio_t, float(width_grid[0]), float(width_grid[-1]))
+        video_pos = _video_grid(latent_t, frame, cursor)
+
+        audio_start = text_len
+        video_start = audio_start + audio_t * 2
+        self.text_slice = (0, text_len)
+        self.audio_slice = (audio_start, video_start)
+        self.video_slice = (video_start, video_start + video_pos.shape[0])
+        self.position_ids = torch.cat([text_pos, audio_pos, video_pos], dim=0)
+        self.seq_len = self.position_ids.shape[0]
+        self.signature = (text_len, latent_t, latent_h, latent_w, audio_t)
+
+
+class TimeEmbedder(nn.Module):
+    def __init__(self, freq_dim: int, hidden: int, out: int):
+        super().__init__()
+        self.freq_dim = freq_dim
+        self.proj_in = nn.Linear(freq_dim, hidden, bias=True, dtype=torch.float32)
+        self.proj_out = nn.Linear(hidden, out, bias=True, dtype=torch.float32)
+
+    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
+        half = self.freq_dim // 2
+        freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32, device=timestep.device) / half)
+        args = timestep.float()[:, None] * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        return self.proj_out(F.silu(self.proj_in(embedding)))
+
+
+class Attention(nn.Module):
+    def __init__(self, hidden: int, heads: int, head_dim: int, eps: float, attn_mode: str, split_attn: bool):
+        super().__init__()
+        self.heads = heads
+        self.head_dim = head_dim
+        self.attn_params = AttentionParams.create_attention_params(attn_mode, split_attn)
+        inner = heads * head_dim
+        self.qkv_proj = nn.Linear(hidden, inner * 3, bias=False)
+        self.q_norm = nn.RMSNorm(head_dim, eps=eps)
+        self.k_norm = nn.RMSNorm(head_dim, eps=eps)
+        self.out_proj = nn.Linear(inner, hidden, bias=False)
+
+    def forward(
+        self, x: torch.Tensor, rope_angles: torch.Tensor | None = None, attn_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        batch, sequence, _ = x.shape
+        q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
+        q = self.q_norm(q.reshape(batch, sequence, self.heads, self.head_dim))
+        k = self.k_norm(k.reshape(batch, sequence, self.heads, self.head_dim))
+        v = v.reshape(batch, sequence, self.heads, self.head_dim)
+        if rope_angles is not None:
+            q = apply_split_half_rope(q, rope_angles)
+            k = apply_split_half_rope(k, rope_angles)
+        if attn_mask is not None:
+            # batched ragged-text path: key-padding mask [B,1,1,S], True = attend
+            out = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=attn_mask
+            )
+            return self.out_proj(out.transpose(1, 2).reshape(batch, sequence, self.heads * self.head_dim))
+        return self.out_proj(common_attention([q, k, v], attn_params=self.attn_params))
+
+
+class MLP(nn.Module):
+    def __init__(self, hidden: int, ffn_hidden: int):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden, ffn_hidden * 2, bias=False)
+        self.fc2 = nn.Linear(ffn_hidden, hidden, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, value = self.fc1(x).chunk(2, dim=-1)
+        return self.fc2(F.silu(gate) * value)
+
+
+class AdalnProj(nn.Module):
+    def __init__(self, time_dim: int, hidden: int, expand: int, modalities: int, apply_silu: bool = True):
+        super().__init__()
+        self.expand = expand
+        self.modalities = modalities
+        self.hidden = hidden
+        self.apply_silu = apply_silu
+        self.linear = nn.Linear(time_dim, expand * hidden * modalities, bias=True)
+
+    def forward(self, time_embedding: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        if self.apply_silu:
+            time_embedding = F.silu(time_embedding)
+        projected = self.linear(time_embedding)
+        projected = projected.view(projected.shape[0] * self.modalities, self.expand * self.hidden)
+        return projected.chunk(self.expand, dim=-1)
+
+
+class RefinerBlock(nn.Module):
+    def __init__(
+        self, hidden: int, heads: int, head_dim: int, ffn: int, eps: float, qk_eps: float, attn_mode: str, split_attn: bool
+    ):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(hidden, eps=eps)
+        self.norm2 = nn.RMSNorm(hidden, eps=eps)
+        self.attn = Attention(hidden, heads, head_dim, qk_eps, attn_mode, split_attn)
+        self.mlp = MLP(hidden, ffn)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        return x + self.mlp(self.norm2(x))
+
+
+class TokenRefiner(nn.Module):
+    def __init__(
+        self,
+        layers: int,
+        hidden: int,
+        heads: int,
+        head_dim: int,
+        ffn: int,
+        eps: float,
+        qk_eps: float,
+        final_eps: float,
+        attn_mode: str,
+        split_attn: bool,
+    ):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [RefinerBlock(hidden, heads, head_dim, ffn, eps, qk_eps, attn_mode, split_attn) for _ in range(layers)]
+        )
+        self.final_norm = nn.RMSNorm(hidden, eps=final_eps)
+
+    def forward(self, x: torch.Tensor, gradient_checkpointing: bool = False) -> torch.Tensor:
+        for block in self.blocks:
+            if gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+        return self.final_norm(x)
+
+
+class DiTBlock(nn.Module):
+    def __init__(
+        self,
+        hidden: int,
+        heads: int,
+        head_dim: int,
+        ffn: int,
+        time_dim: int,
+        eps: float,
+        qk_eps: float,
+        attn_mode: str,
+        split_attn: bool,
+        apply_silu: bool = True,
+    ):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(hidden, eps=eps)
+        self.norm2 = nn.RMSNorm(hidden, eps=eps)
+        self.attn = Attention(hidden, heads, head_dim, qk_eps, attn_mode, split_attn)
+        self.mlp = MLP(hidden, ffn)
+        self.adaln_proj = AdalnProj(time_dim, hidden, expand=6, modalities=3, apply_silu=apply_silu)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        time_embedding: torch.Tensor,
+        modulation_rows: torch.Tensor,
+        rope_angles: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Batched path: time_embedding [B,T,dim] flattens so the adaln table is
+        # [B*T*modalities, hidden]; modulation_rows [B,L] then carry per-item
+        # flat offsets. Serial path ([T,dim] + rows [L]) is byte-identical.
+        adaln_input = time_embedding if time_embedding.ndim == 2 else time_embedding.reshape(-1, time_embedding.shape[-1])
+        batched_rows = modulation_rows.ndim == 2
+
+        def select(table: torch.Tensor) -> torch.Tensor:
+            selected = table[modulation_rows]
+            return (selected if batched_rows else selected[None]).to(x.dtype)
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(adaln_input)
+        hidden = self.norm1(x) * (1.0 + select(scale_msa)) + select(shift_msa)
+        x = x + self.attn(hidden, rope_angles, attn_mask) * select(gate_msa)
+
+        hidden = self.norm2(x) * (1.0 + select(scale_mlp)) + select(shift_mlp)
+        return x + self.mlp(hidden) * select(gate_mlp)
+
+
+class FinalLayer(nn.Module):
+    def __init__(self, hidden: int, time_dim: int, video_dim: int, audio_dim: int, eps: float, apply_silu: bool = True):
+        super().__init__()
+        self.norm = nn.RMSNorm(hidden, eps=eps)
+        self.adaln_proj = AdalnProj(time_dim, hidden, expand=2, modalities=1, apply_silu=apply_silu)
+        self.video_out = nn.Linear(hidden, video_dim, bias=True, dtype=torch.float32)
+        self.audio_out = nn.Linear(hidden, audio_dim, bias=True, dtype=torch.float32)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        time_embedding: torch.Tensor,
+        video_slice: tuple[int, int],
+        audio_slice: tuple[int, int],
+        video_time_row: int | torch.Tensor,
+        audio_time_row: int | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        adaln_input = time_embedding if time_embedding.ndim == 2 else time_embedding.reshape(-1, time_embedding.shape[-1])
+        shift, scale = self.adaln_proj(adaln_input)
+        normalized = self.norm(x)
+        video = normalized[:, video_slice[0] : video_slice[1]]
+        audio = normalized[:, audio_slice[0] : audio_slice[1]]
+        if isinstance(video_time_row, torch.Tensor):
+            # batched: per-item flat rows [B] into the [B*T, hidden] table
+            video = video * (1.0 + scale[video_time_row][:, None].to(video.dtype)) + shift[video_time_row][:, None].to(video.dtype)
+            audio = audio * (1.0 + scale[audio_time_row][:, None].to(audio.dtype)) + shift[audio_time_row][:, None].to(audio.dtype)
+        else:
+            video = video * (1.0 + scale[video_time_row].to(video.dtype)) + shift[video_time_row].to(video.dtype)
+            audio = audio * (1.0 + scale[audio_time_row].to(audio.dtype)) + shift[audio_time_row].to(audio.dtype)
+        return self.video_out(video.float()), self.audio_out(audio.float())
+
+
+class MiniMaxH3Model(nn.Module):
+    """Trainable H3 Omni Transformer for the FL2VA checkpoint."""
+
+    def __init__(
+        self,
+        hidden_size: int = 5376,
+        num_layers: int = 50,
+        token_refiner_num_layers: int = 2,
+        num_attention_heads: int = 56,
+        attention_head_dim: int = 128,
+        ffn_hidden_size: int = 14336,
+        latents_dim: int = 24,
+        audio_latents_dim: int = 32,
+        patch_size: tuple[int, int, int] = (1, 2, 2),
+        text_dim: int = 5120,
+        timestep_input_dim: int = 256,
+        time_embed_hidden_size: int = 5376,
+        time_embed_dim: int = 2688,
+        rope_inv_freq_len: int = 16,
+        norm_eps: float = 1e-5,
+        qk_norm_eps: float = 1e-5,
+        final_norm_eps: float = 1e-5,
+        adaln_curve_grid: int | None = None,
+        sigma_shift_video: float = VIDEO_SIGMA_SHIFT,
+        sigma_shift_audio: float = AUDIO_SIGMA_SHIFT,
+        attn_mode: str = "torch",
+        split_attn: bool = False,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.patch_size = tuple(patch_size)
+        self.latents_dim = latents_dim
+        self.audio_latents_dim = audio_latents_dim
+        self.sigma_shift_video = sigma_shift_video
+        self.sigma_shift_audio = sigma_shift_audio
+        self.use_adaln_curves = adaln_curve_grid is not None
+
+        video_patch_dim = latents_dim * math.prod(self.patch_size)
+        self.video_patch_proj = nn.Linear(video_patch_dim, hidden_size, bias=True, dtype=torch.float32)
+        self.audio_patch_proj = nn.Linear(audio_latents_dim, hidden_size, bias=True, dtype=torch.float32)
+        self.condition_proj = nn.Linear(text_dim, hidden_size, bias=True)
+        if self.use_adaln_curves:
+            self.register_buffer("adaln_t_table", torch.empty(adaln_curve_grid, time_embed_dim, dtype=torch.float32))
+        else:
+            self.time_embedder = TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim)
+        self.rope = nn.Module()
+        self.rope.register_buffer("inv_freq", torch.empty(rope_inv_freq_len, dtype=torch.float32))
+        self.token_refiner = TokenRefiner(
+            token_refiner_num_layers,
+            hidden_size,
+            num_attention_heads,
+            attention_head_dim,
+            ffn_hidden_size,
+            norm_eps,
+            qk_norm_eps,
+            final_norm_eps,
+            attn_mode,
+            split_attn,
+        )
+        self.blocks = nn.ModuleList(
+            [
+                DiTBlock(
+                    hidden_size,
+                    num_attention_heads,
+                    attention_head_dim,
+                    ffn_hidden_size,
+                    time_embed_dim,
+                    norm_eps,
+                    qk_norm_eps,
+                    attn_mode,
+                    split_attn,
+                    apply_silu=not self.use_adaln_curves,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_layer = FinalLayer(
+            hidden_size,
+            time_embed_dim,
+            video_patch_dim,
+            audio_latents_dim,
+            final_norm_eps,
+            apply_silu=not self.use_adaln_curves,
+        )
+
+        self.gradient_checkpointing = False
+        self.blocks_to_swap = 0
+        self.offloader = None
+        self._offload_activations = False
+        self._offload_min_bytes = 1 << 20
+        self._pinned_pool: dict[tuple, list] = {}
+
+    def enable_gradient_checkpointing(self, cpu_offload: bool = False):
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
+
+    def enable_block_swap(self, num_blocks: int, config: BlockSwapConfig):
+        if num_blocks > len(self.blocks) - 2:
+            raise ValueError(f"Cannot swap more than {len(self.blocks) - 2} H3 blocks; requested {num_blocks}")
+        self.blocks_to_swap = num_blocks
+        self.offloader = create_offloader("single", self.blocks, len(self.blocks), num_blocks, config)
+
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        if self.blocks_to_swap:
+            saved_blocks = self.blocks
+            self.blocks = nn.ModuleList()
+        self.to(device)
+        if self.blocks_to_swap:
+            self.blocks = saved_blocks
+
+    def prepare_block_swap_before_forward(self):
+        if self.blocks_to_swap:
+            self.offloader.prepare_block_devices_before_forward(self.blocks)
+
+    def enable_activation_offload(self) -> None:
+        """Offload gradient-checkpoint boundary activations to pinned CPU RAM
+        (Unsloth-style). Trades a little PCIe traffic for ~[blocks x hidden]
+        of resident VRAM — batch-size headroom on 24GB cards."""
+        self._offload_activations = True
+
+    def _activation_offload_ctx(self):
+        if not (self._offload_activations and self.gradient_checkpointing and self.training):
+            return contextlib.nullcontext()
+        pool = self._pinned_pool
+        min_bytes = self._offload_min_bytes
+
+        def pack(tensor: torch.Tensor):
+            if not tensor.is_cuda or tensor.numel() * tensor.element_size() < min_bytes or not tensor.is_floating_point():
+                return tensor
+            key = (tuple(tensor.shape), tensor.dtype)
+            bucket = pool.setdefault(key, [])
+            pinned = bucket.pop() if bucket else torch.empty_like(tensor, device="cpu", pin_memory=True)
+            pinned.copy_(tensor, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+            return (pinned, event, tensor.device, key)
+
+        def unpack(packed):
+            if isinstance(packed, torch.Tensor):
+                return packed
+            pinned, event, device, key = packed
+            event.synchronize()
+            restored = pinned.to(device, non_blocking=True)
+            pool.setdefault(key, []).append(pinned)
+            return restored
+
+        return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
+
+    @contextmanager
+    def override_block_swap_for_sampling(self, sample_blocks_to_swap: int | None, device: torch.device):
+        if sample_blocks_to_swap is None:
+            yield None
+            return
+
+        target_blocks_to_swap = int(sample_blocks_to_swap)
+        if target_blocks_to_swap < 0:
+            raise ValueError("H3 sample_blocks_to_swap must be a non-negative integer.")
+
+        max_blocks_to_swap = len(self.blocks) - 2
+        if target_blocks_to_swap > max_blocks_to_swap:
+            raise ValueError(f"Cannot swap more than {max_blocks_to_swap} H3 blocks during sampling. Requested {target_blocks_to_swap}.")
+
+        original_blocks_to_swap = int(self.blocks_to_swap or 0)
+        if (original_blocks_to_swap > 0 or target_blocks_to_swap > 0) and self.offloader is None:
+            raise ValueError("H3 sample_blocks_to_swap override requires initialized block swap when a positive count is involved.")
+        if isinstance(self.offloader, LoRAStreamOffloader):
+            raise ValueError("H3 sample_blocks_to_swap requires classic block swap; disable --block_swap_h2d_only.")
+
+        offloader = self.offloader
+        original_offloader_blocks_to_swap = getattr(offloader, "blocks_to_swap", None) if offloader is not None else None
+        original_forward_only = getattr(offloader, "forward_only", None) if offloader is not None else None
+
+        if offloader is None:
+            yield target_blocks_to_swap
+            return
+
+        try:
+            offloader.set_forward_only(True)
+            self.blocks_to_swap = target_blocks_to_swap
+            offloader.blocks_to_swap = target_blocks_to_swap
+
+            if target_blocks_to_swap > 0:
+                self.prepare_block_swap_before_forward()
+            else:
+                self.move_to_device_except_swap_blocks(device)
+
+            yield target_blocks_to_swap
+        finally:
+            if original_forward_only is not None:
+                offloader.set_forward_only(original_forward_only)
+            self.blocks_to_swap = original_blocks_to_swap
+            offloader.blocks_to_swap = original_offloader_blocks_to_swap
+
+            if original_blocks_to_swap > 0:
+                self.prepare_block_swap_before_forward()
+            else:
+                self.move_to_device_except_swap_blocks(device)
+
+    def switch_block_swap_for_inference(self):
+        if self.blocks_to_swap:
+            self.offloader.set_forward_only(True)
+            self.prepare_block_swap_before_forward()
+
+    def switch_block_swap_for_training(self):
+        if self.blocks_to_swap:
+            self.offloader.set_forward_only(False)
+            self.prepare_block_swap_before_forward()
+
+    def park_main_block_weights_for_decode(self):
+        """Temporarily free the transformer's VRAM before loading the video decoder."""
+
+        if isinstance(self.offloader, LoRAStreamOffloader):
+            raise RuntimeError(
+                "H3 preview decoding currently requires classic block swap; disable --block_swap_h2d_only"
+            )
+        if self.offloader is not None:
+            self.offloader.set_forward_only(True)
+        self._decode_restore_device = self.video_patch_proj.weight.device
+        self.to("cpu")
+        if self._decode_restore_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def restore_main_block_weights_after_decode(self):
+        device = getattr(self, "_decode_restore_device", None)
+        if device is None:
+            return
+        if self.blocks_to_swap:
+            self.move_to_device_except_swap_blocks(device)
+            self.prepare_block_swap_before_forward()
+        else:
+            self.to(device)
+        del self._decode_restore_device
+
+    def rope_angles(self, position_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
+        positions = position_ids.to(device=device, dtype=torch.float32)
+        inv_freq = self.rope.inv_freq.to(device=device)
+        per_axis = positions.unsqueeze(-1) * inv_freq.view(*([1] * (positions.ndim - 1)), -1)
+        temporal, height, width = per_axis.unbind(dim=-2)
+        half = torch.cat([temporal, height, width], dim=-1)
+        return torch.cat([half, half], dim=-1)
+
+    def _forward_single(
+        self,
+        video: torch.Tensor,
+        audio: torch.Tensor,
+        sigma_video: torch.Tensor,
+        context: torch.Tensor,
+        text_token_tags: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if video.shape[0] != 1 or audio.shape[0] != 1 or context.shape[0] != 1:
+            raise ValueError("_forward_single requires batch size 1")
+        if video.shape[-2] % self.patch_size[1] or video.shape[-1] % self.patch_size[2]:
+            raise ValueError("H3 video latent height and width must be divisible by the spatial patch size")
+
+        latent_t, latent_h, latent_w = video.shape[-3:]
+        audio_t = audio.shape[-1]
+        text_len = context.shape[1]
+        layout = PackedLayout(text_len, latent_t, latent_h, latent_w, audio_t)
+
+        sigma_v = sigma_video.flatten()[0].float().clamp(1e-6, 1.0)
+        sigma_a = time_shift_sigma(sigma_v, self.sigma_shift_video, self.sigma_shift_audio)
+        t_video = float(1.0 - sigma_v)
+        t_audio = float(1.0 - sigma_a)
+        unique_times = sorted({t_video, t_audio})
+        time_row = {value: index for index, value in enumerate(unique_times)}
+
+        if text_token_tags is None:
+            text_token_tags = torch.ones(text_len, device=video.device, dtype=torch.long)
+        else:
+            text_token_tags = text_token_tags.reshape(-1).to(device=video.device, dtype=torch.long)
+            if text_token_tags.shape[0] != text_len:
+                raise ValueError("text_token_tags length must match the text context length")
+
+        modulation_rows = torch.empty(layout.seq_len, device=video.device, dtype=torch.long)
+        modulation_rows[:text_len] = time_row[t_video] * 3 + text_token_tags
+        modulation_rows[layout.audio_slice[0] : layout.audio_slice[1]] = time_row[t_audio] * 3 + 2
+        modulation_rows[layout.video_slice[0] : layout.video_slice[1]] = time_row[t_video] * 3
+
+        compute_dtype = context.dtype
+        video_rows = patchify_video(video.float(), self.patch_size)
+        audio_rows = pack_audio(audio.float())
+        video_embed = self.video_patch_proj(video_rows).to(compute_dtype)
+        audio_embed = self.audio_patch_proj(audio_rows).to(compute_dtype)
+
+        if context.shape[-1] != self.hidden_size:
+            context = self.token_refiner(self.condition_proj(context), self.gradient_checkpointing)
+        hidden = torch.cat([context, audio_embed, video_embed], dim=1)
+
+        time_values = torch.tensor(unique_times, device=video.device, dtype=torch.float32)
+        if self.use_adaln_curves:
+            table = self.adaln_t_table.to(device=video.device)
+            position = time_values.clamp(0.0, 1.0) * (table.shape[0] - 1)
+            lower = position.floor().long().clamp(max=table.shape[0] - 2)
+            time_embedding = torch.lerp(table[lower], table[lower + 1], (position - lower).unsqueeze(1))
+        else:
+            time_embedding = self.time_embedder(time_values).to(compute_dtype)
+        rope_angles = self.rope_angles(layout.position_ids, video.device)
+
+        with self._activation_offload_ctx():
+            for index, block in enumerate(self.blocks):
+                if self.blocks_to_swap:
+                    self.offloader.wait_for_block(index)
+                if self.gradient_checkpointing and self.training:
+                    hidden = torch.utils.checkpoint.checkpoint(
+                        block, hidden, time_embedding, modulation_rows, rope_angles, use_reentrant=False
+                    )
+                else:
+                    hidden = block(hidden, time_embedding, modulation_rows, rope_angles)
+                if self.blocks_to_swap:
+                    self.offloader.submit_move_blocks_forward(self.blocks, index)
+
+        video_rows, audio_rows = self.final_layer(
+            hidden,
+            time_embedding,
+            layout.video_slice,
+            layout.audio_slice,
+            time_row[t_video],
+            time_row[t_audio],
+        )
+        video_out = unpatchify_video(
+            video_rows,
+            latent_t,
+            latent_h // self.patch_size[1],
+            latent_w // self.patch_size[2],
+            self.latents_dim,
+            self.patch_size,
+        )
+        return video_out.to(video.dtype), unpack_audio(audio_rows).to(audio.dtype)
+
+    def _forward_batched(
+        self,
+        video: torch.Tensor,
+        audio: torch.Tensor,
+        sigma_video: torch.Tensor,
+        context: torch.Tensor | list[torch.Tensor],
+        text_token_tags: torch.Tensor | list[torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One packed forward for a bucket batch (uniform video/audio shapes).
+
+        Text is refined per item at its true length, then right-padded to the
+        batch max inside the text segment: the physical layout is uniform, but
+        every token keeps its serial-equivalent RoPE position (audio/video
+        cursors start at the item's true text length) and padded text slots are
+        masked out on the attention key side. Per-item sigmas use a fixed
+        two-row time convention (row 0 = video, row 1 = audio) instead of the
+        serial path's sorted dedup — same selected values, batchable indexing.
+        """
+
+        prep = self._prepare_packed_batch(video, audio, sigma_video, context, text_token_tags)
+        hidden = prep["hidden"]
+        with self._activation_offload_ctx():
+            for index, block in enumerate(self.blocks):
+                if self.blocks_to_swap:
+                    self.offloader.wait_for_block(index)
+                if self.gradient_checkpointing and self.training:
+                    hidden = torch.utils.checkpoint.checkpoint(
+                        block, hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"],
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden = block(hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"])
+                if self.blocks_to_swap:
+                    self.offloader.submit_move_blocks_forward(self.blocks, index)
+        return self._finalize_packed(hidden, prep, video.dtype, audio.dtype)
+
+    def forward_with_uncond(
+        self,
+        video: torch.Tensor,
+        audio: torch.Tensor,
+        sigma_video: torch.Tensor,
+        context: torch.Tensor | list[torch.Tensor],
+        text_token_tags: torch.Tensor | list[torch.Tensor] | None,
+        uncond_context: torch.Tensor,
+        uncond_tags: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """CFG-augmented training forward: one block-swap walk carrying both the
+        conditional stream (gradient, checkpointed) and the empty-prompt stream
+        (no-grad) — identical math to two separate forwards at one walk's cost.
+
+        Returns ``(cond_video, cond_audio, uncond_video, uncond_audio)``.
+        """
+
+        batch = video.shape[0]
+        prep = self._prepare_packed_batch(video, audio, sigma_video, context, text_token_tags)
+        with torch.no_grad():
+            uncond_prep = self._prepare_packed_batch(
+                video, audio, sigma_video, [uncond_context] * batch, [uncond_tags] * batch
+            )
+
+        hidden = prep["hidden"]
+        uncond_hidden = uncond_prep["hidden"]
+        with self._activation_offload_ctx():
+            for index, block in enumerate(self.blocks):
+                if self.blocks_to_swap:
+                    self.offloader.wait_for_block(index)
+                if self.gradient_checkpointing and self.training:
+                    hidden = torch.utils.checkpoint.checkpoint(
+                        block, hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"],
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden = block(hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"])
+                with torch.no_grad():
+                    uncond_hidden = block(
+                        uncond_hidden,
+                        uncond_prep["time_embedding"],
+                        uncond_prep["modulation_rows"],
+                        uncond_prep["rope_angles"],
+                        uncond_prep["attn_mask"],
+                    )
+                if self.blocks_to_swap:
+                    self.offloader.submit_move_blocks_forward(self.blocks, index)
+
+        cond_video, cond_audio = self._finalize_packed(hidden, prep, video.dtype, audio.dtype)
+        with torch.no_grad():
+            uncond_video, uncond_audio = self._finalize_packed(uncond_hidden, uncond_prep, video.dtype, audio.dtype)
+        return cond_video, cond_audio, uncond_video, uncond_audio
+
+    def _prepare_packed_batch(
+        self,
+        video: torch.Tensor,
+        audio: torch.Tensor,
+        sigma_video: torch.Tensor,
+        context: torch.Tensor | list[torch.Tensor],
+        text_token_tags: torch.Tensor | list[torch.Tensor] | None,
+    ) -> dict:
+        batch = video.shape[0]
+        if video.shape[-2] % self.patch_size[1] or video.shape[-1] % self.patch_size[2]:
+            raise ValueError("H3 video latent height and width must be divisible by the spatial patch size")
+        latent_t, latent_h, latent_w = video.shape[-3:]
+        audio_t = audio.shape[-1]
+
+        refined: list[torch.Tensor] = []
+        tags_per_item: list[torch.Tensor] = []
+        lengths: list[int] = []
+        for index in range(batch):
+            context_i = context[index]
+            if context_i.ndim == 2:
+                context_i = context_i.unsqueeze(0)
+            text_len = context_i.shape[1]
+            tags_i = text_token_tags[index] if text_token_tags is not None else None
+            if tags_i is None:
+                tags_i = torch.ones(text_len, device=video.device, dtype=torch.long)
+            else:
+                tags_i = tags_i.reshape(-1).to(device=video.device, dtype=torch.long)
+                if tags_i.shape[0] != text_len:
+                    raise ValueError("text_token_tags length must match the text context length")
+            if context_i.shape[-1] != self.hidden_size:
+                context_i = self.token_refiner(self.condition_proj(context_i), self.gradient_checkpointing)
+            refined.append(context_i)
+            tags_per_item.append(tags_i)
+            lengths.append(text_len)
+
+        compute_dtype = refined[0].dtype
+        text_max = max(lengths)
+        layout = PackedLayout(text_max, latent_t, latent_h, latent_w, audio_t)
+
+        text_embed = refined[0].new_zeros((batch, text_max, self.hidden_size))
+        tags_padded = torch.ones(batch, text_max, device=video.device, dtype=torch.long)
+        text_valid = torch.zeros(batch, text_max, device=video.device, dtype=torch.bool)
+        position_ids = torch.zeros(batch, layout.seq_len, 3, dtype=torch.float64)
+        for index in range(batch):
+            length = lengths[index]
+            text_embed[index, :length] = refined[index][0]
+            tags_padded[index, :length] = tags_per_item[index]
+            text_valid[index, :length] = True
+            layout_i = PackedLayout(length, latent_t, latent_h, latent_w, audio_t)
+            position_ids[index, :length] = layout_i.position_ids[: layout_i.text_slice[1]]
+            position_ids[index, layout.audio_slice[0] : layout.audio_slice[1]] = layout_i.position_ids[
+                layout_i.audio_slice[0] : layout_i.audio_slice[1]
+            ]
+            position_ids[index, layout.video_slice[0] : layout.video_slice[1]] = layout_i.position_ids[
+                layout_i.video_slice[0] : layout_i.video_slice[1]
+            ]
+
+        sigma_v = sigma_video.reshape(-1).float().clamp(1e-6, 1.0)
+        sigma_a = time_shift_sigma(sigma_v, self.sigma_shift_video, self.sigma_shift_audio)
+        time_values = torch.stack([1.0 - sigma_v, 1.0 - sigma_a], dim=1)  # [B, 2]: row 0 video, row 1 audio
+        n_times = time_values.shape[1]
+
+        base_rows = torch.empty(batch, layout.seq_len, device=video.device, dtype=torch.long)
+        base_rows[:, :text_max] = tags_padded  # video-time row (0) * 3 + tag
+        base_rows[:, layout.audio_slice[0] : layout.audio_slice[1]] = 1 * 3 + 2
+        base_rows[:, layout.video_slice[0] : layout.video_slice[1]] = 0
+        modulation_rows = base_rows + torch.arange(batch, device=video.device)[:, None] * (n_times * 3)
+
+        video_embed = self.video_patch_proj(patchify_video(video.float(), self.patch_size)).to(compute_dtype)
+        audio_embed = self.audio_patch_proj(pack_audio(audio.float())).to(compute_dtype)
+        hidden = torch.cat([text_embed, audio_embed, video_embed], dim=1)
+
+        flat_times = time_values.reshape(-1)
+        if self.use_adaln_curves:
+            table = self.adaln_t_table.to(device=video.device)
+            position = flat_times.clamp(0.0, 1.0) * (table.shape[0] - 1)
+            lower = position.floor().long().clamp(max=table.shape[0] - 2)
+            time_embedding = torch.lerp(table[lower], table[lower + 1], (position - lower).unsqueeze(1))
+        else:
+            time_embedding = self.time_embedder(flat_times).to(compute_dtype)
+        time_embedding = time_embedding.reshape(batch, n_times, -1)
+
+        rope_angles = self.rope_angles(position_ids, video.device)
+        attn_mask = None
+        if not bool(text_valid.all()):
+            key_mask = torch.ones(batch, layout.seq_len, device=video.device, dtype=torch.bool)
+            key_mask[:, :text_max] = text_valid
+            attn_mask = key_mask[:, None, None, :]
+
+        return {
+            "hidden": hidden,
+            "time_embedding": time_embedding,
+            "modulation_rows": modulation_rows,
+            "rope_angles": rope_angles,
+            "attn_mask": attn_mask,
+            "layout": layout,
+            "n_times": n_times,
+            "latent_dims": (latent_t, latent_h, latent_w),
+        }
+
+    def _finalize_packed(
+        self, hidden: torch.Tensor, prep: dict, video_dtype: torch.dtype, audio_dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        layout = prep["layout"]
+        latent_t, latent_h, latent_w = prep["latent_dims"]
+        batch = hidden.shape[0]
+        item_offsets = torch.arange(batch, device=hidden.device, dtype=torch.long) * prep["n_times"]
+        video_rows, audio_rows = self.final_layer(
+            hidden,
+            prep["time_embedding"],
+            layout.video_slice,
+            layout.audio_slice,
+            item_offsets,  # row 0 per item = video time
+            item_offsets + 1,  # row 1 per item = audio time
+        )
+        video_out = unpatchify_video(
+            video_rows,
+            latent_t,
+            latent_h // self.patch_size[1],
+            latent_w // self.patch_size[2],
+            self.latents_dim,
+            self.patch_size,
+        )
+        return video_out.to(video_dtype), unpack_audio(audio_rows).to(audio_dtype)
+
+    def forward(
+        self,
+        video: torch.Tensor,
+        audio: torch.Tensor,
+        sigma_video: torch.Tensor,
+        context: torch.Tensor | list[torch.Tensor],
+        text_token_tags: torch.Tensor | list[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return raw checkpoint predictions (``clean - noise``) for both streams.
+
+        Bucket batches (uniform video/audio shapes, ragged text) run as one
+        packed forward; batch-one calls keep the original serial path.
+        """
+
+        if video.shape[0] > 1:
+            return self._forward_batched(video, audio, sigma_video, context, text_token_tags)
+
+        outputs_video: list[torch.Tensor] = []
+        outputs_audio: list[torch.Tensor] = []
+        for index in range(video.shape[0]):
+            context_i = context[index]
+            if context_i.ndim == 2:
+                context_i = context_i.unsqueeze(0)
+            tags_i = None
+            if text_token_tags is not None:
+                tags_i = text_token_tags[index]
+            video_i, audio_i = self._forward_single(
+                video[index : index + 1],
+                audio[index : index + 1],
+                sigma_video[index : index + 1],
+                context_i,
+                tags_i,
+            )
+            outputs_video.append(video_i)
+            outputs_audio.append(audio_i)
+        return torch.cat(outputs_video, dim=0), torch.cat(outputs_audio, dim=0)
