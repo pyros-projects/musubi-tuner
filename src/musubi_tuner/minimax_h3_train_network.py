@@ -613,12 +613,49 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             accelerator.print(f"Loaded H3 uncond embedding for CFG-augmented training ({embed.shape[0]} tokens)")
         return cached
 
+    _GD_PROBE_SIGMAS = (0.9, 0.7, 0.5, 0.3)
+    _GD_PROBE_SEED = 4242
+
     @torch.no_grad()
-    def _measure_guidance_drift(self, args, accelerator, transformer, network, noisy_video, noisy_audio, sigma_video, contexts, tags):
+    def _measure_guidance_drift(self, args, accelerator, transformer, network, clean_video, clean_audio, contexts, tags):
         """Guidance-retention gauge: ``||cond - uncond||`` of the LoRA'd model over
-        the frozen base, on the current batch. 1.0 = distillation intact; standard
-        (non-CFG-augmented) training drifts it toward 1/s as the model un-distills.
+        the frozen base. 1.0 = distillation intact; standard (non-CFG-augmented)
+        training drifts it toward 1/s as the model un-distills.
+
+        Measured on a FIXED probe captured at the first call — up to four items
+        of that batch, a fixed sigma ladder, and fixed-seed noise — so the curve
+        is deterministic across steps (no batch/sigma lottery) and, at equal
+        --seed and dataset config, directly comparable across runs.
         """
+        probe = getattr(self, "_gd_probe", None)
+        if probe is None:
+            take = min(len(self._GD_PROBE_SIGMAS), clean_video.shape[0])
+            sigma = torch.tensor(self._GD_PROBE_SIGMAS[:take], device=clean_video.device, dtype=torch.float32)
+            generator = torch.Generator(device=clean_video.device).manual_seed(self._GD_PROBE_SEED)
+            video = clean_video[:take].detach()
+            audio = clean_audio[:take].detach()
+            noise_video = torch.randn(video.shape, generator=generator, device=video.device, dtype=video.dtype)
+            noise_audio = torch.randn(audio.shape, generator=generator, device=audio.device, dtype=audio.dtype)
+            sigma_audio = time_shift_sigma(sigma, args.video_flow_shift, args.audio_flow_shift)
+            sv = sigma.view(-1, 1, 1, 1, 1).to(video.dtype)
+            sa = sigma_audio.view(-1, 1, 1, 1).to(audio.dtype)
+            probe = self._gd_probe = {
+                "video": ((1 - sv) * video + sv * noise_video).clone(),
+                "audio": ((1 - sa) * audio + sa * noise_audio).clone(),
+                "sigma": sigma,
+                "contexts": [context.detach().clone() for context in contexts[:take]],
+                "tags": [tag.detach().clone() for tag in tags[:take]],
+            }
+            accelerator.print(
+                f"gd probe captured: {take} items at sigmas {tuple(round(s, 2) for s in self._GD_PROBE_SIGMAS[:take])} "
+                "(fixed for the run)"
+            )
+        noisy_video = probe["video"]
+        noisy_audio = probe["audio"]
+        sigma_video = probe["sigma"]
+        contexts = probe["contexts"]
+        tags = probe["tags"]
+
         uncond_embed, uncond_tags = self._get_uncond_context(args, accelerator, network_dtype=noisy_video.dtype)
         uncond_contexts = [uncond_embed] * len(contexts)
         uncond_tag_list = [uncond_tags] * len(contexts)
@@ -715,7 +752,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if drift_every > 0 and global_step > 0 and global_step % drift_every == 0 and not getattr(self, "_drift_measured_at", None) == global_step:
             self._drift_measured_at = global_step
             self._last_guidance_drift = self._measure_guidance_drift(
-                args, accelerator, transformer, network, noisy_video, noisy_audio, sigma_video, contexts, tags
+                args, accelerator, transformer, network, clean_video, clean_audio, contexts, tags
             )
 
         cfg_scale = float(getattr(args, "cfg_augmented_scale", 1.0) or 1.0)

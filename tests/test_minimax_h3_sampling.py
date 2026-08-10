@@ -1214,21 +1214,28 @@ def test_h3_guidance_drift_gauge(tmp_path):
     accelerator = SimpleNamespace(
         device="cpu", print=lambda *a, **k: None, unwrap_model=lambda m: m, autocast=nullcontext
     )
-    args = SimpleNamespace(dataset_config=str(dataset_toml))
+    args = SimpleNamespace(dataset_config=str(dataset_toml), video_flow_shift=12.0, audio_flow_shift=3.0)
     video = torch.randn(2, 2, 1, 4, 6)
     audio = torch.randn(2, 3, 2, 2)
-    sigma = torch.tensor([0.6, 0.3])
     contexts = [torch.randn(1, 5, 8), torch.randn(1, 4, 8)]
     tags = [torch.ones(5, dtype=torch.long), torch.ones(4, dtype=torch.long)]
 
     # zero-initialized LoRA -> LoRA'd model == base -> drift exactly 1.0
-    drift = trainer._measure_guidance_drift(args, accelerator, model, network, video, audio, sigma, contexts, tags)
+    drift = trainer._measure_guidance_drift(args, accelerator, model, network, video, audio, contexts, tags)
     assert drift == pytest.approx(1.0, abs=1e-5)
     assert network.unet_loras[0].multiplier == 1.0  # restored after the base forwards
+    assert trainer._gd_probe is not None
+
+    # the probe is FIXED: a wildly different batch must give the identical reading
+    other = trainer._measure_guidance_drift(
+        args, accelerator, model, network, torch.randn(2, 2, 1, 4, 6) * 9, torch.randn(2, 3, 2, 2) * 9,
+        [torch.randn(1, 7, 8)] * 2, [torch.ones(7, dtype=torch.long)] * 2,
+    )
+    assert other == pytest.approx(drift, abs=1e-6)
 
     with torch.no_grad():
         for module in network.unet_loras:
             module.lora_up.weight.normal_(0, 1.0)
-    drift_perturbed = trainer._measure_guidance_drift(args, accelerator, model, network, video, audio, sigma, contexts, tags)
+    drift_perturbed = trainer._measure_guidance_drift(args, accelerator, model, network, video, audio, contexts, tags)
     assert drift_perturbed != pytest.approx(1.0, abs=1e-4)
     assert 0.0 < drift_perturbed < 10.0
