@@ -55,7 +55,8 @@ git branch -f "$BRANCH" "$commit"
 unset GIT_INDEX_FILE
 
 echo "== verify: leftovers that must NOT be in $BRANCH:"
-if git ls-tree -r --name-only "$BRANCH" | grep -E "claude_review|^local/|release\.sh|cfg/(p_)?(cheststand|plushy|squishy|bb|bcatch|test_|woman|arched)"; then
+if git ls-tree -r --name-only "$BRANCH" | grep -E "claude_review|^local/|release\.sh|runpod_setup|train_pyros" \
+    || git ls-tree -r --name-only "$BRANCH" | grep "^\.pyro/h3/cfg/" | grep -v lucy_v2; then
     echo "RELEASE CONTAINS EXCLUDED FILES — aborting" >&2
     exit 1
 fi
