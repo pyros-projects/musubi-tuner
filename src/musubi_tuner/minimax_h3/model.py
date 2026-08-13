@@ -457,6 +457,10 @@ class MiniMaxH3Model(nn.Module):
         self.blocks_to_swap = 0
         self.offloader = None
         self._offload_activations = False
+        # CREPA block-output capture (armed by set_crepa_capture). Recording happens
+        # in the block loops AFTER the checkpoint boundary so captured student
+        # features stay graph-connected under non-reentrant checkpointing.
+        self._crepa_capture: dict | None = None
         self._offload_min_bytes = 1 << 20
         self._pinned_pool: dict[tuple, list] = {}
 
@@ -668,6 +672,7 @@ class MiniMaxH3Model(nn.Module):
             time_embedding = self.time_embedder(time_values).to(compute_dtype)
         rope_angles = self.rope_angles(layout.position_ids, video.device)
 
+        self._crepa_record_layout(layout.video_slice, latent_t)
         with self._activation_offload_ctx():
             for index, block in enumerate(self.blocks):
                 if self.blocks_to_swap:
@@ -678,6 +683,7 @@ class MiniMaxH3Model(nn.Module):
                     )
                 else:
                     hidden = block(hidden, time_embedding, modulation_rows, rope_angles)
+                self._crepa_record_block(index, hidden)
                 if self.blocks_to_swap:
                     self.offloader.submit_move_blocks_forward(self.blocks, index)
 
@@ -720,6 +726,7 @@ class MiniMaxH3Model(nn.Module):
 
         prep = self._prepare_packed_batch(video, audio, sigma_video, context, text_token_tags)
         hidden = prep["hidden"]
+        self._crepa_record_layout(prep["layout"].video_slice, prep["latent_dims"][0])
         with self._activation_offload_ctx():
             for index, block in enumerate(self.blocks):
                 if self.blocks_to_swap:
@@ -731,6 +738,7 @@ class MiniMaxH3Model(nn.Module):
                     )
                 else:
                     hidden = block(hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"])
+                self._crepa_record_block(index, hidden)
                 if self.blocks_to_swap:
                     self.offloader.submit_move_blocks_forward(self.blocks, index)
         return self._finalize_packed(hidden, prep, video.dtype, audio.dtype)
@@ -761,6 +769,8 @@ class MiniMaxH3Model(nn.Module):
 
         hidden = prep["hidden"]
         uncond_hidden = uncond_prep["hidden"]
+        # CREPA records the conditional stream only.
+        self._crepa_record_layout(prep["layout"].video_slice, prep["latent_dims"][0])
         with self._activation_offload_ctx():
             for index, block in enumerate(self.blocks):
                 if self.blocks_to_swap:
@@ -772,6 +782,7 @@ class MiniMaxH3Model(nn.Module):
                     )
                 else:
                     hidden = block(hidden, prep["time_embedding"], prep["modulation_rows"], prep["rope_angles"], prep["attn_mask"])
+                self._crepa_record_block(index, hidden)
                 with torch.no_grad():
                     uncond_hidden = block(
                         uncond_hidden,
@@ -887,6 +898,37 @@ class MiniMaxH3Model(nn.Module):
             "n_times": n_times,
             "latent_dims": (latent_t, latent_h, latent_w),
         }
+
+    def set_crepa_capture(self, student_block_idx: int | None, teacher_block_idx: int | None = None) -> None:
+        """Arm (or disarm with None) CREPA block-output recording for training forwards."""
+        if student_block_idx is None:
+            self._crepa_capture = None
+            return
+        self._crepa_capture = {
+            "student_idx": int(student_block_idx),
+            "teacher_idx": int(teacher_block_idx),
+            "student": None,
+            "teacher": None,
+            "video_slice": None,
+            "latent_t": 0,
+        }
+
+    def _crepa_record_layout(self, video_slice, latent_t: int) -> None:
+        cap = self._crepa_capture
+        if cap is not None:
+            cap["video_slice"] = video_slice
+            cap["latent_t"] = int(latent_t)
+            cap["student"] = None
+            cap["teacher"] = None
+
+    def _crepa_record_block(self, index: int, hidden: torch.Tensor) -> None:
+        cap = self._crepa_capture
+        if cap is None:
+            return
+        if index == cap["student_idx"]:
+            cap["student"] = hidden
+        if index == cap["teacher_idx"]:
+            cap["teacher"] = hidden.detach()
 
     def _finalize_packed(
         self, hidden: torch.Tensor, prep: dict, video_dtype: torch.dtype, audio_dtype: torch.dtype

@@ -503,7 +503,39 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         drift = getattr(self, "_last_guidance_drift", None)
         if drift is not None:
             logs["gd"] = round(drift, 3)
+        crepa = getattr(self, "_crepa", None)
+        if crepa is not None and crepa.last_loss is not None:
+            logs["crepa"] = round(crepa.last_loss, 4)
         return logs
+
+    def extra_trainable_params(self, args, accelerator, network, transformer, trainable_params):
+        if not getattr(args, "crepa", False):
+            return trainable_params
+        from musubi_tuner.minimax_h3.crepa import CREPAModule, parse_crepa_args
+
+        config = parse_crepa_args(getattr(args, "crepa_args", None))
+        model = accelerator.unwrap_model(transformer)
+        config.validate(len(model.blocks))
+        if config.max_steps <= 0:
+            config.max_steps = int(getattr(args, "max_train_steps", 0) or 0)
+        module = CREPAModule(config, model.hidden_size)
+        module.projector.to(device=accelerator.device, dtype=torch.float32)
+        model.set_crepa_capture(config.student_block_idx, config.teacher_block_idx)
+        # Projector persists in the Accelerate state dir (resume-safe, not needed at inference).
+        accelerator.register_for_checkpointing(module.projector)
+        self._crepa = module
+        projector_params = list(module.projector.parameters())
+        logger.info(
+            "CREPA enabled: student block %d -> teacher block %d, lambda %.3f (%s), tau %.2f, K %d, projector %.1fM params",
+            config.student_block_idx,
+            config.teacher_block_idx,
+            config.lambda_crepa,
+            config.schedule,
+            config.tau,
+            config.num_neighbors,
+            sum(p.numel() for p in projector_params) / 1e6,
+        )
+        return list(trainable_params) + [{"params": projector_params, "lr": args.learning_rate}]
 
     def extra_step_logs(self, args, logs) -> dict:
         extra = {}
@@ -781,7 +813,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         else:
             audio_loss = self._weighted_mse(pred_audio.to(network_dtype), target_audio, sigma_audio, args.weighting_scheme)
             loss = (video_loss + args.audio_loss_weight * audio_loss) / (1.0 + args.audio_loss_weight)
-        return loss, {"loss/video": float(video_loss.detach()), "loss/audio": float(audio_loss.detach())}
+        logs = {"loss/video": float(video_loss.detach()), "loss/audio": float(audio_loss.detach())}
+
+        crepa = getattr(self, "_crepa", None)
+        if crepa is not None:
+            crepa.on_step(global_step)
+            capture = accelerator.unwrap_model(transformer)._crepa_capture
+            crepa_loss = crepa.compute_loss(capture or {})
+            if crepa_loss is not None:
+                loss = loss + crepa_loss.to(loss.dtype)
+                logs["loss/crepa"] = crepa.last_loss
+        return loss, logs
 
 
 def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -793,6 +835,17 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         choices=("none", "silent"),
         default="none",
         help="empty image audio rows (none) or duration-matched noised zero-audio rows (silent)",
+    )
+    parser.add_argument(
+        "--crepa",
+        action="store_true",
+        help="enable CREPA cross-frame representation alignment (video batches only; image batches are skipped)",
+    )
+    parser.add_argument(
+        "--crepa_args",
+        nargs="*",
+        default=None,
+        help="CREPA key=value settings: student_block_idx teacher_block_idx lambda_crepa tau num_neighbors schedule warmup_steps max_steps normalize",
     )
     parser.add_argument(
         "--lora_target_preset",
