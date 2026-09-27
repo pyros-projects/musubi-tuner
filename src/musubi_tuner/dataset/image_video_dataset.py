@@ -93,6 +93,8 @@ ARCHITECTURE_QWEN_IMAGE_LAYERED = "qil"
 ARCHITECTURE_QWEN_IMAGE_LAYERED_FULL = "qwen_image_layered"
 ARCHITECTURE_KREA2 = "kr2"
 ARCHITECTURE_KREA2_FULL = "krea2"
+ARCHITECTURE_QWEN_IMAGE21 = "qi21"
+ARCHITECTURE_QWEN_IMAGE21_FULL = "qwen_image21"
 ARCHITECTURE_KANDINSKY5 = "k5"
 ARCHITECTURE_KANDINSKY5_FULL = "kandinsky5"
 ARCHITECTURE_HUNYUAN_VIDEO_1_5 = "hv15"
@@ -429,6 +431,17 @@ def save_latent_cache_krea2(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
 
 
+def save_latent_cache_qwen_image21(item_info: ItemInfo, latent: torch.Tensor):
+    """Qwen-Image 2.1 architecture. Single image, normalized 64-channel latents."""
+    assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
+
+    _, F, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE21_FULL)
+
+
 def save_latent_cache_boogu_image(item_info: ItemInfo, latent: torch.Tensor):
     """Boogu Image Base architecture. Single image FLUX-compatible VAE latents."""
     assert latent.dim() == 3, "latent should be 3D tensor (channel, height, width)"
@@ -669,6 +682,17 @@ def save_text_encoder_output_cache_krea2(item_info: ItemInfo, embed: torch.Tenso
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
 
 
+def save_text_encoder_output_cache_qwen_image21(item_info: ItemInfo, embed: torch.Tensor):
+    """Qwen-Image 2.1 architecture. embed: Qwen3-VL-8B states with the system turn dropped, (tokens, 4096)."""
+    assert embed.dim() == 2, "embed should be 2D tensor (tokens, hidden)"
+
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    sd[f"varlen_qwen21_vl_embed_{dtype_str}"] = embed.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE21_FULL)
+
+
 def save_text_encoder_output_cache_boogu_image(item_info: ItemInfo, embed: torch.Tensor):
     """Boogu Image instruction feature cache.
 
@@ -764,6 +788,7 @@ class BucketSelector:
     RESOLUTION_STEPS_QWEN_IMAGE = 16
     RESOLUTION_STEPS_QWEN_IMAGE_EDIT = 16
     RESOLUTION_STEPS_KREA2 = 16
+    RESOLUTION_STEPS_QWEN_IMAGE21 = 16
     RESOLUTION_STEPS_KANDINSKY5 = 16
     RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5 = 16
     RESOLUTION_STEPS_Z_IMAGE = 16
@@ -782,6 +807,7 @@ class BucketSelector:
         ARCHITECTURE_QWEN_IMAGE_EDIT: RESOLUTION_STEPS_QWEN_IMAGE_EDIT,
         ARCHITECTURE_QWEN_IMAGE_LAYERED: RESOLUTION_STEPS_QWEN_IMAGE,  # use same steps as Qwen-Image
         ARCHITECTURE_KREA2: RESOLUTION_STEPS_KREA2,
+        ARCHITECTURE_QWEN_IMAGE21: RESOLUTION_STEPS_QWEN_IMAGE21,
         ARCHITECTURE_KANDINSKY5: RESOLUTION_STEPS_KANDINSKY5,
         ARCHITECTURE_HUNYUAN_VIDEO_1_5: RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5,
         ARCHITECTURE_Z_IMAGE: RESOLUTION_STEPS_Z_IMAGE,

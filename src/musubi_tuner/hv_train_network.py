@@ -1521,6 +1521,7 @@ class NetworkTrainer:
             or args.timestep_sampling == "qinglong_qwen"
             or args.timestep_sampling == "flux2_shift"
             or args.timestep_sampling == "krea2_shift"
+            or args.timestep_sampling == "qwen21_shift"
         ):
 
             def compute_sampling_timesteps(org_timesteps: Optional[torch.Tensor]) -> torch.Tensor:
@@ -1562,6 +1563,9 @@ class NetworkTrainer:
                             mu = train_utils.get_lin_function(x1=256, y1=0.5, x2=8192, y2=0.9)((h // 2) * (w // 2))
                         elif args.timestep_sampling == "krea2_shift":
                             mu = train_utils.get_lin_function(x1=256, y1=0.5, x2=6400, y2=1.15)((h // 2) * (w // 2))
+                        elif args.timestep_sampling == "qwen21_shift":
+                            # Qwen-Image 2.1 latents are unpacked: one token per latent pixel
+                            mu = train_utils.get_lin_function(x1=256, y1=0.5, x2=8192, y2=0.9)(h * w)
                         # def time_shift(mu: float, sigma: float, t: torch.Tensor):
                         #     return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma) # sigma=1.0
                         shift = math.exp(mu)
@@ -4813,13 +4817,14 @@ def setup_parser_common() -> argparse.ArgumentParser:
             "flux2_shift",
             "qwen_shift",
             "krea2_shift",
+            "qwen21_shift",
             "logsnr",
             "qinglong_flux",
             "qinglong_qwen",
             "shifted_logit_normal",
         ],
         default="sigma",
-        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, flux/qwen/krea2 shift, "
+        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, flux/qwen/krea2/qwen21 shift, "
         "or shifted_logit_normal (sequence-length-adaptive, official LTX-2 method)."
         " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
     )
