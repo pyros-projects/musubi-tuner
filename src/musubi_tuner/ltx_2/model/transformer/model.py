@@ -150,6 +150,8 @@ class LTXModel(torch.nn.Module):
         apply_gated_attention: bool = False,
         caption_proj_before_connector: bool = False,
         cross_attention_adaln: bool = False,
+        ff_bias: bool = True,
+        use_keyframes_abs_pos_embedding: bool = False,
     ):
         super().__init__()
         self._enable_gradient_checkpointing = False
@@ -168,6 +170,8 @@ class LTXModel(torch.nn.Module):
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.caption_proj_before_connector = caption_proj_before_connector
         self.cross_attention_adaln = cross_attention_adaln
+        self.ff_bias = ff_bias
+        self.use_keyframes_abs_pos_embedding = use_keyframes_abs_pos_embedding
         cross_pe_max_pos = None
         if model_type.is_video_enabled():
             if positional_embedding_max_pos is None:
@@ -248,6 +252,12 @@ class LTXModel(torch.nn.Module):
         self.scale_shift_table = torch.nn.Parameter(torch.empty(2, self.inner_dim))
         self.norm_out = torch.nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=norm_eps)
         self.proj_out = torch.nn.Linear(self.inner_dim, out_channels)
+
+        # LTX-2.5 keyframe conditioning embedding. Load-compat only for now: the
+        # parameter must exist so checkpoint loading is exact; keyframe-conditioned
+        # inference does not consume it in this trainer yet.
+        if self.use_keyframes_abs_pos_embedding:
+            self.keyframes_abs_pos_embedding = torch.nn.Parameter(torch.empty(1, self.inner_dim))
 
     def _init_audio(
         self,
@@ -404,6 +414,7 @@ class LTXModel(torch.nn.Module):
                 context_dim=cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
                 cross_attention_adaln=self.cross_attention_adaln,
+                ff_bias=self.ff_bias,
             )
             if self.model_type.is_video_enabled()
             else None
@@ -416,6 +427,9 @@ class LTXModel(torch.nn.Module):
                 context_dim=audio_cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
                 cross_attention_adaln=self.cross_attention_adaln,
+                # LTX-2.5 sets ff_bias=false but only the video FF drops its biases;
+                # audio_ff keeps bias tensors in the shipped checkpoints.
+                ff_bias=True,
             )
             if self.model_type.is_audio_enabled()
             else None

@@ -417,9 +417,24 @@ def module_ops_from_gemma_root(
     else:
         raise ValueError("Either gemma_root, gemma_weights_path, or gemma_safetensors must be provided")
 
+    # Gemma-4 (LTX-2.5) checkpoints are detected via their embedded gemma_config
+    # metadata and handled by the native encoder — transformers has no gemma4 support.
+    gemma4_config = None
+    if gemma_safetensors:
+        from musubi_tuner.ltx_2.text_encoders.gemma.gemma4_text_model import gemma4_metadata_config
+
+        gemma4_config = gemma4_metadata_config(gemma_safetensors)
+        if gemma4_config is not None:
+            logger.info("Detected Gemma-4 unified checkpoint — using the native text encoder")
+
     # Resolve tokenizer: from gemma_root directory or extracted from safetensors
-    if gemma_root is not None:
-        tokenizer_path: str | bytes = _find_matching_dir(gemma_root, "tokenizer.model")
+    if gemma4_config is not None:
+        from musubi_tuner.ltx_2.text_encoders.gemma.gemma4_text_model import extract_tokenizer_json_bytes
+
+        logger.info("Extracting embedded Gemma-4 tokenizer from safetensors file...")
+        tokenizer_path = extract_tokenizer_json_bytes(gemma_safetensors)
+    elif gemma_root is not None:
+        tokenizer_path = _find_matching_dir(gemma_root, "tokenizer.model")
     elif gemma_safetensors:
         logger.info("Extracting tokenizer from safetensors file...")
         tokenizer_path = _extract_spiece_model_bytes(gemma_safetensors)
@@ -429,6 +444,23 @@ def module_ops_from_gemma_root(
     def load_gemma(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
         if load_in_8bit and load_in_4bit:
             raise ValueError("Only one of load_in_8bit or load_in_4bit can be enabled")
+
+        if gemma4_config is not None:
+            if load_in_8bit or load_in_4bit:
+                raise ValueError("8-bit/4-bit loading is not supported for the native Gemma-4 encoder; use the bf16 checkpoint")
+            if keep_fp8:
+                raise ValueError("fp8/quantized Gemma-4 checkpoints are not supported; use the bf16 release file")
+            from musubi_tuner.ltx_2.text_encoders.gemma.gemma4_text_model import load_gemma4_text_encoder
+
+            logger.info(f"Loading native Gemma-4 text encoder from {gemma_safetensors}...")
+            module.model = load_gemma4_text_encoder(
+                gemma_safetensors,
+                gemma4_config,
+                torch_dtype=torch_dtype,
+                device=device,
+            )
+            logger.info("Gemma-4 text encoder loaded")
+            return module
 
         if load_in_8bit or load_in_4bit:
             if not torch.cuda.is_available():

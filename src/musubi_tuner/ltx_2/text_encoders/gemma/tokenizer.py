@@ -1,6 +1,62 @@
 from transformers import AutoTokenizer
 
 
+class _TokenizersJsonAdapter:
+    """Adapter around ``tokenizers.Tokenizer`` exposing the subset of the
+    HuggingFace tokenizer API used by LTXVGemmaTokenizer. Used for Gemma-4
+    checkpoints, which embed the tokenizer as a ``tokenizer_json`` tensor
+    (HF tokenizers format) instead of a sentencepiece model.
+    """
+
+    def __init__(self, tokenizer_json: bytes, max_length: int = 256, bos_token_id: int = 2, pad_token_id: int = 0):
+        from tokenizers import Tokenizer
+
+        self.tokenizer = Tokenizer.from_str(tokenizer_json.decode("utf-8"))
+        self.model_max_length = max_length
+        self.padding_side = "left"
+        self.bos_token_id = bos_token_id
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, text, padding=None, max_length=None, truncation=False, return_tensors=None):
+        import torch
+
+        ids = self.tokenizer.encode(text).ids
+        # The embedded tokenizer JSON may or may not carry a BOS post-processor.
+        if not ids or ids[0] != self.bos_token_id:
+            ids = [self.bos_token_id] + ids
+        if truncation and max_length is not None:
+            ids = ids[:max_length]
+
+        attn = [1] * len(ids)
+        if padding == "max_length" and max_length is not None:
+            pad_len = max_length - len(ids)
+            if pad_len > 0:
+                if self.padding_side == "left":
+                    ids = [self.pad_token_id] * pad_len + ids
+                    attn = [0] * pad_len + attn
+                else:
+                    ids = ids + [self.pad_token_id] * pad_len
+                    attn = attn + [0] * pad_len
+
+        if return_tensors == "pt":
+
+            class _Out:
+                pass
+
+            out = _Out()
+            out.input_ids = torch.tensor([ids], dtype=torch.long)
+            out.attention_mask = torch.tensor([attn], dtype=torch.long)
+            return out
+
+        return {"input_ids": [ids], "attention_mask": [attn]}
+
+    def apply_chat_template(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Chat template is not available for the embedded Gemma-4 tokenizer; "
+            "prompt enhancement is not supported with the native Gemma-4 encoder."
+        )
+
+
 class _SentencePieceTokenizerAdapter:
     """Thin adapter around sentencepiece.SentencePieceProcessor that exposes
     the subset of the HuggingFace tokenizer API used by LTXVGemmaTokenizer.
@@ -75,7 +131,12 @@ class LTXVGemmaTokenizer:
             max_length (int, optional): Max sequence length for encoding. Defaults to 256.
         """
         if isinstance(tokenizer_path, bytes):
-            self.tokenizer = _SentencePieceTokenizerAdapter(tokenizer_path, max_length)
+            # Gemma-4 checkpoints embed an HF-tokenizers JSON; gemma3 files carry
+            # a binary sentencepiece proto. JSON always starts with '{'.
+            if tokenizer_path.lstrip()[:1] == b"{":
+                self.tokenizer = _TokenizersJsonAdapter(tokenizer_path, max_length)
+            else:
+                self.tokenizer = _SentencePieceTokenizerAdapter(tokenizer_path, max_length)
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_path, local_files_only=True, model_max_length=max_length

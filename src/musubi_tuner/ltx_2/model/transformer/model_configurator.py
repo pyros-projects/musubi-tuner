@@ -67,6 +67,8 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             apply_gated_attention=config.get("apply_gated_attention", False),
             caption_proj_before_connector=config.get("caption_proj_before_connector", False),
             cross_attention_adaln=config.get("cross_attention_adaln", False),
+            ff_bias=config.get("ff_bias", True),
+            use_keyframes_abs_pos_embedding=config.get("use_keyframes_abs_pos_embedding", False),
         )
 
 
@@ -116,6 +118,8 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             apply_gated_attention=config.get("apply_gated_attention", False),
             caption_proj_before_connector=config.get("caption_proj_before_connector", False),
             cross_attention_adaln=config.get("cross_attention_adaln", False),
+            ff_bias=config.get("ff_bias", True),
+            use_keyframes_abs_pos_embedding=config.get("use_keyframes_abs_pos_embedding", False),
         )
 
 

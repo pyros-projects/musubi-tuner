@@ -247,6 +247,49 @@ def detect_ltx2_config(model_path: str) -> Dict[str, Any]:
     return config
 
 
+def _scan_ltx2_int8_convrot_layers(model_files) -> Dict[str, Any]:
+    """Detect comfy INT8 ConvRot markers in DiT checkpoint files (header-only reads).
+
+    Returns Int8ConvRotConfig entries keyed by INTERNAL module names (comfy
+    ``model.diffusion_model.`` prefix stripped), ready for
+    ``apply_int8_convrot_monkey_patch`` on the meta-built model.
+    """
+    import json as _json
+
+    from safetensors import safe_open as _safe_open
+
+    from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
+    from musubi_tuner.modules.int8_optimization_utils import Int8ConvRotConfig
+
+    layers: Dict[str, Any] = {}
+    for path in model_files:
+        with _safe_open(str(path), framework="pt", device="cpu") as f:
+            keys = set(f.keys())
+            for marker_key in (k for k in keys if k.endswith(".comfy_quant")):
+                base = marker_key[: -len(".comfy_quant")]
+                module_key = base[: -len(".weight")] if base.endswith(".weight") else base
+                weight_key = f"{module_key}.weight"
+                scale_key = f"{module_key}.weight_scale"
+                if weight_key not in keys:
+                    continue
+                marker = _json.loads(bytes(f.get_tensor(marker_key).tolist()).decode("utf-8"))
+                params = marker.get("params", {})
+                if marker.get("format") != "int8_tensorwise" or not marker.get("convrot", params.get("convrot", False)):
+                    raise ValueError(
+                        f"Unsupported quantization format for {module_key}: {marker.get('format')!r} "
+                        "(only int8 ConvRot checkpoints are supported; nvfp4 files are not)"
+                    )
+                if scale_key not in keys:
+                    raise ValueError(f"Quantized layer {module_key} is missing its weight_scale tensor")
+                renamed = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(weight_key)
+                module_name = (renamed if renamed is not None else weight_key)[: -len(".weight")]
+                layers[module_name] = Int8ConvRotConfig(
+                    group_size=int(marker.get("convrot_groupsize", params.get("convrot_groupsize", 256))),
+                    scale_shape=tuple(f.get_slice(scale_key).get_shape()),
+                )
+    return layers
+
+
 def infer_ltx_version_from_checkpoint_config(config: Dict[str, Any]) -> Tuple[str, List[str]]:
     """Infer checkpoint generation (2.0 vs 2.3) from metadata config markers."""
     markers: List[str] = []
@@ -405,7 +448,9 @@ def load_ltx2_model(
     """
     def _cast_non_fp8_params(model: torch.nn.Module, target_dtype: torch.dtype) -> None:
         for module in model.modules():
-            is_quantized_linear = isinstance(module, torch.nn.Linear) and hasattr(module, "scale_weight")
+            is_quantized_linear = isinstance(module, torch.nn.Linear) and (
+                hasattr(module, "scale_weight") or hasattr(module, "int8_convrot_group_size")
+            )
             if is_quantized_linear:
                 continue
             for _, param in module.named_parameters(recurse=False):
@@ -432,6 +477,29 @@ def load_ltx2_model(
 
     load_weights_on_cpu = _resolved_quant_device.type != "cuda"
     state_device = torch.device("cpu") if load_weights_on_cpu else load_device
+
+    # Official int8-convrot checkpoints are auto-detected via their .comfy_quant
+    # markers and handled by a dedicated frozen-INT8 base lane.
+    _int8_convrot_layers = _scan_ltx2_int8_convrot_layers(
+        model_path if isinstance(model_path, list) else [model_path]
+    )
+    if _int8_convrot_layers:
+        _conflicts = [
+            flag
+            for flag, active in (
+                ("--fp8_base/--fp8_scaled", fp8_scaled),
+                ("--fp8_w8a8", fp8_w8a8),
+                ("--nf4_base", nf4_base),
+                ("--fp8_upcast", fp8_upcast or fp8_upcast_stochastic),
+            )
+            if active
+        ]
+        if _conflicts:
+            raise ValueError(
+                f"Checkpoint is int8-convrot quantized ({len(_int8_convrot_layers)} linears); "
+                f"drop {', '.join(_conflicts)} — the INT8 ConvRot base lane is selected automatically."
+            )
+        logger.info("INT8 ConvRot base: %d quantized linears detected in checkpoint", len(_int8_convrot_layers))
 
     from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
     from musubi_tuner.ltx_2.model.transformer.model_configurator import (
@@ -683,7 +751,8 @@ def load_ltx2_model(
             fp8_optimization=False,
             calc_device=state_device,
             move_to_device=not load_weights_on_cpu,
-            dit_weight_dtype=torch_dtype,
+            # INT8 payloads and F32 scales must keep their checkpoint dtypes.
+            dit_weight_dtype=None if _int8_convrot_layers else torch_dtype,
             target_keys=None,
             exclude_keys=None,
         )
@@ -694,6 +763,8 @@ def load_ltx2_model(
             nk = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(k)
             renamed_sd[nk if nk is not None else k] = v
         sd = renamed_sd
+    if _int8_convrot_layers:
+        sd = {k: v for k, v in sd.items() if not k.endswith(".comfy_quant")}
 
     def _trace_vram_ltx2(tag):
         if torch.cuda.is_available():
@@ -707,6 +778,10 @@ def load_ltx2_model(
         apply_nf4_monkey_patch(base_model, sd, block_size=nf4_block_size, awq_scales=_awq_scales)
     elif fp8_scaled:
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
+    elif _int8_convrot_layers:
+        from musubi_tuner.modules.int8_optimization_utils import apply_int8_convrot_monkey_patch
+
+        apply_int8_convrot_monkey_patch(base_model, _int8_convrot_layers)
     _trace_vram_ltx2("AFTER apply monkey patch")
     base_model.load_state_dict(sd, strict=False, assign=True)
     _trace_vram_ltx2("AFTER load_state_dict (model still on meta/cpu)")
