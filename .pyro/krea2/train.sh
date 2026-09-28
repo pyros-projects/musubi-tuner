@@ -23,7 +23,8 @@ BYPASS_WEIGHT="${BYPASS_WEIGHT:-5}"
 BYPASS_MERGE="${BYPASS_MERGE:-0}"
 # Frozen LoRA overlay, PATH[:STRENGTH], e.g. the TextFusion refusal-reduction LoRA. Like BYPASS it is active in
 # training and snapshots, and it is never saved: load it next to the trained LoRA at inference. Tags runs -ovl-<file>.
-TRAIN_LORA_OVERLAY="${TRAIN_LORA_OVERLAY:-}"
+# On by default with the refusal-reduction LoRA; set TRAIN_LORA_OVERLAY= to train without it.
+TRAIN_LORA_OVERLAY="${TRAIN_LORA_OVERLAY-/home/pyro/models/comfy/loras/krea/adapter/Krea2_TextFusion_Refusal_Reduction.safetensors}"
 
 NAME="${NAME:-cobra}"
 LORA_CONFIG="${LORA_CONFIG:-default}"   # default | preset-1 | preset-2 | preset-3 | custom
@@ -31,11 +32,11 @@ NETWORK_ARGS="${NETWORK_ARGS:-}"        # optional raw Musubi --network_args ent
 CACHE_DATASET="${CACHE_DATASET:-0}"     # 1/true/yes/on = cache latents and text encoder outputs before training
 OPTIMIZER="${OPTIMIZER:-adamw8bit}"   # adamw8bit | adafactor | prodigy
 SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
-MAX_STEPS="${MAX_STEPS:-1000}"
+MAX_STEPS="${MAX_STEPS:-2000}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
-NETWORK_DIM="${NETWORK_DIM:-16}"
-NETWORK_ALPHA="${NETWORK_ALPHA:-16}"
+NETWORK_DIM="${NETWORK_DIM:-32}"
+NETWORK_ALPHA="${NETWORK_ALPHA:-32}"
 BLOCKS_TO_SWAP="${BLOCKS_TO_SWAP:-0}"
 SAMPLE_BLOCKS_TO_SWAP="${SAMPLE_BLOCKS_TO_SWAP:-0}"  # 0 = unswapped snapshots, "inherit" = use BLOCKS_TO_SWAP
 SAMPLE_WITH_OFFLOADING="${SAMPLE_WITH_OFFLOADING:-1}"  # 1 = offload DiT before snapshot VAE decode

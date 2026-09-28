@@ -171,12 +171,16 @@ embedded bypass diff.
 
 `TRAIN_LORA_OVERLAY` puts a frozen LoRA on the DiT, for example Capitan01R's
 [TextFusion Refusal-Reduction LoRA](https://civitai.com/models/2775340/krea2-textfusion-refusal-reduction-lora),
-a LoRA alternative to the projector bypass. It is off by default:
+a LoRA alternative to the projector bypass. It is on by default:
+
+```text
+TRAIN_LORA_OVERLAY  /home/pyro/models/comfy/loras/krea/adapter/Krea2_TextFusion_Refusal_Reduction.safetensors
+```
+
+Train without it:
 
 ```bash
-NAME=msplits \
-TRAIN_LORA_OVERLAY=/home/pyro/models/comfy/loras/krea/adapter/Krea2_TextFusion_Refusal_Reduction.safetensors \
-.pyro/krea2/train.sh
+NAME=msplits TRAIN_LORA_OVERLAY= .pyro/krea2/train.sh
 ```
 
 The overlay:
@@ -205,8 +209,8 @@ MAX_STEPS       default 2000
 SAVE_EVERY      default 100
 SAMPLE_EVERY    default 50
 GRAD_ACCUM      default 1
-NETWORK_DIM     default 16
-NETWORK_ALPHA   default 16
+NETWORK_DIM     default 32
+NETWORK_ALPHA   default 32
 OPTIMIZER       adamw8bit | adafactor | prodigy
 ```
 
