@@ -360,6 +360,13 @@ class Krea2NetworkTrainer(NetworkTrainer):
             attn_mode=attn_mode,
             split_attn=split_attn,
         )
+        if any(hasattr(module, "int8_convrot_group_size") for module in model.modules()):
+            # the offloader only moves .weight (not the INT8 weight_scale buffers), and torch.compile
+            # cannot trace comfy-kitchen's kernel (its failure silently disables kitchen for the run)
+            if self.blocks_to_swap:
+                raise ValueError("The INT8 ConvRot Krea 2 DiT does not support --blocks_to_swap (it takes ~13.5 GB).")
+            if args.compile:
+                raise ValueError("The INT8 ConvRot Krea 2 DiT does not support --compile.")
         if getattr(args, "bypass", None):
             apply_projector_bypass_from_file(model, args.bypass, getattr(args, "bypass_weight", 1.0))
         return model

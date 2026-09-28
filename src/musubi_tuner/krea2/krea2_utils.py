@@ -13,8 +13,9 @@ from musubi_tuner.krea2.krea2_encoder import (
 )
 from musubi_tuner.krea2.krea2_mmdit import SingleMMDiTConfig, SingleStreamDiT
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
+from musubi_tuner.modules.int8_optimization_utils import apply_int8_convrot_monkey_patch, scan_int8_convrot
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
-from musubi_tuner.utils.safetensors_utils import load_safetensors
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,14 @@ def load_krea2_dit(
     loading_device = device if loading_device is None else torch.device(loading_device)
     has_lora = lora_weights is not None and len(lora_weights) > 0
 
+    int8_layers = krea2_int8_convrot_layers(dit_path)
+    if int8_layers:
+        if fp8_scaled:
+            raise ValueError(f"{dit_path} is INT8 ConvRot quantized; drop --fp8_base/--fp8_scaled (INT8 is used as is).")
+        if has_lora:
+            raise ValueError("Merging LoRA weights into an INT8 ConvRot Krea 2 DiT is not supported.")
+        return _load_krea2_int8_dit(dit_path, int8_layers, config, loading_device, attn_mode, split_attn)
+
     logger.info(
         f"Loading Krea 2 DiT weights from {dit_path}"
         + (" (fp8 scaled)" if fp8_scaled else "")
@@ -115,6 +124,38 @@ def load_krea2_dit(
         sd = load_safetensors(dit_path, device=loading_device, disable_mmap=True, dtype=dtype)
         dit.load_state_dict(sd, strict=True, assign=True)
 
+    return dit
+
+
+def krea2_int8_convrot_layers(dit_path: str) -> dict:
+    """Comfy INT8 ConvRot layers of a Krea 2 DiT file (header-only read); empty for bf16 files."""
+    with MemoryEfficientSafeOpen(dit_path) as reader:
+        return scan_int8_convrot(reader)
+
+
+def _load_krea2_int8_dit(
+    dit_path: str,
+    int8_layers: dict,
+    config: SingleMMDiTConfig,
+    loading_device: torch.device,
+    attn_mode: str,
+    split_attn: bool,
+) -> SingleStreamDiT:
+    """Comfy ``krea2_*_int8_convrot`` files: the main blocks' Linears stay frozen INT8 and run through
+    comfy-kitchen (LoRA trains on top); every other tensor keeps its checkpoint dtype, as in the fp8 lane."""
+    logger.info(f"Loading Krea 2 DiT weights from {dit_path} (INT8 ConvRot, {len(int8_layers)} quantized Linears)")
+    with torch.device("meta"):
+        dit = SingleStreamDiT(config, attn_mode=attn_mode, split_attn=split_attn)
+    apply_int8_convrot_monkey_patch(dit, int8_layers)
+
+    sd = {}
+    with MemoryEfficientSafeOpen(dit_path) as reader:
+        for key in reader.keys():
+            if not key.endswith(".comfy_quant"):
+                sd[key] = reader.get_tensor(key, device=loading_device)
+    if loading_device.type == "cuda":
+        torch.cuda.synchronize(loading_device)
+    dit.load_state_dict(sd, strict=True, assign=True)
     return dit
 
 

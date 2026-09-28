@@ -2,7 +2,7 @@
 
 `.pyro/krea2/train.sh` is a small environment-variable driven wrapper for Krea2
 LoRA training. It keeps dataset selection, output naming, cache refreshes,
-sampling LoRA, fp8 base loading, and LoRA target presets in one place.
+sampling LoRA, the INT8 ConvRot (or fp8) base, and LoRA target presets in one place.
 
 Run it from the repo root:
 
@@ -191,7 +191,8 @@ NAME=msplits OPTIMIZER=prodigy .pyro/krea2/train.sh
 
 ## Block Swap And Sampling Speed
 
-Training block swap defaults to `BLOCKS_TO_SWAP=10`.
+Training block swap defaults to `BLOCKS_TO_SWAP=0`. The INT8 ConvRot DiT (the default, about
+13.5 GB) does not support block swap at all; it needs a bf16 `DIT` with `FP8=1`.
 
 Snapshot VAE decode offload defaults to `SAMPLE_WITH_OFFLOADING=1`. This passes
 `--sample_with_offloading`, so Krea2 moves the DiT to CPU after denoising and
@@ -211,8 +212,8 @@ SAMPLE_BLOCKS_TO_SWAP=N        use N swapped blocks only during sampling
 Examples:
 
 ```bash
-NAME=msplits BLOCKS_TO_SWAP=10 SAMPLE_BLOCKS_TO_SWAP=0 .pyro/krea2/train.sh
-NAME=msplits BLOCKS_TO_SWAP=10 SAMPLE_BLOCKS_TO_SWAP=inherit .pyro/krea2/train.sh
+DIT=/path/to/krea2_raw_bf16.safetensors FP8=1 NAME=msplits BLOCKS_TO_SWAP=10 SAMPLE_BLOCKS_TO_SWAP=0 .pyro/krea2/train.sh
+DIT=/path/to/krea2_raw_bf16.safetensors FP8=1 NAME=msplits BLOCKS_TO_SWAP=10 SAMPLE_BLOCKS_TO_SWAP=inherit .pyro/krea2/train.sh
 NAME=msplits SAMPLE_WITH_OFFLOADING=0 .pyro/krea2/train.sh
 ```
 
@@ -221,16 +222,25 @@ NAME=msplits SAMPLE_WITH_OFFLOADING=0 .pyro/krea2/train.sh
 The wrapper defaults to Pyro's local Comfy model layout:
 
 ```text
-DIT        /home/pyro/models/comfy/diffusion_models/krea2_raw_bf16.safetensors
+DIT        /home/pyro/models/comfy/diffusion_models/krea2_raw_int8_convrot.safetensors
 TENC       /home/pyro/models/comfy/text_encoders/qwen3vl_4b_bf16.safetensors
 VAE        /home/pyro/models/comfy/vae/qwen_image_vae.safetensors
 TURBO_LORA /home/pyro/models/comfy/loras/krea/krea2_turbo_lora_rank_64_bf16.safetensors
 ```
 
+The default DIT is the Comfy INT8 ConvRot file. Its quantized block Linears stay frozen INT8
+(comfy-kitchen kernels) and the LoRA trains on top; the turbo sampling LoRA is applied as an
+unmerged overlay on those layers. A bf16 DIT needs `FP8=1`, which adds `--fp8_base --fp8_scaled`
+as before:
+
+```bash
+DIT=/home/pyro/models/comfy/diffusion_models/krea2_raw_bf16.safetensors FP8=1 NAME=msplits .pyro/krea2/train.sh
+```
+
 Override them when running elsewhere:
 
 ```bash
-DIT=/workspace/models/krea2_raw_bf16.safetensors \
+DIT=/workspace/models/krea2_raw_int8_convrot.safetensors \
 TENC=/workspace/models/qwen3vl_4b_bf16.safetensors \
 VAE=/workspace/models/qwen_image_vae.safetensors \
 TURBO_LORA=/workspace/models/krea2_turbo_lora_rank_64_bf16.safetensors \

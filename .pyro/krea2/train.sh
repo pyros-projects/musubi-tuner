@@ -12,7 +12,8 @@ cd "$ROOT"
 #   NAME=msplits SAMPLE_WITH_OFFLOADING=0 .pyro/krea2/train.sh
 #   NAME=msplits BYPASS=/home/pyro/models/comfy/loras/krea/krea2filterbypass3.safetensors .pyro/krea2/train.sh
 #   NAME=msplits BYPASS=/home/pyro/models/comfy/loras/krea/krea2filterbypass3.safetensors BYPASS_MERGE=1 .pyro/krea2/train.sh
-DIT="${DIT:-/home/pyro/models/comfy/diffusion_models/krea2_raw_bf16.safetensors}"
+DIT="${DIT:-/home/pyro/models/comfy/diffusion_models/krea2_raw_int8_convrot.safetensors}"
+FP8="${FP8:-0}"  # 1 = --fp8_base --fp8_scaled, only for a bf16 DIT; INT8 ConvRot DITs are used as is
 TENC="${TENC:-/home/pyro/models/comfy/text_encoders/qwen3vl_4b_bf16.safetensors}"
 VAE="${VAE:-/home/pyro/models/comfy/vae/qwen_image_vae.safetensors}"
 TURBO_LORA="${TURBO_LORA:-/home/pyro/models/comfy/loras/krea/krea2_turbo_lora_rank_64_bf16.safetensors}"
@@ -72,6 +73,19 @@ case "$BYPASS_MERGE" in
         ;;
     *)
         echo "BYPASS_MERGE must be 0/1, true/false, yes/no, or on/off: $BYPASS_MERGE" >&2
+        exit 1
+        ;;
+esac
+
+case "$FP8" in
+    1|true|TRUE|yes|YES|on|ON)
+        FP8_ARGS=(--fp8_base --fp8_scaled)
+        ;;
+    0|false|FALSE|no|NO|off|OFF)
+        FP8_ARGS=()
+        ;;
+    *)
+        echo "FP8 must be 0/1, true/false, yes/no, or on/off: $FP8" >&2
         exit 1
         ;;
 esac
@@ -226,7 +240,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
     --text_encoder "$TENC" \
     --dataset_config "$DATASET_TOML" \
     --sample_prompts "$PROMPT_TOML" \
-    --sdpa --mixed_precision bf16 \
+    --sdpa --split_attn --mixed_precision bf16 \
     --timestep_sampling krea2_shift --weighting_scheme none \
     "${OPT_ARGS[@]}" \
     --gradient_checkpointing \
@@ -243,7 +257,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
     --logging_dir /home/pyro/models/_out/krea2/.logs \
     --sampling_lora_weight "$TURBO_LORA" \
     --sampling_lora_multiplier 1.0 \
-    --fp8_base --fp8_scaled \
+    "${FP8_ARGS[@]}" \
     "${BLOCK_SWAP_ARGS[@]}" \
     "${SAMPLE_BLOCK_SWAP_ARGS[@]}" \
     "${SAMPLE_OFFLOAD_ARGS[@]}" \
