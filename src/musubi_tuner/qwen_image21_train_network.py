@@ -12,7 +12,6 @@ Training snapshots follow the official pipeline: Euler, resolution-dependent mu 
 import argparse
 import gc
 import os
-import re
 from typing import Optional
 
 import torch
@@ -33,6 +32,8 @@ from musubi_tuner.krea2 import krea2_sampling
 from musubi_tuner.networks import lora_qwen_image21
 from musubi_tuner.qwen_image21 import qwen_image21_text_encoder, qwen_image21_utils
 from musubi_tuner.qwen_image21.qwen_image21_vae import SPATIAL_COMPRESSION, load_qwen_image21_vae
+from musubi_tuner.utils import train_lora_overlay
+from musubi_tuner.utils.train_lora_overlay import parse_overlay_spec, set_train_lora_overlay_enabled
 
 import logging
 
@@ -40,33 +41,11 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-def parse_overlay_spec(spec: str) -> tuple[str, float]:
-    """``PATH`` or ``PATH:STRENGTH`` (H3's --train_lora_overlay convention)."""
-    match = re.fullmatch(r"(.+):([0-9]*\.?[0-9]+)", spec)
-    return (match.group(1), float(match.group(2))) if match else (spec, 1.0)
-
-
 def attach_train_lora_overlay(model: torch.nn.Module, path: str, strength: float, device) -> "lora_qwen_image21.lora.LoRANetwork":
-    """Hook a frozen training adapter (SimpleTuner's assistant, Fizgig's adapter, ...) onto the DiT.
-
-    Unmerged: every adapted Linear computes W x + strength * B A x, as SimpleTuner and Fizgig
-    apply theirs. The trained LoRA wraps these modules afterwards and learns on top. The
-    adapter is not part of the trained network, so it never reaches the optimizer or a save.
-    """
+    """Hook a frozen training adapter (SimpleTuner's assistant, Fizgig's adapter, ...) onto the DiT,
+    unmerged, as SimpleTuner and Fizgig apply theirs."""
     weights = qwen_image21_utils.convert_lora_to_musubi(load_file(path), qwen_image21_utils.peft_lora_scale(path))
-    network = lora_qwen_image21.create_arch_network_from_weights(strength, weights, unet=model, for_inference=True)
-    network.apply_to(None, model, apply_text_encoder=False, apply_unet=True)
-    info = network.load_state_dict(weights, strict=False)
-    if info.missing_keys or info.unexpected_keys:
-        raise ValueError(f"Training adapter {path} does not match the DiT: {info}")
-    network.to(device=device, dtype=model.dtype)
-    network.requires_grad_(False)
-    return network
-
-
-def set_train_lora_overlay_enabled(network, enabled: bool) -> None:
-    for lora in network.unet_loras:
-        lora.enabled = enabled
+    return train_lora_overlay.attach_train_lora_overlay(model, lora_qwen_image21, weights, strength, device, model.dtype, path)
 
 
 class QwenImage21NetworkTrainer(NetworkTrainer):

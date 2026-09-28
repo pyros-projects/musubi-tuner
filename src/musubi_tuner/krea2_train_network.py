@@ -18,6 +18,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from safetensors.torch import load_file
 from tqdm import tqdm
 from einops import rearrange, repeat
 
@@ -32,8 +33,10 @@ from musubi_tuner.hv_train_network import (
 from musubi_tuner.krea2 import krea2_utils
 from musubi_tuner.krea2 import krea2_sampling
 from musubi_tuner.krea2.projector_bypass import apply_projector_bypass_from_file
+from musubi_tuner.networks import lora_krea2
 from musubi_tuner.qwen_image import qwen_image_utils
 from musubi_tuner.utils import model_utils
+from musubi_tuner.utils.train_lora_overlay import attach_train_lora_overlay, parse_overlay_spec
 
 import logging
 
@@ -45,6 +48,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.vae_frame_stride = 1  # single image
+        self.train_lora_overlay = None  # --train_lora_overlay network: training forwards and sample images, never saved
 
     # region model specific
 
@@ -71,17 +75,26 @@ class Krea2NetworkTrainer(NetworkTrainer):
                 raise ValueError("Krea2 bypass-merged Comfy export requires --bypass.")
             if not getattr(args, "convert_to_comfy", True):
                 raise ValueError("Krea2 bypass-merged Comfy export requires Comfy conversion; remove --no_convert_to_comfy.")
+        if getattr(args, "train_lora_overlay", None):
+            path, strength = parse_overlay_spec(args.train_lora_overlay)
+            if not os.path.isfile(path):
+                raise ValueError(f"--train_lora_overlay file not found: {path}")
+            if strength <= 0:
+                raise ValueError(f"--train_lora_overlay strength must be positive: {args.train_lora_overlay}")
 
     def _default_sampling_lora_network_module_name(self) -> Optional[str]:
         return "musubi_tuner.networks.lora_krea2"
 
     def get_checkpoint_metadata(self, args: argparse.Namespace) -> dict[str, str]:
-        if not getattr(args, "bypass", None):
-            return {}
-        return {
-            "ss_krea2_bypass_path": str(args.bypass),
-            "ss_krea2_bypass_weight": f"{float(getattr(args, 'bypass_weight', 1.0)):g}",
-        }
+        metadata = {}
+        if getattr(args, "bypass", None):
+            metadata["ss_krea2_bypass_path"] = str(args.bypass)
+            metadata["ss_krea2_bypass_weight"] = f"{float(getattr(args, 'bypass_weight', 1.0)):g}"
+        if getattr(args, "train_lora_overlay", None):
+            path, strength = parse_overlay_spec(args.train_lora_overlay)
+            metadata["ss_krea2_train_lora_overlay"] = os.path.basename(path)
+            metadata["ss_krea2_train_lora_overlay_strength"] = f"{strength:g}"
+        return metadata
 
     def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
         """Convert saved Krea2 LoRA checkpoints to native ComfyUI format."""
@@ -369,6 +382,17 @@ class Krea2NetworkTrainer(NetworkTrainer):
                 raise ValueError("The INT8 ConvRot Krea 2 DiT does not support --compile.")
         if getattr(args, "bypass", None):
             apply_projector_bypass_from_file(model, args.bypass, getattr(args, "bypass_weight", 1.0))
+        if getattr(args, "train_lora_overlay", None):
+            # e.g. the TextFusion refusal-reduction LoRA. As with --bypass, training forwards and sample images
+            # both see it, so the trained LoRA is meant to be used together with it. It stays on the compute
+            # device (not loading_device): block swap only moves the DiT's blocks.
+            path, strength = parse_overlay_spec(args.train_lora_overlay)
+            weights = self.normalize_sampling_lora_weights(args, load_file(path), path)
+            self.train_lora_overlay = attach_train_lora_overlay(model, lora_krea2, weights, strength, accelerator.device, dtype, path)
+            logger.info(
+                f"Training LoRA overlay {path} at strength {strength:g}: {len(self.train_lora_overlay.unet_loras)} modules, "
+                "active in training forwards and sample images, never saved"
+            )
         return model
 
     def compile_transformer(self, args, transformer):
@@ -487,6 +511,13 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         action="store_true",
         default=False,
         help="Also export a ComfyUI checkpoint with the scaled Krea2 bypass diff merged into the file.",
+    )
+    parser.add_argument(
+        "--train_lora_overlay",
+        type=str,
+        default=None,
+        help="PATH[:STRENGTH] of a frozen LoRA (e.g. the TextFusion refusal-reduction LoRA) applied unmerged in training "
+        "forwards and sample images; never saved. Use it together with the trained LoRA at inference.",
     )
     return parser
 

@@ -1,6 +1,8 @@
+import argparse
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,7 +17,9 @@ from musubi_tuner.krea2 import krea2_sampling, krea2_utils
 from musubi_tuner.krea2.krea2_mmdit import SingleMMDiTConfig, SingleStreamDiT
 from musubi_tuner.krea2_train_network import Krea2NetworkTrainer
 from musubi_tuner.modules.int8_optimization_utils import _convrot_hadamard, _quantize_int8_rowwise
+from musubi_tuner.hv_train_network import NetworkTrainer
 from musubi_tuner.networks import lora_krea2
+from musubi_tuner.utils.train_lora_overlay import set_train_lora_overlay_enabled
 
 TINY = SingleMMDiTConfig(
     features=128, tdim=32, txtdim=32, heads=2, kvheads=1, multiplier=2, layers=2, patch=2, channels=4,
@@ -114,3 +118,63 @@ def test_sampling_lora_overlays_int8_layers_instead_of_merging(tmp_path):
     trainer._clear_sampling_lora_runtime_overlays(model)
     trainer._restore_sampling_lora_network(backups)
     torch.testing.assert_close(first.weight, first_before)
+
+
+def _write_ai_toolkit_lora(reference, path, names, rank=2, seed=7):
+    """ai-toolkit / PEFT layout, like the TextFusion refusal-reduction LoRA: diffusion_model. prefix, no alpha."""
+    g = torch.Generator().manual_seed(seed)
+    sd = {}
+    for name in names:
+        linear = reference.get_submodule(name)
+        sd[f"diffusion_model.{name}.lora_A.weight"] = torch.randn(rank, linear.in_features, generator=g) * 0.2
+        sd[f"diffusion_model.{name}.lora_B.weight"] = torch.randn(linear.out_features, rank, generator=g) * 0.2
+    save_file(sd, str(path))
+
+
+def test_train_lora_overlay_is_frozen_unmerged_on_int8_and_never_saved(tmp_path, monkeypatch):
+    reference = _tiny_model()
+    ckpt = tmp_path / "krea2_tiny_int8_convrot.safetensors"
+    _write_int8_checkpoint(reference, ckpt)
+    overlay_path = tmp_path / "refusal.safetensors"
+    names = ("txtfusion.layerwise_blocks.0.attn.wq", "txtfusion.refiner_blocks.1.attn.wo", "blocks.0.attn.wq")
+    _write_ai_toolkit_lora(reference, overlay_path, names)
+
+    int8_model = krea2_utils.load_krea2_dit(str(ckpt), device="cpu", config=TINY)
+    monkeypatch.setattr(krea2_utils, "load_krea2_dit", lambda *a, **k: int8_model)
+    inputs = _inputs()
+    with torch.no_grad():
+        base = int8_model(**inputs)
+
+    trainer = Krea2NetworkTrainer()
+    trainer.blocks_to_swap = 0
+    args = argparse.Namespace(
+        fp8_base=False, fp8_scaled=False, compile=False, bypass=None, network_module=None,
+        train_lora_overlay=f"{overlay_path}:0.5",
+    )  # fmt: skip
+    trainer.handle_model_specific_args(args)
+    model = trainer.load_transformer(SimpleNamespace(device=torch.device("cpu")), args, str(ckpt), "torch", False, "cpu", torch.float32)
+    overlay = trainer.train_lora_overlay
+    assert len(overlay.unet_loras) == len(names)
+    assert all(lora.multiplier == 0.5 for lora in overlay.unet_loras)
+    assert not any(p.requires_grad for p in overlay.parameters())
+    assert model.blocks[0].attn.wq.weight.dtype == torch.int8  # unmerged: the INT8 payload is untouched
+    with torch.no_grad():
+        assert not torch.allclose(model(**inputs), base)
+
+    # the trained LoRA wraps the overlaid modules: gradients reach it, never the overlay
+    network = lora_krea2.create_arch_network(1.0, 4, 4, None, [], model)
+    network.apply_to(None, model, apply_text_encoder=False, apply_unet=True)
+    model(**inputs).square().mean().backward()
+    assert all(p.grad is None for p in overlay.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in network.parameters())
+
+    # like --bypass, sample images keep the overlay on: no sample_images override
+    assert Krea2NetworkTrainer.sample_images is NetworkTrainer.sample_images
+    assert trainer.get_checkpoint_metadata(args) == {
+        "ss_krea2_train_lora_overlay": "refusal.safetensors",
+        "ss_krea2_train_lora_overlay_strength": "0.5",
+    }
+
+    set_train_lora_overlay_enabled(overlay, False)  # the trained LoRA's up weights are still zero-initialized
+    with torch.no_grad():
+        torch.testing.assert_close(model(**inputs), base)

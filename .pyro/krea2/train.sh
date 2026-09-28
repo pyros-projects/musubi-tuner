@@ -12,6 +12,7 @@ cd "$ROOT"
 #   NAME=msplits SAMPLE_WITH_OFFLOADING=0 .pyro/krea2/train.sh
 #   NAME=msplits BYPASS=/home/pyro/models/comfy/loras/krea/krea2filterbypass3.safetensors .pyro/krea2/train.sh
 #   NAME=msplits BYPASS=/home/pyro/models/comfy/loras/krea/krea2filterbypass3.safetensors BYPASS_MERGE=1 .pyro/krea2/train.sh
+#   NAME=msplits TRAIN_LORA_OVERLAY=/home/pyro/models/comfy/loras/krea/adapter/Krea2_TextFusion_Refusal_Reduction.safetensors .pyro/krea2/train.sh
 DIT="${DIT:-/home/pyro/models/comfy/diffusion_models/krea2_raw_int8_convrot.safetensors}"
 FP8="${FP8:-0}"  # 1 = --fp8_base --fp8_scaled, only for a bf16 DIT; INT8 ConvRot DITs are used as is
 TENC="${TENC:-/home/pyro/models/comfy/text_encoders/qwen3vl_4b_bf16.safetensors}"
@@ -20,6 +21,9 @@ TURBO_LORA="${TURBO_LORA:-/home/pyro/models/comfy/loras/krea/krea2_turbo_lora_ra
 BYPASS="${BYPASS:-}"
 BYPASS_WEIGHT="${BYPASS_WEIGHT:-5}"
 BYPASS_MERGE="${BYPASS_MERGE:-0}"
+# Frozen LoRA overlay, PATH[:STRENGTH], e.g. the TextFusion refusal-reduction LoRA. Like BYPASS it is active in
+# training and snapshots, and it is never saved: load it next to the trained LoRA at inference. Tags runs -ovl-<file>.
+TRAIN_LORA_OVERLAY="${TRAIN_LORA_OVERLAY:-}"
 
 NAME="${NAME:-cobra}"
 LORA_CONFIG="${LORA_CONFIG:-default}"   # default | preset-1 | preset-2 | preset-3 | custom
@@ -95,7 +99,14 @@ if [[ ! "$LORA_CONFIG" =~ ^[A-Za-z0-9._-]+$ ]]; then
     exit 1
 fi
 
-RUN_NAME="${NAME}-${LORA_CONFIG}-${OPTIMIZER}"
+OVERLAY_SUFFIX=""
+if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
+    # -ovl-<overlay file name>, so runs with different overlays (or none) never resume each other
+    OVERLAY_NAME="$(basename "${TRAIN_LORA_OVERLAY%%.safetensors*}")"
+    OVERLAY_SUFFIX="-ovl-${OVERLAY_NAME//[^A-Za-z0-9._-]/_}"
+fi
+
+RUN_NAME="${NAME}-${LORA_CONFIG}-${OPTIMIZER}${OVERLAY_SUFFIX}"
 LORA_PRESET_ARGS=()
 
 case "$LORA_CONFIG" in
@@ -185,6 +196,19 @@ if (( BYPASS_MERGE_ENABLED )) && [[ -z "$BYPASS" ]]; then
     exit 1
 fi
 
+TRAIN_OVERLAY_ARGS=()
+if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
+    TRAIN_OVERLAY_PATH="$TRAIN_LORA_OVERLAY"
+    if [[ "$TRAIN_LORA_OVERLAY" =~ ^(.+):[0-9]*\.?[0-9]+$ ]]; then
+        TRAIN_OVERLAY_PATH="${BASH_REMATCH[1]}"
+    fi
+    if [[ ! -f "$TRAIN_OVERLAY_PATH" ]]; then
+        echo "Missing training LoRA overlay: $TRAIN_OVERLAY_PATH" >&2
+        exit 1
+    fi
+    TRAIN_OVERLAY_ARGS=(--train_lora_overlay "$TRAIN_LORA_OVERLAY")
+fi
+
 BLOCK_SWAP_ARGS=()
 if (( BLOCKS_TO_SWAP > 0 )); then
     BLOCK_SWAP_ARGS=(--blocks_to_swap "$BLOCKS_TO_SWAP" --use_pinned_memory_for_block_swap)
@@ -215,6 +239,9 @@ echo "Krea2 cache step: CACHE_DATASET=$CACHE_DATASET"
 echo "Krea2 sample decode offload: SAMPLE_WITH_OFFLOADING=$SAMPLE_WITH_OFFLOADING"
 if [[ -n "$BYPASS" ]]; then
     echo "Krea2 projector bypass: BYPASS=$BYPASS BYPASS_WEIGHT=$BYPASS_WEIGHT BYPASS_MERGE=$BYPASS_MERGE"
+fi
+if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
+    echo "Krea2 training LoRA overlay: TRAIN_LORA_OVERLAY=$TRAIN_LORA_OVERLAY (training and snapshots, never saved)"
 fi
 if ((${#NETWORK_ARGS_VALUES[@]} > 0)); then
     printf 'Krea2 LoRA network args:'
@@ -249,6 +276,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
     --network_module networks.lora_krea2 --network_dim "$NETWORK_DIM" --network_alpha "$NETWORK_ALPHA" \
     "${NETWORK_ARGS_CLI[@]}" \
     "${BYPASS_ARGS[@]}" \
+    "${TRAIN_OVERLAY_ARGS[@]}" \
     --seed 42 \
     --save_every_n_steps "$SAVE_EVERY" --max_train_steps "$MAX_STEPS" \
     --save_state --save_last_n_steps_state 2 --autoresume \

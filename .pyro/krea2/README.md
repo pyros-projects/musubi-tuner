@@ -167,6 +167,35 @@ the training-time bypass weight. In loaders that treat every tensor in the file
 as one adapter, lowering or raising the global LoRA strength can also scale the
 embedded bypass diff.
 
+## Training LoRA Overlay
+
+`TRAIN_LORA_OVERLAY` puts a frozen LoRA on the DiT, for example Capitan01R's
+[TextFusion Refusal-Reduction LoRA](https://civitai.com/models/2775340/krea2-textfusion-refusal-reduction-lora),
+a LoRA alternative to the projector bypass. It is off by default:
+
+```bash
+NAME=msplits \
+TRAIN_LORA_OVERLAY=/home/pyro/models/comfy/loras/krea/adapter/Krea2_TextFusion_Refusal_Reduction.safetensors \
+.pyro/krea2/train.sh
+```
+
+The overlay:
+
+- runs unmerged in every training forward and in the snapshots, like `BYPASS`, so the
+  trained LoRA learns on top of it;
+- is frozen and never saved. Load it next to the trained LoRA at inference, at the same
+  strength;
+- takes an optional strength, `PATH:STRENGTH` (default 1.0). The refusal LoRA's author
+  recommends 0.75-1.0:
+
+```bash
+TRAIN_LORA_OVERLAY=/home/pyro/models/comfy/loras/krea/adapter/Krea2_TextFusion_Refusal_Reduction.safetensors:0.75
+```
+
+ai-toolkit/PEFT (`diffusion_model.*.lora_A/B`) and native Krea2 LoRA files load as they are;
+a key that does not match the DiT stops the run. Runs with an overlay get a
+`-ovl-<file name>` suffix, so they never resume a run without it (or with another one).
+
 ## Training Knobs
 
 Common overrides:
