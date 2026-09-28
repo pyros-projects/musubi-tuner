@@ -10,9 +10,10 @@ materialize a full BF16 copy of a large base weight.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MethodType
 
@@ -59,6 +60,26 @@ def _convrot_hadamard(value: torch.Tensor, group_size: int) -> torch.Tensor:
         transformed = torch.stack((a + b + c - d, a + b - c + d, a - b + c + d, -a + b + c + d), dim=-2).reshape(*transformed.shape)
         stride *= 4
     return (transformed / math.sqrt(group_size)).reshape(original_shape)
+
+
+_HADAMARD_MATRICES: dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
+
+
+def _convrot_rotate(value: torch.Tensor, group_size: int) -> torch.Tensor:
+    """``_convrot_hadamard`` as one GEMM against a cached group_size x group_size matrix.
+
+    This is how comfy-kitchen rotates activations. The butterfly above re-reads the whole tensor
+    ~45 times per call, which dominated the INT8 backward.
+    """
+    key = (group_size, value.device, value.dtype)
+    matrix = _HADAMARD_MATRICES.get(key)
+    if matrix is None:
+        # rows of the transformed identity; the normalized regular Hadamard matrix is symmetric
+        eye = torch.eye(group_size, dtype=torch.float32, device=value.device)
+        matrix = _HADAMARD_MATRICES[key] = _convrot_hadamard(eye, group_size).to(value.dtype)
+    if value.shape[-1] % group_size:
+        raise ValueError(f"ConvRot group size {group_size} does not divide feature size {value.shape[-1]}")
+    return (value.reshape(-1, group_size) @ matrix).reshape(value.shape)
 
 
 def _quantize_int8_rowwise(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -174,16 +195,20 @@ class _Int8ConvRotLinearFunction(torch.autograd.Function):
         # W_rot = diag(weight_scale) @ weight_int8. Dequantize bounded row
         # chunks for an accurate input gradient without expanding the entire
         # frozen weight at once.
-        rotated_grad_input = torch.empty((grad_rows.shape[0], weight.shape[1]), dtype=compute_dtype, device=grad_output.device)
-        rotated_grad_input.zero_()
+        rotated_grad_input = None
         chunk_rows = _dequant_chunk_rows(weight.shape[1], compute_dtype)
         for start in range(0, weight.shape[0], chunk_rows):
             stop = min(start + chunk_rows, weight.shape[0])
-            dequantized_weight = weight[start:stop].to(device=grad_output.device, dtype=compute_dtype)
             scale_chunk = weight_scale if weight_scale.numel() == 1 else weight_scale[start:stop]
-            dequantized_weight.mul_(scale_chunk.to(device=grad_output.device, dtype=compute_dtype))
-            rotated_grad_input.addmm_(grad_rows[:, start:stop], dequantized_weight)
-        grad_input = _convrot_hadamard(rotated_grad_input, ctx.group_size)
+            # int8 * float promotes: dequantize in one kernel
+            dequantized_weight = weight[start:stop].to(grad_output.device) * scale_chunk.to(
+                device=grad_output.device, dtype=compute_dtype
+            )
+            if rotated_grad_input is None:
+                rotated_grad_input = grad_rows[:, start:stop] @ dequantized_weight
+            else:
+                rotated_grad_input.addmm_(grad_rows[:, start:stop], dequantized_weight)
+        grad_input = _convrot_rotate(rotated_grad_input, ctx.group_size)
         grad_input = grad_input.to(grad_output.dtype).reshape(*original_shape[:-1], weight.shape[1])
         return grad_input, None, None, None, None
 
@@ -228,3 +253,25 @@ def apply_int8_convrot_monkey_patch(model: nn.Module, layer_configs: Mapping[str
         raise ValueError(f"INT8 ConvRot checkpoint refers to {len(remaining)} unknown Linear layers: {preview}")
     logger.info("Enabled INT8 ConvRot training for %d Linear layers", len(layer_configs))
     return model
+
+
+def scan_int8_convrot(reader, module_name: Callable[[str], str | None] = lambda k: k) -> dict[str, Int8ConvRotConfig]:
+    """Map Comfy ``.comfy_quant`` markers of an open safetensors reader (``MemoryEfficientSafeOpen``) to
+    Int8ConvRotConfig, keyed by ``module_name(checkpoint module path)``; None skips a layer."""
+    layers: dict[str, Int8ConvRotConfig] = {}
+    for marker_key in (k for k in reader.keys() if k.endswith(".comfy_quant")):
+        source = marker_key[: -len(".comfy_quant")]
+        name = module_name(source)
+        if name is None:
+            continue
+        marker = json.loads(reader.get_tensor(marker_key).numpy().tobytes())
+        params = marker.get("params") if isinstance(marker.get("params"), dict) else {}
+        if marker.get("format") != "int8_tensorwise" or not marker.get("convrot", params.get("convrot", False)):
+            raise ValueError(f"Unsupported quantization for {source}: {marker.get('format')!r} (only INT8 ConvRot is supported)")
+        if reader.header[f"{source}.weight"]["dtype"] != "I8":
+            raise ValueError(f"INT8 ConvRot layer {source} has non-I8 storage")
+        layers[name] = Int8ConvRotConfig(
+            group_size=int(marker.get("convrot_groupsize", params.get("convrot_groupsize", 256))),
+            scale_shape=tuple(reader.header[f"{source}.weight_scale"]["shape"]),
+        )
+    return layers

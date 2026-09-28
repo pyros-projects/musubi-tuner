@@ -8,7 +8,7 @@ from typing import Callable, Optional, Sequence
 import numpy as np
 import torch
 
-from musubi_tuner.modules.int8_optimization_utils import Int8ConvRotConfig, apply_int8_convrot_monkey_patch
+from musubi_tuner.modules.int8_optimization_utils import apply_int8_convrot_monkey_patch, scan_int8_convrot
 from musubi_tuner.qwen_image21.qwen_image21_model import QwenImage21Transformer2DModel
 from musubi_tuner.qwen_image21.qwen_image21_vae import SPATIAL_COMPRESSION
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
@@ -21,27 +21,6 @@ MAX_IMAGE_SEQ_LEN = 8192
 BASE_SHIFT = 0.5
 MAX_SHIFT = 0.9
 SHIFT_TERMINAL = 0.02
-
-
-def scan_int8_convrot(reader: MemoryEfficientSafeOpen, module_name: Callable[[str], Optional[str]] = lambda k: k):
-    """Map Comfy ``.comfy_quant`` markers to Int8ConvRotConfig, keyed by ``module_name(checkpoint module path)``."""
-    layers: dict[str, Int8ConvRotConfig] = {}
-    for marker_key in (k for k in reader.keys() if k.endswith(".comfy_quant")):
-        source = marker_key[: -len(".comfy_quant")]
-        name = module_name(source)
-        if name is None:
-            continue
-        marker = json.loads(reader.get_tensor(marker_key).numpy().tobytes())
-        params = marker.get("params") if isinstance(marker.get("params"), dict) else {}
-        if marker.get("format") != "int8_tensorwise" or not marker.get("convrot", params.get("convrot", False)):
-            raise ValueError(f"Unsupported quantization for {source}: {marker.get('format')!r} (only INT8 ConvRot is supported)")
-        if reader.header[f"{source}.weight"]["dtype"] != "I8":
-            raise ValueError(f"INT8 ConvRot layer {source} has non-I8 storage")
-        layers[name] = Int8ConvRotConfig(
-            group_size=int(marker.get("convrot_groupsize", params.get("convrot_groupsize", 256))),
-            scale_shape=tuple(reader.header[f"{source}.weight_scale"]["shape"]),
-        )
-    return layers
 
 
 def dit_config_from_header(header: dict) -> dict:

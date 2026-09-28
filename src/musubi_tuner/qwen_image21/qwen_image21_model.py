@@ -115,18 +115,26 @@ class SwiGLUFeedForward(nn.Module):
         return self.out(F.silu(gate) * up)
 
 
-def text_image_attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, txt_len: int, key_mask: Optional[torch.Tensor]
-) -> torch.Tensor:
+def text_image_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, txt_len: int, txt_lens: Sequence[int]) -> torch.Tensor:
     """Block-causal attention over [text, image]: text is causal, image attends to everything.
 
-    q, k, v: (B, N, H, D). key_mask: (B, N) bool marking valid keys (text padding False), or None.
-    Causal text queries never reach the trailing text padding, so only the image queries need the mask.
+    q, k, v: (B, N, H, D) with text right-padded to ``txt_len``; ``txt_lens`` are the valid lengths.
+    Causal text queries never reach the trailing padding. Image queries must skip it: rather than a
+    key mask (which rules out the flash kernel), padded samples run one by one on their valid keys.
     """
     q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     txt = F.scaled_dot_product_attention(q[:, :, :txt_len], k[:, :, :txt_len], v[:, :, :txt_len], is_causal=True)
-    mask = None if key_mask is None else key_mask[:, None, None, :]
-    img = F.scaled_dot_product_attention(q[:, :, txt_len:], k, v, attn_mask=mask)
+    if all(n == txt_len for n in txt_lens):
+        img = F.scaled_dot_product_attention(q[:, :, txt_len:], k, v)
+    else:
+        img = []
+        for i, n in enumerate(txt_lens):
+            ki, vi = k[i : i + 1], v[i : i + 1]
+            if n != txt_len:
+                ki = torch.cat([ki[:, :, :n], ki[:, :, txt_len:]], dim=2)
+                vi = torch.cat([vi[:, :, :n], vi[:, :, txt_len:]], dim=2)
+            img.append(F.scaled_dot_product_attention(q[i : i + 1, :, txt_len:], ki, vi))
+        img = torch.cat(img, dim=0)
     return torch.cat([txt, img], dim=2).transpose(1, 2).flatten(2)
 
 
@@ -286,12 +294,7 @@ class QwenImage21Transformer2DModel(nn.Module):
 
         hidden_states = torch.cat([self.txt_in(context), self.img_in(x.flatten(2).transpose(1, 2))], dim=1)
         pe = self.rope_freqs(txt_lens, txt_len, H, W, x.device)
-        key_mask = None
-        if any(n != txt_len for n in txt_lens):
-            key_mask = torch.ones(B, hidden_states.shape[1], dtype=torch.bool, device=x.device)
-            for i, n in enumerate(txt_lens):
-                key_mask[i, n:txt_len] = False
-        attn_fn = partial(text_image_attention, txt_len=txt_len, key_mask=key_mask)
+        attn_fn = partial(text_image_attention, txt_len=txt_len, txt_lens=txt_lens)
 
         # the pipeline rounds t*1000 and t to the compute dtype; text tokens modulate from t = 0
         t = ((timesteps * 1000).to(dtype) / 1000).to(dtype)

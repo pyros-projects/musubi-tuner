@@ -16,8 +16,8 @@ import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
 
-from musubi_tuner.modules.int8_optimization_utils import _convrot_hadamard, apply_int8_convrot_monkey_patch
-from musubi_tuner.qwen_image21.qwen_image21_utils import scan_int8_convrot
+from musubi_tuner.modules.int8_optimization_utils import _convrot_hadamard, apply_int8_convrot_monkey_patch, scan_int8_convrot
+
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
 logger = logging.getLogger(__name__)

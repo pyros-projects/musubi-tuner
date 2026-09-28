@@ -137,9 +137,10 @@ class LoRAModule(torch.nn.Module):
             else:
                 scale = self.scale
 
-            lx = self.lora_up(lx)
+            # scale the rank-r intermediate, not the full-width output: same math, far less memory traffic
+            lx = self.lora_up(lx * (self.multiplier * scale))
 
-            return org_forwarded + lx * self.multiplier * scale
+            return org_forwarded + lx
         else:
             lxs = [lora_down(x) for lora_down in self.lora_down]
 
@@ -162,9 +163,9 @@ class LoRAModule(torch.nn.Module):
             else:
                 scale = self.scale
 
-            lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
+            lxs = [lora_up(lx * (self.multiplier * scale)) for lora_up, lx in zip(self.lora_up, lxs)]
 
-            return org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale
+            return org_forwarded + torch.cat(lxs, dim=-1)
 
 
 class LoRAInfModule(LoRAModule):
@@ -276,12 +277,12 @@ class LoRAInfModule(LoRAModule):
         # logger.info(f"default_forward {self.lora_name} {x.size()}")
         if self.split_dims is None:
             lx = self.lora_down(x)
-            lx = self.lora_up(lx)
-            return self.org_forward(x) + lx * self.multiplier * self.scale
+            lx = self.lora_up(lx * (self.multiplier * self.scale))
+            return self.org_forward(x) + lx
         else:
             lxs = [lora_down(x) for lora_down in self.lora_down]
-            lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
-            return self.org_forward(x) + torch.cat(lxs, dim=-1) * self.multiplier * self.scale
+            lxs = [lora_up(lx * (self.multiplier * self.scale)) for lora_up, lx in zip(self.lora_up, lxs)]
+            return self.org_forward(x) + torch.cat(lxs, dim=-1)
 
     def forward(self, x):
         if not self.enabled:
