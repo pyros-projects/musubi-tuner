@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 from contextlib import contextmanager
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -185,6 +186,15 @@ class TimeEmbedder(nn.Module):
         return self.proj_out(F.silu(self.proj_in(embedding)))
 
 
+class RaggedText(NamedTuple):
+    """Ragged text in a packed batch: sample i has valid text rows [0, lengths[i]), padding up to
+    text_max, then its video/audio rows. Python ints, so attention splits per sample without a host
+    sync (a sync per block would stall the block-swap and activation-offload pipelines)."""
+
+    lengths: tuple[int, ...]
+    text_max: int
+
+
 class Attention(nn.Module):
     def __init__(self, hidden: int, heads: int, head_dim: int, eps: float, attn_mode: str, split_attn: bool):
         super().__init__()
@@ -198,7 +208,7 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(inner, hidden, bias=False)
 
     def forward(
-        self, x: torch.Tensor, rope_angles: torch.Tensor | None = None, attn_mask: torch.Tensor | None = None
+        self, x: torch.Tensor, rope_angles: torch.Tensor | None = None, attn_mask: RaggedText | None = None
     ) -> torch.Tensor:
         batch, sequence, _ = x.shape
         q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
@@ -209,10 +219,19 @@ class Attention(nn.Module):
             q = apply_split_half_rope(q, rope_angles)
             k = apply_split_half_rope(k, rope_angles)
         if attn_mask is not None:
-            # batched ragged-text path: key-padding mask [B,1,1,S], True = attend
-            out = F.scaled_dot_product_attention(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=attn_mask
-            )
+            # batched ragged-text path: each sample attends to its valid keys (its text prefix plus all
+            # video/audio rows) without a key mask, so SDPA can pick the flash kernel; padded query
+            # rows see the same valid keys as they would with the mask.
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            text_max = attn_mask.text_max
+            out = []
+            for index, length in enumerate(attn_mask.lengths):
+                k_i, v_i = k[index : index + 1], v[index : index + 1]
+                if length != text_max:
+                    k_i = torch.cat([k_i[:, :, :length], k_i[:, :, text_max:]], dim=2)
+                    v_i = torch.cat([v_i[:, :, :length], v_i[:, :, text_max:]], dim=2)
+                out.append(F.scaled_dot_product_attention(q[index : index + 1], k_i, v_i))
+            out = torch.cat(out, dim=0)
             return self.out_proj(out.transpose(1, 2).reshape(batch, sequence, self.heads * self.head_dim))
         return self.out_proj(common_attention([q, k, v], attn_params=self.attn_params))
 
@@ -316,7 +335,7 @@ class DiTBlock(nn.Module):
         time_embedding: torch.Tensor,
         modulation_rows: torch.Tensor,
         rope_angles: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
+        attn_mask: RaggedText | None = None,
     ) -> torch.Tensor:
         # Batched path: time_embedding [B,T,dim] flattens so the adaln table is
         # [B*T*modalities, hidden]; modulation_rows [B,L] then carry per-item
@@ -882,11 +901,7 @@ class MiniMaxH3Model(nn.Module):
         time_embedding = time_embedding.reshape(batch, n_times, -1)
 
         rope_angles = self.rope_angles(position_ids, video.device)
-        attn_mask = None
-        if not bool(text_valid.all()):
-            key_mask = torch.ones(batch, layout.seq_len, device=video.device, dtype=torch.bool)
-            key_mask[:, :text_max] = text_valid
-            attn_mask = key_mask[:, None, None, :]
+        attn_mask = RaggedText(tuple(lengths), text_max) if any(n != text_max for n in lengths) else None
 
         return {
             "hidden": hidden,

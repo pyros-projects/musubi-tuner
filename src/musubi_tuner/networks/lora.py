@@ -167,10 +167,11 @@ class LoRAModule(torch.nn.Module):
             else:
                 scale = self.scale
 
-            lx = self.lora_up(lx)
+            # scale the rank-r intermediate, not the full-width output: same math, far less memory traffic
+            lx = self.lora_up(lx * (self.multiplier * scale))
 
             # Add in the (possibly higher-precision) delta dtype, then round the sum once.
-            return self._match_org_dtype(org_forwarded + lx * self.multiplier * scale, org_forwarded)
+            return self._match_org_dtype(org_forwarded + lx, org_forwarded)
         else:
             lxs = [lora_down(lora_input) for lora_down in self.lora_down]
 
@@ -193,10 +194,10 @@ class LoRAModule(torch.nn.Module):
             else:
                 scale = self.scale
 
-            lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
+            lxs = [lora_up(lx * (self.multiplier * scale)) for lora_up, lx in zip(self.lora_up, lxs)]
 
             # Add in the (possibly higher-precision) delta dtype, then round the sum once.
-            return self._match_org_dtype(org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale, org_forwarded)
+            return self._match_org_dtype(org_forwarded + torch.cat(lxs, dim=-1), org_forwarded)
 
 
 class LoRAInfModule(LoRAModule):
@@ -344,16 +345,16 @@ class LoRAInfModule(LoRAModule):
         lora_input = self._lora_input(x)
         if self.split_dims is None:
             lx = self.lora_down(lora_input)
-            lx = self.lora_up(lx)
+            lx = self.lora_up(lx * (self.multiplier * self.scale))
             org_forwarded = self.org_forward(x)
             # Add in the (possibly higher-precision) delta dtype, then round the sum once.
-            return self._match_org_dtype(org_forwarded + lx * self.multiplier * self.scale, org_forwarded)
+            return self._match_org_dtype(org_forwarded + lx, org_forwarded)
         else:
             lxs = [lora_down(lora_input) for lora_down in self.lora_down]
-            lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
+            lxs = [lora_up(lx * (self.multiplier * self.scale)) for lora_up, lx in zip(self.lora_up, lxs)]
             org_forwarded = self.org_forward(x)
             # Add in the (possibly higher-precision) delta dtype, then round the sum once.
-            return self._match_org_dtype(org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * self.scale, org_forwarded)
+            return self._match_org_dtype(org_forwarded + torch.cat(lxs, dim=-1), org_forwarded)
 
     def forward(self, x):
         if not self.enabled:
