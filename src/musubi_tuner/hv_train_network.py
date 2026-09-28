@@ -542,6 +542,14 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
     return sigma
 
 
+def qwen21_diffsynth_sigma_table(device) -> torch.Tensor:
+    """DiffSynth-Studio's Qwen-Image(-2.1) training table: 1000 sigmas from linspace(1, 0.001, 1000),
+    exponential time shift with a fixed mu of 0.8, stretched to end at 0.02 (FlowMatchScheduler("Qwen-Image"))."""
+    from musubi_tuner.qwen_image21.qwen_image21_utils import get_sigmas
+
+    return get_sigmas(1000, 0.8)[:-1].to(device)
+
+
 def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, timesteps, device, dtype):
     """Computes loss weighting scheme for SD3 training.
 
@@ -549,6 +557,15 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, times
 
     SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
     """
+    if weighting_scheme == "qwen21_diffsynth":
+        # DiffSynth-Studio's bell weight exp(-2 (sigma - 0.5)^2), shifted to 0 at its minimum and scaled to
+        # mean 1 over its training table. Shift-type samplers return timesteps = sigma * 1000 + 1.
+        table = qwen21_diffsynth_sigma_table(device)
+        bell_table = torch.exp(-2 * (table - 0.5) ** 2)
+        floor, norm = bell_table.min(), len(table) / (bell_table - bell_table.min()).sum()
+        sigmas = ((timesteps.to(device).float() - 1) / 1000).clamp(0, 1)
+        weighting = ((torch.exp(-2 * (sigmas - 0.5) ** 2) - floor) * norm).clamp_min(0)
+        return weighting.view(-1, 1, 1, 1, 1)
     if weighting_scheme == "sigma_sqrt" or weighting_scheme == "cosmap":
         sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype)
         if weighting_scheme == "sigma_sqrt":
@@ -744,7 +761,8 @@ class NetworkTrainer:
 
             base_weight = org_module.weight.data
             is_nf4_quantized = bool(getattr(org_module, "_nf4_quantized", False))
-            if is_nf4_quantized or (float8_dtypes and base_weight.dtype in float8_dtypes):
+            is_int8 = base_weight.dtype == torch.int8  # INT8 ConvRot bases: merging would corrupt the payload
+            if is_nf4_quantized or is_int8 or (float8_dtypes and base_weight.dtype in float8_dtypes):
                 supports_runtime_overlay = (
                     lora.split_dims is None
                     and org_module.__class__.__name__.endswith("Linear")
@@ -766,6 +784,10 @@ class NetworkTrainer:
                         compute_dtype=torch.float32,
                     )
                     runtime_attached += 1
+                    continue
+
+                if is_int8:
+                    logger.warning(f"Sampling LoRA skips INT8 module {lora.lora_name}: it cannot be merged into INT8 weights.")
                     continue
 
                 quantized_kind = "NF4" if is_nf4_quantized else "float8"
@@ -1522,6 +1544,7 @@ class NetworkTrainer:
             or args.timestep_sampling == "flux2_shift"
             or args.timestep_sampling == "krea2_shift"
             or args.timestep_sampling == "qwen21_shift"
+            or args.timestep_sampling == "qwen21_diffsynth"
         ):
 
             def compute_sampling_timesteps(org_timesteps: Optional[torch.Tensor]) -> torch.Tensor:
@@ -1574,6 +1597,12 @@ class NetworkTrainer:
                     logits_norm = logits_norm * args.sigmoid_scale  # larger scale for more uniform sampling
                     t = logits_norm.sigmoid()
                     t = (t * shift) / (1 + (shift - 1) * t)
+
+                elif args.timestep_sampling == "qwen21_diffsynth":
+                    # DiffSynth-Studio: a uniformly drawn index into its shifted Qwen-Image table
+                    table = qwen21_diffsynth_sigma_table(device)
+                    index = (rand(batch_size, org_timesteps) * len(table)).long().clamp(0, len(table) - 1)
+                    t = table[index]
 
                 elif args.timestep_sampling == "logsnr":
                     # https://arxiv.org/abs/2411.14793v3
@@ -4818,6 +4847,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
             "qwen_shift",
             "krea2_shift",
             "qwen21_shift",
+            "qwen21_diffsynth",
             "logsnr",
             "qinglong_flux",
             "qinglong_qwen",
@@ -4844,7 +4874,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--weighting_scheme",
         type=str,
         default="none",
-        choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"],
+        choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "qwen21_diffsynth", "none"],
         help="weighting scheme for timestep distribution. Default is none / タイムステップ分布の重み付けスキーム、デフォルトはnone",
     )
     parser.add_argument(

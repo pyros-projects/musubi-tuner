@@ -179,7 +179,9 @@ def test_lora_keys_are_comfy_loadable_and_presets_select_expected_layers():
     names = {lora.lora_name for lora in network.unet_loras}
     assert names <= comfy_keys
     assert "lora_unet_transformer_blocks_0_img_mlp_gate_up" in names
-    assert len(names) == 6 * TINY["num_layers"] + 8  # blocks + img_in, txt_in x2, timestep x2, modulation, norm_out, proj_out
+    # DiffSynth's default set: attention + MLP in the blocks; the shared modulation and the embedders stay frozen
+    assert len(names) == 6 * TINY["num_layers"]
+    assert all(name.startswith("lora_unet_transformer_blocks_") for name in names)
 
     def count(pattern):
         net = lora_qwen_image21.create_arch_network(1.0, 4, 4, None, [], _tiny_model(), include_patterns=[pattern])
@@ -326,3 +328,117 @@ def test_sampling_lora_attaches_unmerged_overlays_and_clears_cleanly():
     assert trainer._clear_sampling_lora_runtime_overlays(model) == 4
     with torch.no_grad():
         torch.testing.assert_close(model(x, t, ctx), base_out)
+
+
+def _diffsynth_reference_table():
+    """DiffSynth-Studio FlowMatchScheduler("Qwen-Image").set_timesteps(1000, training=True), transcribed."""
+    sigmas = torch.linspace(1.0, 0.0, 1000 + 1)[:-1]
+    mu = 0.8
+    sigmas = math.exp(mu) / (math.exp(mu) + (1 / sigmas - 1))
+    one_minus_z = 1 - sigmas
+    sigmas = 1 - (one_minus_z / (one_minus_z[-1] / (1 - 0.02)))
+    x = sigmas * 1000
+    y = torch.exp(-2 * ((x - 1000 / 2) / 1000) ** 2)
+    y_shifted = y - y.min()
+    return sigmas, y_shifted * (1000 / y_shifted.sum())
+
+
+def test_diffsynth_timestep_preset_matches_diffsynth_studio():
+    from musubi_tuner.hv_train_network import compute_loss_weighting_for_sd3, qwen21_diffsynth_sigma_table
+    from musubi_tuner.qwen_image21_train_network import QwenImage21NetworkTrainer
+
+    ref_sigmas, ref_weights = _diffsynth_reference_table()
+    table = qwen21_diffsynth_sigma_table("cpu")
+    torch.testing.assert_close(table, ref_sigmas, atol=1e-5, rtol=0)
+    assert table[0].item() == pytest.approx(1.0) and table[-1].item() == pytest.approx(0.02, abs=1e-6)
+
+    # weights: the trainer's timesteps are sigma * 1000 + 1
+    weights = compute_loss_weighting_for_sd3("qwen21_diffsynth", None, ref_sigmas * 1000 + 1, "cpu", torch.float32)
+    torch.testing.assert_close(weights.flatten(), ref_weights, atol=1e-4, rtol=1e-4)
+    assert weights.shape == (1000, 1, 1, 1, 1) and weights.mean().item() == pytest.approx(1.0, abs=1e-4)
+
+    # sampling: uniform indices into the table
+    args = SimpleNamespace(
+        timestep_sampling="qwen21_diffsynth",
+        sigmoid_scale=1.0,
+        min_timestep=None,
+        max_timestep=None,
+        preserve_distribution_shape=False,
+    )
+    torch.manual_seed(0)
+    latents = torch.zeros(20000, 1, 1, 8, 8)
+    _, timesteps = QwenImage21NetworkTrainer().get_noisy_model_input_and_timesteps(
+        args, torch.zeros_like(latents), latents, None, None, torch.device("cpu"), torch.float32
+    )
+    sigmas = (timesteps - 1) / 1000
+    assert (sigmas[:, None] - table[None]).abs().min(dim=1).values.max().item() < 1e-5  # every draw is a table entry
+    assert sigmas.median().item() == pytest.approx(ref_sigmas.median().item(), abs=0.01)
+
+
+def _write_fizgig_style_adapter(model, path, rank=2, seed=5):
+    """PEFT keys with a transformer. prefix, F32 alphas and the unfused gate_layer/proj pair (Fizgig's layout)."""
+    g = torch.Generator().manual_seed(seed)
+    inner = model.inner_dim
+    hidden = model.transformer_blocks[0].img_mlp.out.in_features
+    shapes = {
+        "attn.to_q": (inner, inner),
+        "img_mlp.gate_layer": (inner, hidden),
+        "img_mlp.proj": (inner, hidden),
+        "img_mlp.out": (hidden, inner),
+    }
+    sd = {}
+    for block in range(len(model.transformer_blocks)):
+        for module, (fan_in, fan_out) in shapes.items():
+            key = f"transformer.transformer_blocks.{block}.{module}"
+            sd[f"{key}.lora_A.weight"] = torch.randn(rank, fan_in, generator=g) * 0.2
+            sd[f"{key}.lora_B.weight"] = torch.randn(fan_out, rank, generator=g) * 0.2
+            sd[f"{key}.alpha"] = torch.tensor(float(rank))
+    save_file(sd, str(path))
+
+
+def test_train_lora_overlay_is_frozen_unmerged_off_for_previews_and_never_saved(tmp_path, monkeypatch):
+    from musubi_tuner.hv_train_network import NetworkTrainer
+    from musubi_tuner.qwen_image21_train_network import (
+        QwenImage21NetworkTrainer,
+        attach_train_lora_overlay,
+        parse_overlay_spec,
+        set_train_lora_overlay_enabled,
+    )
+
+    assert parse_overlay_spec("/m/adapter.safetensors:0.5") == ("/m/adapter.safetensors", 0.5)
+    assert parse_overlay_spec("/m/adapter.safetensors") == ("/m/adapter.safetensors", 1.0)
+
+    model = _tiny_model()
+    x, t, ctx = _inputs(1, 4, 4, 5)
+    with torch.no_grad():
+        base = model(x, t, ctx)
+    path = tmp_path / "adapter.safetensors"
+    _write_fizgig_style_adapter(model, path)
+
+    overlay = attach_train_lora_overlay(model, str(path), 1.0, "cpu")
+    assert len(overlay.unet_loras) == 3 * TINY["num_layers"]  # to_q, fused gate_up, out
+    assert not any(p.requires_grad for p in overlay.parameters())
+    with torch.no_grad():
+        assert not torch.allclose(model(x, t, ctx), base)
+
+    # the trained LoRA wraps the adapted modules: gradients reach it, never the adapter
+    network = lora_qwen_image21.create_arch_network(1.0, 4, 4, None, [], model)
+    network.apply_to(None, model, apply_text_encoder=False, apply_unet=True)
+    model(x, t, ctx).square().mean().backward()
+    assert all(p.grad is None for p in overlay.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in network.parameters())
+    assert all(key.startswith("lora_unet_transformer_blocks_") for key in network.state_dict())
+    assert len(network.unet_loras) == 6 * TINY["num_layers"]
+
+    # previews run on the plain base (+ trained LoRA), training resumes with the adapter
+    trainer = QwenImage21NetworkTrainer()
+    trainer.train_lora_overlay = overlay
+    seen = []
+    monkeypatch.setattr(NetworkTrainer, "sample_images", lambda self, *a, **k: seen.append([m.enabled for m in overlay.unet_loras]))
+    trainer.sample_images()
+    assert seen == [[False] * len(overlay.unet_loras)]
+    assert all(m.enabled for m in overlay.unet_loras)
+
+    set_train_lora_overlay_enabled(overlay, False)  # the trained LoRA's up weights are still zero-initialized
+    with torch.no_grad():
+        torch.testing.assert_close(model(x, t, ctx), base)

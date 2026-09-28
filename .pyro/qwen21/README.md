@@ -21,10 +21,11 @@ NAME=flat .pyro/qwen21/train.sh
 .pyro/qwen21/cfg/p_${NAME}.toml
 ```
 
-The run name is `${NAME}-${LORA_CONFIG}-${OPTIMIZER}` and the run writes to:
+The run name is `${NAME}-${LORA_CONFIG}-${OPTIMIZER}`, plus `-diffsynth` and `-dedistill-<adapter>`
+suffixes (see Timestep Sampling and Training Adapter), and the run writes to:
 
 ```text
-/home/pyro/models/_out/qwen21/${NAME}-${LORA_CONFIG}-${OPTIMIZER}
+/home/pyro/models/_out/qwen21/${RUN_NAME}
 ```
 
 A Krea2 dataset config works unchanged apart from `cache_directory`: point it at a
@@ -76,6 +77,45 @@ Sample on the base model instead, with the prompt file's `sample_steps`:
 NAME=flat TURBO_LORA= .pyro/qwen21/train.sh
 ```
 
+## Training Adapter (De-Distillation)
+
+Plain LoRA training erodes the base model's ability to render without guidance: at CFG 1
+the LoRA's samples get fused, ghosted bodies, while CFG 4 still renders them cleanly. The
+community fix (Fizgig, SimpleTuner) is a frozen "training assistant" LoRA that sits on the
+DiT during training only, so the trained LoRA learns the concept and not the drift. It is on
+by default:
+
+```text
+TRAIN_LORA_OVERLAY  /home/pyro/models/comfy/loras/qwen21/training_adapter/fizgig_qwen_image_2.1_training_adapter.safetensors
+```
+
+The adapter:
+
+- runs in every training forward, unmerged, at strength 1.0, with no gradients;
+- is switched off for snapshots, so previews show base + trained LoRA (+ turbo) exactly as
+  ComfyUI will;
+- is never saved: checkpoints contain only the trained LoRA (its path is recorded in the
+  metadata).
+
+Two adapters are downloaded:
+
+```text
+fizgig_qwen_image_2.1_training_adapter.safetensors             rank 16, attention + MLP (default)
+simpletuner_qwen_image_2.1_training_assistant_v2.safetensors   rank 32, attention only
+```
+
+Switch to SimpleTuner's, set a strength (`PATH:STRENGTH`), or train without one:
+
+```bash
+NAME=hs TRAIN_LORA_OVERLAY=/home/pyro/models/comfy/loras/qwen21/training_adapter/simpletuner_qwen_image_2.1_training_assistant_v2.safetensors .pyro/qwen21/train.sh
+NAME=hs TRAIN_LORA_OVERLAY=/home/pyro/models/comfy/loras/qwen21/training_adapter/fizgig_qwen_image_2.1_training_adapter.safetensors:0.8 .pyro/qwen21/train.sh
+NAME=hs TRAIN_LORA_OVERLAY= .pyro/qwen21/train.sh
+```
+
+Runs with an adapter get a `-dedistill-<adapter>` suffix on the run name, taken from the first
+word of the file name (`-dedistill-fizgig`, `-dedistill-simpletuner`), so runs with different
+adapters or none never resume each other.
+
 ## Cache Control
 
 By default the script skips caching:
@@ -110,16 +150,18 @@ The DiT has 32 blocks, each with `attn.to_q/to_k/to_v/to_out.0` and a fused SwiG
 `img_mlp.gate_up/out`.
 
 ```text
-default   all 200 DiT Linear layers: the blocks plus img_in, txt_in, timestep MLP,
-          the shared modulation, norm_out.linear and proj_out
+default   main blocks attention plus MLP (192 layers), DiffSynth-Studio's default targets
 preset-1  main blocks attention only: to_q, to_k, to_v, to_out.0 (128 layers)
-preset-2  main blocks attention plus MLP: gate_up, out (192 layers)
-preset-3  diffusion-pipe-ish: any Linear module with blocks. in its path (same 192 as preset-2)
-custom    use raw NETWORK_ARGS
+preset-2  main blocks attention plus MLP: gate_up, out (192 layers, same as default)
+preset-3  diffusion-pipe-ish: any Linear module with blocks. in its path (same 192 as default)
+custom    use raw NETWORK_ARGS (within the blocks)
 ```
 
-`default` includes the single modulation Linear that every block shares; `preset-2` is the
-conventional Qwen-Image choice if that is too broad.
+Unlike Krea2's "all Linears", nothing outside the blocks is trained. Qwen-Image 2.1 has one
+modulation Linear shared by every block, which also modulates the text tokens; a LoRA there
+rewrites how the whole prompt is read and broke composition (fused, ghosted bodies). The
+embedders, norm_out and proj_out stay frozen as well, as in DiffSynth-Studio (Qwen's own
+trainer) and diffusers.
 
 Examples:
 
@@ -149,6 +191,23 @@ NAME=flat LORA_CONFIG=preset-1 NETWORK_ARGS="verbose=True" .pyro/qwen21/train.sh
 The DiT's module names are the Comfy checkpoint keys, so the saved
 `${RUN_NAME}-step*.safetensors` LoRAs load in ComfyUI as they are, with the regular
 LoRA loader on the INT8 ConvRot model (no `.comfy.safetensors` twin is needed).
+
+## Timestep Sampling
+
+`TIMESTEP_PRESET` picks how training noise levels are drawn:
+
+```text
+shift      default: sigmoid(randn), shifted by the official scheduler's resolution-dependent mu
+diffsynth  DiffSynth-Studio (Qwen's own trainer): a uniform draw from its 1000-entry table
+           (fixed mu 0.8, sigma 1.0 -> 0.02) with its bell-shaped loss weight (peak near sigma 0.5,
+           zero at sigma 1, mean 1)
+```
+
+```bash
+NAME=hs TIMESTEP_PRESET=diffsynth .pyro/qwen21/train.sh
+```
+
+`diffsynth` runs get a `-diffsynth` suffix on the run name, so they never resume a `shift` run.
 
 ## Training Knobs
 

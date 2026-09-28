@@ -11,11 +11,14 @@ Training snapshots follow the official pipeline: Euler, resolution-dependent mu 
 
 import argparse
 import gc
+import os
+import re
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from safetensors.torch import load_file
 from tqdm import tqdm
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_QWEN_IMAGE21, ARCHITECTURE_QWEN_IMAGE21_FULL
@@ -27,6 +30,7 @@ from musubi_tuner.hv_train_network import (
     read_config_from_file,
 )
 from musubi_tuner.krea2 import krea2_sampling
+from musubi_tuner.networks import lora_qwen_image21
 from musubi_tuner.qwen_image21 import qwen_image21_text_encoder, qwen_image21_utils
 from musubi_tuner.qwen_image21.qwen_image21_vae import SPATIAL_COMPRESSION, load_qwen_image21_vae
 
@@ -36,11 +40,41 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def parse_overlay_spec(spec: str) -> tuple[str, float]:
+    """``PATH`` or ``PATH:STRENGTH`` (H3's --train_lora_overlay convention)."""
+    match = re.fullmatch(r"(.+):([0-9]*\.?[0-9]+)", spec)
+    return (match.group(1), float(match.group(2))) if match else (spec, 1.0)
+
+
+def attach_train_lora_overlay(model: torch.nn.Module, path: str, strength: float, device) -> "lora_qwen_image21.lora.LoRANetwork":
+    """Hook a frozen training adapter (SimpleTuner's assistant, Fizgig's adapter, ...) onto the DiT.
+
+    Unmerged: every adapted Linear computes W x + strength * B A x, as SimpleTuner and Fizgig
+    apply theirs. The trained LoRA wraps these modules afterwards and learns on top. The
+    adapter is not part of the trained network, so it never reaches the optimizer or a save.
+    """
+    weights = qwen_image21_utils.convert_lora_to_musubi(load_file(path), qwen_image21_utils.peft_lora_scale(path))
+    network = lora_qwen_image21.create_arch_network_from_weights(strength, weights, unet=model, for_inference=True)
+    network.apply_to(None, model, apply_text_encoder=False, apply_unet=True)
+    info = network.load_state_dict(weights, strict=False)
+    if info.missing_keys or info.unexpected_keys:
+        raise ValueError(f"Training adapter {path} does not match the DiT: {info}")
+    network.to(device=device, dtype=model.dtype)
+    network.requires_grad_(False)
+    return network
+
+
+def set_train_lora_overlay_enabled(network, enabled: bool) -> None:
+    for lora in network.unet_loras:
+        lora.enabled = enabled
+
+
 class QwenImage21NetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.vae_frame_stride = 1  # single image
         self.sample_raw_sigmas = None  # --sample_raw_sigmas
+        self.train_lora_overlay = None  # --train_lora_overlay network, active in training forwards only
 
     # region model specific
 
@@ -65,6 +99,28 @@ class QwenImage21NetworkTrainer(NetworkTrainer):
             raise ValueError("Qwen-Image 2.1 does not support --compile.")
         if args.sample_raw_sigmas:
             self.sample_raw_sigmas = [float(s) for s in args.sample_raw_sigmas.split(",")]
+        if args.train_lora_overlay:
+            path, strength = parse_overlay_spec(args.train_lora_overlay)
+            if not os.path.isfile(path):
+                raise ValueError(f"--train_lora_overlay file not found: {path}")
+            if strength <= 0:
+                raise ValueError(f"--train_lora_overlay strength must be positive: {args.train_lora_overlay}")
+
+    def get_checkpoint_metadata(self, args: argparse.Namespace) -> dict[str, str]:
+        if not args.train_lora_overlay:
+            return {}
+        path, strength = parse_overlay_spec(args.train_lora_overlay)
+        return {"ss_qwen21_train_lora_overlay": os.path.basename(path), "ss_qwen21_train_lora_overlay_strength": f"{strength:g}"}
+
+    def sample_images(self, *args, **kwargs):
+        # previews show what the LoRA does on the plain base, i.e. without the training adapter
+        if self.train_lora_overlay is None:
+            return super().sample_images(*args, **kwargs)
+        set_train_lora_overlay_enabled(self.train_lora_overlay, False)
+        try:
+            return super().sample_images(*args, **kwargs)
+        finally:
+            set_train_lora_overlay_enabled(self.train_lora_overlay, True)
 
     def _default_sampling_lora_network_module_name(self) -> Optional[str]:
         return "musubi_tuner.networks.lora_qwen_image21"
@@ -211,7 +267,16 @@ class QwenImage21NetworkTrainer(NetworkTrainer):
     ):
         if attn_mode != "torch" or split_attn:
             raise ValueError("Qwen-Image 2.1 uses PyTorch SDPA attention: pass --sdpa (without --split_attn).")
-        return qwen_image21_utils.load_qwen_image21_dit(dit_path, device=loading_device, dtype=torch.bfloat16)
+        model = qwen_image21_utils.load_qwen_image21_dit(dit_path, device=loading_device, dtype=torch.bfloat16)
+        if args.train_lora_overlay:
+            # attached before the trained LoRA, which then wraps these modules and learns on top
+            path, strength = parse_overlay_spec(args.train_lora_overlay)
+            self.train_lora_overlay = attach_train_lora_overlay(model, path, strength, loading_device)
+            logger.info(
+                f"Training LoRA overlay {path} at strength {strength:g}: {len(self.train_lora_overlay.unet_loras)} modules, "
+                "active in training forwards, off for previews, never saved"
+            )
+        return model
 
     def scale_shift_latents(self, latents):
         # latents are cached normalized ((raw - mean) / std)
@@ -272,6 +337,14 @@ def qwen_image21_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argum
         help="comma-separated raw sigma nodes for sample generation, e.g. a turbo LoRA's schedule "
         "(Viggle v0.2.1: 1.0,0.9375,0.875,0.75,0.5,0.25). They get the resolution shift but no terminal "
         "stretch, and replace the prompt file's sample_steps.",
+    )
+    parser.add_argument(
+        "--train_lora_overlay",
+        type=str,
+        default=None,
+        help="frozen training adapter (de-distillation assistant) applied during TRAINING forwards only, PATH[:STRENGTH], "
+        "e.g. Fizgig's or SimpleTuner's Qwen-Image 2.1 training adapter. Unmerged, off for previews, never saved, "
+        "so the trained LoRA is used on the plain base",
     )
     return parser
 

@@ -17,18 +17,24 @@ VAE="${VAE:-/home/pyro/models/comfy/vae/qwen_image_2.1_vae_bf16.safetensors}"
 # Snapshot-only turbo LoRA and its raw sigma nodes (Viggle v0.2.1: 6 steps). Set TURBO_LORA= to sample without it.
 TURBO_LORA="${TURBO_LORA-/home/pyro/models/comfy/loras/qwen21/turbo/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors}"
 TURBO_SIGMAS="${TURBO_SIGMAS:-1.0,0.9375,0.875,0.75,0.5,0.25}"
+# Frozen training adapter (de-distillation assistant), PATH[:STRENGTH]: active in training forwards only,
+# off for snapshots, never saved. Set TRAIN_LORA_OVERLAY= to train without it. Tags runs -dedistill-<adapter>.
+# simpletuner_qwen_image_2.1_training_assistant_v2
+# fizgig_qwen_image_2.1_training_adapter
+TRAIN_LORA_OVERLAY="${TRAIN_LORA_OVERLAY-/home/pyro/models/comfy/loras/qwen21/training_adapter/fizgig_qwen_image_2.1_training_adapter.safetensors}"
 
 NAME="${NAME:-flat}"
 LORA_CONFIG="${LORA_CONFIG:-default}"   # default | preset-1 | preset-2 | preset-3 | custom
 NETWORK_ARGS="${NETWORK_ARGS:-}"        # optional raw Musubi --network_args entries, e.g. "verbose=True"
-CACHE_DATASET="${CACHE_DATASET:-1}"     # 1/true/yes/on = cache latents and text encoder outputs before training
+CACHE_DATASET="${CACHE_DATASET:-0}"     # 1/true/yes/on = cache latents and text encoder outputs before training
 OPTIMIZER="${OPTIMIZER:-adamw8bit}"   # adamw8bit | adafactor | prodigy
+TIMESTEP_PRESET="${TIMESTEP_PRESET:-shift}"  # shift = logit-normal, resolution-shifted | diffsynth = DiffSynth-Studio's table + bell loss weight
 SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
-MAX_STEPS="${MAX_STEPS:-1000}"
+MAX_STEPS="${MAX_STEPS:-2000}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
-NETWORK_DIM="${NETWORK_DIM:-16}"
-NETWORK_ALPHA="${NETWORK_ALPHA:-16}"
+NETWORK_DIM="${NETWORK_DIM:-32}"
+NETWORK_ALPHA="${NETWORK_ALPHA:-32}"
 SAMPLE_WITH_OFFLOADING="${SAMPLE_WITH_OFFLOADING:-1}"  # 1 = offload DiT before snapshot VAE decode
 CACHE_LATENTS_BATCH_SIZE="${CACHE_LATENTS_BATCH_SIZE:-2}"
 CACHE_TEXT_BATCH_SIZE="${CACHE_TEXT_BATCH_SIZE:-1}"
@@ -64,12 +70,36 @@ if [[ ! "$LORA_CONFIG" =~ ^[A-Za-z0-9._-]+$ ]]; then
     exit 1
 fi
 
-RUN_NAME="${NAME}-${LORA_CONFIG}-${OPTIMIZER}"
+case "$TIMESTEP_PRESET" in
+    shift)
+        # musubi-style: sigmoid(randn) shifted by the resolution-dependent mu of the official scheduler
+        TIMESTEP_ARGS=(--timestep_sampling qwen21_shift --weighting_scheme none)
+        TIMESTEP_SUFFIX=""
+        ;;
+    diffsynth)
+        # DiffSynth-Studio (Qwen's trainer): uniform index into its mu=0.8 table (sigma 1 -> 0.02), bell loss weight
+        TIMESTEP_ARGS=(--timestep_sampling qwen21_diffsynth --weighting_scheme qwen21_diffsynth)
+        TIMESTEP_SUFFIX="-diffsynth"
+        ;;
+    *)
+        echo "Unknown TIMESTEP_PRESET: $TIMESTEP_PRESET (valid: shift, diffsynth)" >&2
+        exit 1
+        ;;
+esac
+
+OVERLAY_SUFFIX=""
+if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
+    # -dedistill-<first token of the adapter file name>, e.g. -dedistill-fizgig / -dedistill-simpletuner
+    OVERLAY_NAME="$(basename "${TRAIN_LORA_OVERLAY%%.safetensors*}")"
+    OVERLAY_SUFFIX="-dedistill-${OVERLAY_NAME%%_*}"
+fi
+
+RUN_NAME="${NAME}-${LORA_CONFIG}-${OPTIMIZER}${TIMESTEP_SUFFIX}${OVERLAY_SUFFIX}"
 LORA_PRESET_ARGS=()
 
 case "$LORA_CONFIG" in
     default)
-        # Qwen-Image 2.1 module default: every Linear in the DiT (blocks, embedders, shared modulation, output).
+        # Qwen-Image 2.1 module default: attention + MLP in every block (DiffSynth-Studio's targets).
         ;;
     preset-1)
         # Main per-block attention only: to_q/to_k/to_v/to_out.0.
@@ -110,14 +140,14 @@ fi
 
 OPT_ADAMW8BIT=(
     --optimizer_type adamw8bit
-    --learning_rate 2e-4
+    --learning_rate 1e-4
 )
 
 OPT_ADAFACTOR=(
     --optimizer_type adafactor
     --optimizer_args "scale_parameter=False" "relative_step=False" "warmup_init=False"
     --lr_scheduler constant
-    --learning_rate 2e-4
+    --learning_rate 1e-4
     --max_grad_norm 0
 )
 
@@ -154,6 +184,19 @@ if [[ -n "$TURBO_LORA" ]]; then
     TURBO_ARGS=(--sampling_lora_weight "$TURBO_LORA" --sampling_lora_multiplier 1.0 --sample_raw_sigmas "$TURBO_SIGMAS")
 fi
 
+TRAIN_OVERLAY_ARGS=()
+if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
+    TRAIN_OVERLAY_PATH="$TRAIN_LORA_OVERLAY"
+    if [[ "$TRAIN_LORA_OVERLAY" =~ ^(.+):[0-9]*\.?[0-9]+$ ]]; then
+        TRAIN_OVERLAY_PATH="${BASH_REMATCH[1]}"
+    fi
+    if [[ ! -f "$TRAIN_OVERLAY_PATH" ]]; then
+        echo "Missing training adapter: $TRAIN_OVERLAY_PATH (set TRAIN_LORA_OVERLAY= to train without one)" >&2
+        exit 1
+    fi
+    TRAIN_OVERLAY_ARGS=(--train_lora_overlay "$TRAIN_LORA_OVERLAY")
+fi
+
 SAMPLE_OFFLOAD_ARGS=()
 if (( SAMPLE_WITH_OFFLOADING_ENABLED )); then
     SAMPLE_OFFLOAD_ARGS=(--sample_with_offloading)
@@ -161,13 +204,18 @@ fi
 
 source .venv/bin/activate
 
-echo "Qwen-Image 2.1 training run: dataset=$NAME output=$RUN_NAME lora_config=$LORA_CONFIG"
+echo "Qwen-Image 2.1 training run: dataset=$NAME output=$RUN_NAME lora_config=$LORA_CONFIG timestep_preset=$TIMESTEP_PRESET"
 echo "Qwen-Image 2.1 cache step: CACHE_DATASET=$CACHE_DATASET"
 echo "Qwen-Image 2.1 sample decode offload: SAMPLE_WITH_OFFLOADING=$SAMPLE_WITH_OFFLOADING"
 if [[ -n "$TURBO_LORA" ]]; then
     echo "Qwen-Image 2.1 turbo snapshots: TURBO_LORA=$TURBO_LORA TURBO_SIGMAS=$TURBO_SIGMAS"
 else
     echo "Qwen-Image 2.1 turbo snapshots: off (base model, prompt file sample_steps)"
+fi
+if [[ -n "$TRAIN_LORA_OVERLAY" ]]; then
+    echo "Qwen-Image 2.1 training adapter: TRAIN_LORA_OVERLAY=$TRAIN_LORA_OVERLAY (training forwards only)"
+else
+    echo "Qwen-Image 2.1 training adapter: off"
 fi
 if ((${#NETWORK_ARGS_VALUES[@]} > 0)); then
     printf 'Qwen-Image 2.1 LoRA network args:'
@@ -194,7 +242,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
     --dataset_config "$DATASET_TOML" \
     --sample_prompts "$PROMPT_TOML" \
     --sdpa --mixed_precision bf16 \
-    --timestep_sampling qwen21_shift --weighting_scheme none \
+    "${TIMESTEP_ARGS[@]}" \
     "${OPT_ARGS[@]}" \
     --gradient_checkpointing \
     --gradient_accumulation_steps "$GRAD_ACCUM" \
@@ -207,6 +255,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
     --output_dir /home/pyro/models/_out/qwen21/"$RUN_NAME" \
     --output_name "$RUN_NAME" \
     --logging_dir /home/pyro/models/_out/qwen21/.logs \
+    "${TRAIN_OVERLAY_ARGS[@]}" \
     "${TURBO_ARGS[@]}" \
     "${SAMPLE_OFFLOAD_ARGS[@]}" \
     --sample_at_first --sample_every_n_steps "$SAMPLE_EVERY" --log_with trackio
